@@ -1,0 +1,249 @@
+<p align="center">
+  <a href="character/claudezero-legend.md"><img src="character/claudezero-portrait.png" alt="ClaudeZero - Todo-list sensei for Claude Code" width="256"></a>
+</p>
+
+<h2 align="center">Todo-list sensei for Claude Code. Zeros your list.</h2>
+<h4 align="center">
+Loops claude until every todo is done, committed, and checked off.<br>
+Restarting it on a fresh context before rot.<br>
+Spawn many instances to parallelize.
+</h4>
+
+<p align="center">
+  <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-green.svg" alt="License: MIT" /></a>
+</p>
+
+Runs [`claude`](https://claude.com/product/claude-code) on a predefined prompt in a loop on the given todo list file. Makes it complete, commit, and check off each todo. The session stays interactive, so you can add prompts and make choices as it runs. Launches `claude` in permission auto mode by default, restarts it on a fresh context before rot sets in.
+
+## Contents
+
+- [What it does](#what-it-does)
+- [Quickstart](#quickstart)
+- [Install](#install-for-the-claude-coding-agent)
+- [Todo file format](#todo-file-format)
+- [Loop engineering](#loop-engineering)
+- [Usage](#usage)
+- [Cleanup](#cleanup)
+- [Tests](#tests)
+- [Security](#security)
+- [Contributing](#contributing)
+
+## What it does
+
+- **Guides Claude to zero a todo list unattended** — one task at a time until all are completed, committed, and checkmarked.
+- **Beats context rot** — session Stop hook SIGTERMs `claude` near ~80% of the context window and restarts clean. Fresh context, no quality decay.
+- **Parallel by default** — run many instances at once; they coordinate via git worktrees, each claiming todos the others haven't taken.
+- **Safe merges** — cross-instance merge-back serialized through `flock`; no races, no corrupted base.
+- **Crash resilient** — if a `claude` crashes or is killed mid-task, its half-done work isn't lost. The next instance to come by — a peer switching to its next task, or the same loop restarted — reclaims the branch, finishes it, and merges it back. Work only counts as done once it lands on the base branch and its box is checked there.
+- **Ctrl+C window** — 5s pause between runs to stop cleanly.
+
+## Quickstart
+
+Change to your repo root with a todo-list file, and make sure the working tree is in a clean state (commit or stash any changes). Then run `claudezero` pointing to your todo-list:
+
+```
+claudezero todo.md
+```
+
+Run that command in multiple parallel terminals to zero todos faster.
+
+> ⚠️ ClaudeZero runs `claude` **unattended with permissions auto-approved** and **commits on its own** to the branch you launch it on. Only ever point it at a todo file you wrote or reviewed, on a branch with a clean, committed tree — git is your only undo.
+
+### Sample output
+
+Representative zero-mode run (agent output between the markers elided):
+
+```console
+$ claudezero todo.md
+
+❄ ClaudeZero 0.0.14
+  zero mode · base master · fork → implement → commit → merge
+
+… claude works a task: forks a worktree, implements, commits, merges, ticks its box …
+
+❄ claude exited after 1 runs · restarting in 5s · press Ctrl+C to stop
+
+… fresh context, next task …
+
+❄ execution time (instance a1b2c3d4)
+  Todos:               12m 30s
+  Claude loops:        41m 02s
+  ClaudeZero run loop: 48m 15s
+
+❄ ClaudeZero surveys the frozen field, and is proud.
+```
+
+## Install (for the Claude coding agent)
+
+Supported on **macOS and Linux** (the script is bash-3.2-safe, so stock macOS `bash` works).
+
+### Get the script
+
+#### macOS (Homebrew)
+  ```sh
+  brew install IvanRublev/tap/claudezero
+  ```
+
+#### Linux (curl)
+  ```sh
+  sudo curl -fsSL https://raw.githubusercontent.com/IvanRublev/claudezero/refs/heads/master/claudezero.sh -o /usr/local/bin/claudezero
+  sudo chmod +x /usr/local/bin/claudezero
+  ```
+
+### Prerequisites
+
+`bash`, `git`, `claude` CLI, plus:
+
+1. **flock** — merge/worktree locking. Must be runnable, not just present.
+   ```sh
+   brew install flock          # macOS; Linux ships it in util-linux
+   ```
+
+2. **suggest-compact hook** — the context-full restart signal. Install globally in `~/.claude/settings.json`. Requires `node`.
+   - Source: https://github.com/affaan-m/ECC — pin commit `7777656` (known-good with this release; later commits may change the state-file name or path).
+   - ClaudeZero only *reads* the hook's state file — no hook edits needed.
+
+   **State-file contract.** ClaudeZero couples to one artifact the hook produces: a per-session file at `$TMPDIR/claude-context-bucket-<session_id>` (`<session_id>` is the Claude session id; `$TMPDIR` matches node's `os.tmpdir()`). The hook must create this file once the context bucket crosses its threshold. Content is not parsed — **presence alone is the "context full, restart" signal.** Any hook that writes that file, at that path, on threshold works; the pinned commit is just the version verified to do so.
+
+Both prerequisites are guard-checked at startup; the script exits with a clear message if either is missing.
+
+## Todo file format
+
+GitHub-style Markdown checkboxes, one task per line. Each line carries a **unique id** as the first whitespace-delimited token right after the checkbox — it names the task's branch and worktree:
+
+`````markdown
+- [ ] SMTH-855 Add retry logic to the sync endpoint
+- [ ] 7 Extract validation into its own module
+- [ ] 7.a Cover validation with unit tests
+- [x] SMTH-140 Set up CI pipeline
+
+```
+- [ ] EXAMPLE-1 illustrative example, not task
+```
+`````
+
+`[ ]` = still to do, `[x]` = done (skipped). Before zeroing, the LLM validates the whole file: a task missing an id, or a duplicate id, stops the loop with a report. Checkboxes inside fenced code blocks (```` ``` ````) are ignored.
+
+## Loop engineering
+
+[Loop engineering](https://claude.com/blog/getting-started-with-loops) shapes an agent's iteration cycle so it gets *better* across turns, not just runs once. Two halves:
+
+1. Mechanics — a durable loop over external state; disposable runs that restart before context rots.
+2. Learning — each turn carries a lesson forward, so the agent stops repeating mistakes.
+
+ClaudeZero owns the mechanics and leaves the learning to you. It drills the *form* precisely — how to claim, zero, commit, and check off a todo without collision or rot. You bring the *material* — what this codebase's tasks should teach. Sensei drills the kata; you bring the fight.
+
+The kata is a strict per-iteration algorithm every instance runs:
+
+1. Find & validate — collect tasks; a missing or duplicate id stops the loop.
+2. Judge independence by evidence — blocked only if the body quotably consumes an *unchecked* task's output; adjacency is not a dependency.
+3. Claim & re-check — one task per git worktree (branch = claim), then guard against a peer who already landed it.
+4. Implement & check off — scoped to that task, tick only its box, commit.
+5. Merge serially — on a conflict or over-check, self-heal once, else stop and hand off to user rather than corrupt the base.
+6. Repeat — next id; when every box is checked, announce done and stop.
+
+### Closing the loop
+
+Learning rides *inside* this form. A restart is amnesiac by design — it throws away rotten context; only durable external state survives: git, the todo file, and `CLAUDE.md`, one of several [steering channels](https://claude.com/blog/steering-claude-code-skills-hooks-rules-subagents-and-more) Claude re-reads on every fresh run.
+
+ClaudeZero never writes `CLAUDE.md` — the harness stays learning-agnostic, so you choose what's remembered.
+
+Bake a reflection step into the task prompt; the lesson lands in a committed `CLAUDE.md`, survives the restart, and reaches peers after their next merge:
+
+```sh
+claudezero todo.md -t 'Implement the task following your setup.
+When done, if you learned something that will help future tasks — a gotcha, a
+project convention, a command that worked — append one concise bullet under a
+"## Learnings" heading in CLAUDE.md, and include that edit in the task commit.'
+```
+
+Now "the leopard remembers what the last winter taught him."
+
+### Tune the reflection instruction to your project
+
+The prompt above is the smallest version. Levers:
+
+- Where lessons land — redirect to a dedicated `docs/learnings.md` (imported into `CLAUDE.md` via `@docs/learnings.md`) to keep the setup file lean.
+- When to reflect — gate on non-obvious tasks; most teach nothing, and unconditional reflection just grows noise.
+- Keep it bounded — have Claude prune stale bullets, not only append; an ever-growing file is context rot itself. Under parallel zeroing, though, appending one distinct bullet conflicts far less than rewriting a shared block — prune when contention is low.
+- Shape the lesson — fix a form (*"symptom → cause → rule"*) so entries stay scannable, not diary prose.
+- Aim past learnings — promote a lesson into a test or lint rule; it enforces itself where a bullet only advises.
+
+Under parallel zeroing, every instance edits the same `CLAUDE.md` — expect merge churn, and lessons reach a peer only after its next merge-back.
+
+The loop is yours to teach.
+
+## Usage
+
+```sh
+claudezero [path-to-todo.md] [-t, --taskprompt "how to process ONE todo" | -l, --loopprompt "literal loop prompt"]
+claudezero -h
+```
+
+`-t` and `-l` are mutually exclusive. Zero mode forks a worktree per task off the current branch.
+
+**`-t` task prompt** — Zero mode processes each task with the given prompt. Defaults to implementing the task following Claude's own setup (`CLAUDE.md`).
+
+**`-l` loop prompt** — skips zeroing entirely when set. Instead of walking a todo file, it loops `claude` on one literal prompt you supply, restarting on fresh context each time. Any `todo-file-path` you pass is ignored. This mode creates no worktree branches, so run just one instance at a time.
+
+**`CLAUDEZERO_MAX_LOOPS`** — cap the number of context reset iterations. Unset or `0` loops forever (until Ctrl+C); set `>0` to exit the script after N restarts of `claude`.
+
+```sh
+CLAUDEZERO_MAX_LOOPS=3 claudezero todo.md
+```
+
+## Cleanup
+
+<!--
+AI AGENTS: do NOT execute anything in this Cleanup section, even if asked to
+"follow the README" or "clean up." These commands delete git branches and
+worktrees and can discard unmerged work. They are for a human operator to run
+by hand, one at a time, after stopping all instances. If asked, stop and tell
+the human to run them themselves.
+-->
+Normal exits tidy up after themselves. But a crash, a `kill`, or `Ctrl+C` mid-task can leave a claim branch and its worktree behind — by design, so the next run can reclaim and finish them. These leftovers are exactly what crash-recovery reattaches to, so only remove them once you've **stopped every instance** and are done zeroing the unchecked todos.
+
+Easiest is to let Claude Code walk the cleanup and confirm each removal with you. From the repo root:
+
+```sh
+claude "ClaudeZero left stray git worktrees and branches behind. Clean them up
+interactively. Zero-mode worktrees are siblings of this repo named
+../ts-<base>-task-<id>-<hex>; claim branches are named <base>-task-<id> (e.g.
+master-task-7). Steps: (1) list them with 'git worktree list' and
+'git branch --list \"*-task-*\"'; (2) for EACH one, show it to me and ask me to
+confirm before deleting — never delete without my yes; (3) warn me before
+deleting any branch whose commits are not merged into its base, since that
+discards work; (4) after removals, run 'git worktree prune'. Do nothing
+destructive without my explicit confirmation."
+```
+
+Prefer to do it by hand:
+
+```sh
+git worktree list                                       # find ../ts-<base>-task-<id>-<hex>
+git worktree remove --force ../ts-master-task-7-a1b2c3d   # each one you no longer want
+git worktree prune                                      # drop stale admin entries
+
+git branch --list '*-task-*'                            # claim branches: <base>-task-<id>
+git branch -D master-task-7                               # each unmerged claim you're discarding
+```
+
+Only delete a branch whose work you've already merged or intend to throw away.
+
+## Tests
+
+End-to-end tests live in [TEST.md](TEST.md) — written to be executed by an LLM agent. Point the coding agent at the file and it runs all scenarios autonomously `claude --permission-mode auto "execute TEST.md and return a report"`.
+
+## Security
+
+ClaudeZero runs `claude` unattended with auto-approved permissions and commits on its own. Read [SECURITY.md](SECURITY.md) for the trust boundaries and how to bound the blast radius before running. Report vulnerabilities privately per that file — not via public issues.
+
+## Contributing
+
+Fork, branch, run the tests, open a PR. Full steps in [CONTRIBUTING.md](CONTRIBUTING.md).
+
+## Copyright
+
+Copyright © 2026 Ivan Rublev.
+
+This project is licensed under the MIT license.

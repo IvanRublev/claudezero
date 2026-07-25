@@ -1,0 +1,19 @@
+name: Bump Homebrew tap
+
+# On a published release, bump url + sha256 in the tap formula.
+# Wraps `brew bump-formula-pr`. Does not build bottles or touch this repo.
+on:
+  release:
+    types: [published]
+
+jobs:
+  bump:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: dawidd6/action-homebrew-bump-formula@v3
+        with:
+          # PAT with `repo` scope on the tap repo. Store as an Actions secret.
+          token: ${{ secrets.TAP_TOKEN }}
+          tap: IvanRublev/homebrew-tap
+          formula: claudezero
+          # Opens a PR on the tap by default. Add `push: true` to commit direct.

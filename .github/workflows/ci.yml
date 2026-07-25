@@ -1,0 +1,46 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+jobs:
+  # Deterministic hard gate: pinned shellcheck, same result on every run.
+  # Findings = red = block the PR (make this a required check in branch protection).
+  shellcheck:
+    runs-on: ubuntu-latest
+    env:
+      SC_VERSION: v0.10.0
+    steps:
+      - uses: actions/checkout@v5
+      - name: ShellCheck (pinned ${{ env.SC_VERSION }})
+        run: |
+          set -euo pipefail
+          url="https://github.com/koalaman/shellcheck/releases/download/${SC_VERSION}/shellcheck-${SC_VERSION}.linux.x86_64.tar.xz"
+          curl -fsSL "$url" | tar -xJ
+          bin="shellcheck-${SC_VERSION}/shellcheck"
+          "$bin" --version
+          "$bin" claudezero.sh .github/smoke.sh .github/check-embedded.sh
+      - name: ShellCheck embedded scripts (zero.sh, hooks, merge driver)
+        run: SHELLCHECK="shellcheck-${SC_VERSION}/shellcheck" bash .github/check-embedded.sh
+
+  # OS-dependent checks: bash 3.2 syntax (macos /bin/bash is 3.2) + dependency smoke.
+  utils_call_check:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Syntax check
+        run: /bin/bash -n claudezero.sh
+
+      - name: Install flock (macOS only; Linux ships it in util-linux)
+        if: runner.os == 'macOS'
+        run: brew install flock
+
+      - name: Dependency smoke test
+        run: /bin/bash .github/smoke.sh
