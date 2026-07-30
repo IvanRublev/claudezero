@@ -146,7 +146,12 @@ while true; do
 done
 
 # single closer — every exit path (Ctrl+C or MAX_LOOPS) lands here, so dojo_proud lives in one place.
+# The exit report goes here too: the loop's own report prints before the between-runs sleep, so a
+# Ctrl+C in that gap used to end the run on figures stale by one claude run. After credit_inflight_time
+# so a task still in flight is folded in before the files are read.
 credit_inflight_time
+print_report "$(date +%s)"
+print_fleet_total
 if all_todos_done; then dojo_proud; fi
 reap_dead_sessions   # no future acquire will reap this session's marker
 }
@@ -320,12 +325,13 @@ fmt_tok() {
 #   first match per line is the parent field — usage.iterations[] repeats all four names one level
 #     down, and usage.cache_creation carries the ephemeral_5m/1h leaves that already sum into
 #     cache_creation_input_tokens. Take the parent only, never the leaves or the nested copy.
+# $1 = transcript-list file, default this instance's — the fleet total passes each peer's in turn.
 read_tokens_total() {
-  [ -n "${TRANSCRIPTS_FILE:-}" ] && [ -f "$TRANSCRIPTS_FILE" ] || return 0
-  local p
+  local tf=${1:-${TRANSCRIPTS_FILE:-}} p
+  [ -n "$tf" ] && [ -f "$tf" ] || return 0
   while IFS= read -r p; do
     if [ -f "$p" ]; then cat "$p"; fi
-  done < "$TRANSCRIPTS_FILE" | awk '
+  done < "$tf" | awk '
     function num(key,   s) {
       if (!match($0, "\"" key "\":[0-9]+")) return 0
       s = substr($0, RSTART, RLENGTH); sub(/.*:/, "", s); return s + 0
@@ -392,6 +398,53 @@ print_report() {
   fi
   printf '  %-20s %s\n' 'ClaudeZero run loop:' "$(fmt_dur $(( $1 - LOOP_START )))"
   print_tokens
+}
+
+# fleet-wide TOTAL for this base, printed once on the exit path beneath this instance's report.
+# The sum is a GLOB, not a registry: every figure is already one file per instance in the git common
+# dir, so a shared aggregate would only be a second copy that can disagree with the first. Read
+# without flock — all three writers publish with temp-file + mv, so a reader sees the old file or
+# the new one, never a torn line. No baseline: per-instance files are created fresh under a new
+# INSTANCE_ID each launch and dead runs' files are GC'd at startup, so what is on disk IS this run;
+# subtracting a startup snapshot would under-report peers that started earlier. A crashed peer's
+# files are summed too — its merged todos did land. Solo run prints nothing: with one id the total
+# just restates the block above it. `ClaudeZero run loop:` is omitted — instances' wall times
+# overlap, so their sum is not a duration anything took.
+print_fleet_total() {
+  local gc slug pre f id ids="" n=0 secs=0 done_n=0 t any=0 ti=0 to=0 tcc=0 tcr=0 tt=0
+  gc="$(cd "$(git rev-parse --git-common-dir)" 2>/dev/null && pwd)" || return 0
+  [ -n "$gc" ] || return 0
+  slug="${BASE_BRANCH//\//-}"
+  for pre in todos-seconds todos-done transcripts; do    # union: an instance that merged nothing
+    for f in "$gc/$pre-$slug-"*; do                      # writes no todos-done file, but has tokens
+      [ -e "$f" ] || continue
+      case "$f" in *.lock|*.tmp) continue;; esac
+      id="${f##*/"$pre"-"$slug"-}"
+      case " $ids " in *" $id "*) continue;; esac
+      ids="$ids $id"; n=$((n+1))
+    done
+  done
+  [ "$n" -gt 1 ] || return 0
+  for id in $ids; do
+    secs=$((   secs   + $(read_counter "$gc/todos-seconds-$slug-$id") ))
+    done_n=$(( done_n + $(read_counter "$gc/todos-done-$slug-$id") ))
+    t="$(read_tokens_total "$gc/transcripts-$slug-$id" || true)"
+    # shellcheck disable=SC2086  # deliberate split: awk emits five space-separated integers
+    set -- $t
+    if [ "$#" -eq 5 ]; then any=1; ti=$((ti+$1)); to=$((to+$2)); tcc=$((tcc+$3)); tcr=$((tcr+$4)); tt=$((tt+$5)); fi
+  done
+  printf '\n-----------------------------------------------\n'
+  printf '❄ TOTAL (%s instances)\n' "$n"
+  if [ "${MODE:-}" = zero ]; then
+    printf '  %-20s %s  ·  %s completed\n' 'Todos:' "$(fmt_dur "$secs")" "$done_n"
+  fi
+  if [ "$any" = 1 ]; then
+    printf '\n  Tokens: %s Total\n' "$(fmt_tok "$tt")"
+    printf '  in %s · out %s · cache write %s · cache read %s\n' \
+      "$(fmt_tok "$ti")" "$(fmt_tok "$to")" "$(fmt_tok "$tcc")" "$(fmt_tok "$tcr")"
+  else
+    printf '\n  Tokens: n/a\n'
+  fi
 }
 
 # credit orphaned in-flight tasks before an exit-path report: zero.sh folds worktrees whose owner
