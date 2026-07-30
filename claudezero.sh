@@ -126,7 +126,7 @@ while true; do
     # first prompt submitted straight from the CLI arg. The session Stop hook SIGTERMs claude
     # when context fills; exit 143 is the normal restart path, so swallow it.
     CLAUDEZERO_INSTANCE="$INSTANCE_ID" CLAUDEZERO_TRANSCRIPTS="$TRANSCRIPTS_FILE" \
-        claude --settings "$STOP_SETTINGS" --permission-mode auto "$PROMPT" >&4 2>&4 || true
+        claude --settings "$STOP_SETTINGS" --permission-mode auto --name "$SESSION_NAME" "$PROMPT" >&4 2>&4 || true
     # claude killed mid-run (Ctrl+C/SIGTERM) can leave the tty in raw mode with ISIG off; then every
     # later Ctrl+C arrives as a 0x03 byte, not a SIGINT, so the INT trap never fires and the loop
     # spins forever restarting claude on a wedged terminal. Restore cooked mode so Ctrl+C signals again.
@@ -161,6 +161,10 @@ BASE_BRANCH="$(git rev-parse --abbrev-ref HEAD)"
 # compare instances after a run and size the fleet next time. Exported into claude's env below,
 # inherited by its Bash-tool children; zero.sh reads it (CLAUDEZERO_INSTANCE) to route credit.
 INSTANCE_ID="$(uuidgen 2>/dev/null | tr -d - | head -c8)"; [ -n "$INSTANCE_ID" ] || INSTANCE_ID="$$"
+# claude's display name (prompt box, /resume picker, terminal title) — the same id the report heads
+# its stats with, plus a dojo-student activity so parallel terminals are told apart without reading
+# hex. Derived from the id, never from chance, so every restart re-launches under the same name.
+SESSION_NAME="($INSTANCE_ID) $(dojo_student "$INSTANCE_ID")"
 
 # -t/--taskprompt sets the zero task prompt; -l/--loopprompt runs claude on a
 # literal prompt (skips zero mode). They are mutually exclusive.
@@ -416,6 +420,24 @@ dojo_wisdom() {
     'ClaudeZero stretches, long and slow, and says nothing.'
   )
   printf '\n❄ %s\n' "${w[RANDOM % ${#w[@]}]}"
+}
+# what the student under ClaudeZero's guidance is busy with — the tail of a claude session's
+# display name. $1 = instance id; the first two chars (hex from uuidgen, decimal from the $$
+# fallback — both valid hex) pick the line, so the name is stable across context restarts.
+dojo_student() {
+  local a=(
+    'drilling the fork-implement-merge kata'
+    'hauling snow buckets uphill'
+    'claiming a track before stepping on it'
+    'reading the whole task before striking'
+    'starting over on fresh snow'
+    'carving one checkbox into ice'
+    'chasing one unchecked box'
+    'practicing one clean strike per task'
+    "leaving a peer's branch untouched"
+    'approaching the merge gate'
+  )
+  printf '%s' "${a[$(( 16#${1:0:2} % 10 ))]}"
 }
 # the proud closer — his quiet nod of pride, printed independently once every todo has landed.
 dojo_proud() { printf '\n❄ ClaudeZero surveys the frozen field, and is proud.\n'; }

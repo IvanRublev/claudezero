@@ -600,6 +600,75 @@ not a tty) — exactly the operator's situation.
 
 ---
 
+## Scenario H — claude session display name   `[$TESTROOT/H]`   (stub claude, deterministic)
+
+Each instance names its claude session `(<instance id>) <student activity>` via `--name`, so
+parallel terminals are told apart without reading hex. The name must reach claude as ONE argv
+element, and must be the SAME on every context restart (derived from the id, never from chance).
+The stub claude echoes its argv, so no real claude is needed.
+
+### Setup
+```bash
+TH="$TESTROOT/H"; mkdir -p "$TH/repo" "$TH/bin"
+cat > "$TH/bin/claude" <<'EOF'
+#!/usr/bin/env bash
+printf 'ARGV:'; for a in "$@"; do printf ' [%s]' "$a"; done; printf '\n'
+exit 0
+EOF
+chmod +x "$TH/bin/claude"
+cd "$TH/repo"
+git init -q -b main; git config user.email t@t.t; git config user.name test
+printf -- '- [ ] H1 x\n' > todo.md; git add -A; git commit -qm init
+# the ten activities, verbatim (claudezero.sh dojo_student)
+ACT=('drilling the fork-implement-merge kata' 'hauling snow buckets uphill' \
+     'claiming a track before stepping on it' 'reading the whole task before striking' \
+     'starting over on fresh snow' 'carving one checkbox into ice' 'chasing one unchecked box' \
+     'practicing one clean strike per task' "leaving a peer's branch untouched" \
+     'approaching the merge gate')
+# claude's own output goes to fd 4, which falls back to stdout only when there is no controlling
+# terminal — run detached so the stub's ARGV line lands in the capture file (see Scenario G).
+detachH() {
+  if command -v setsid >/dev/null 2>&1; then setsid "$@"
+  elif command -v python3 >/dev/null 2>&1; then
+    python3 -c 'import os,sys; os.setsid(); os.execvp(sys.argv[1], sys.argv[1:])' "$@"
+  else echo "H SKIP — neither setsid nor python3 available to drop the controlling terminal" >&2; fi
+}
+```
+
+### H1 — name construction, unsplit argv, restart stability
+```bash
+cd "$TH/repo"
+detachH env PATH="$TH/bin:$PATH" CLAUDEZERO_MAX_LOOPS=3 \
+  timeout 90 bash "$SCRIPT" todo.md -t x > "$TH/run.log" 2>&1 || true
+ID=$(grep -m1 -oE 'instance [0-9A-Za-z]+' "$TH/run.log" | awk '{print $2}')
+WANT="($ID) ${ACT[$(( 16#${ID:0:2} % 10 ))]}"
+echo "H1 want name     : $WANT"
+echo "H1 launches      : $(grep -c '^ARGV:' "$TH/run.log")  (want 3)"
+echo "H1 named+unsplit : $(grep -c -F -- "[--name] [$WANT]" "$TH/run.log")  (want 3)"
+```
+- **H1 PASS** — `launches = 3` and `named+unsplit = 3`: `--name` carries the parenthesised,
+  space-containing name as a single argv element, the activity is the one the id selects by
+  `16#<first two chars> % 10`, and all three restarts used the same name.
+
+### H2 — loop mode named too; decimal (`$$`-shaped) id picks an activity, not an error
+```bash
+cd "$TH/repo"
+detachH env PATH="$TH/bin:$PATH" CLAUDEZERO_MAX_LOOPS=1 \
+  timeout 60 bash "$SCRIPT" -l 'hi' > "$TH/loop.log" 2>&1 || true
+echo "H2 loop-mode name: $(grep -m1 -oE '\[--name\] \[[^]]*\]' "$TH/loop.log" || echo NONE)"
+# the $$ fallback id is decimal digits — valid hex, so the same derivation applies with no
+# branch. Drive the real function on such an id.
+eval "$(sed -n '/^dojo_student()/,/^}/p' "$SCRIPT")"
+echo "H2 decimal id    : $(dojo_student 48584); $(dojo_student 90210)  (two activities, no error)"
+echo "H2 deterministic : $([ "$(dojo_student a1b2c3d4)" = "$(dojo_student a1ffffff)" ] && echo yes || echo NO)"
+echo "H2 a1 vs b2      : $([ "$(dojo_student a1b2c3d4)" != "$(dojo_student b2b2c3d4)" ] && echo differ || echo same)"
+```
+- **H2 PASS** — the loop-mode line shows `[--name] [(<id>) <activity>]`, both decimal ids render
+  an activity with no arithmetic error, `deterministic = yes` (only the first two chars select),
+  and `a1 vs b2 = differ` (`16#a1 % 10 = 1`, `16#b2 % 10 = 8`).
+
+---
+
 ## Run all in parallel (optional)
 
 After Section 0 and each Setup, launch the Run blocks together: put A's and C's run
