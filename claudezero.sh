@@ -186,9 +186,11 @@ else
     # (not detached) and CLEAN before we start — else refuse and let the human decide.
     [ "$BASE_BRANCH" != HEAD ] || { echo "$PROG: detached HEAD — check out the base branch first."; exit 1; }
     # guardrail: claude's Bash calls run from cwd, and the zero prompt + `.git/zero.sh` + `../ts-*`
-    # worktree paths all assume cwd is the repo root — refuse a subdir launch so they never misfire.
-    REPO_ROOT="$(git rev-parse --show-toplevel)"
-    [ "$PWD" = "$REPO_ROOT" ] || { echo "$PROG: not at repo root — cd to '$REPO_ROOT' first."; exit 1; }
+    # worktree paths all assume cwd is the main worktree's root — refuse a subdir launch, and a
+    # launch inside a leftover `../ts-*` claim worktree, so they never misfire. The first entry of
+    # `git worktree list --porcelain` is always the main worktree, so one compare covers both.
+    REPO_ROOT="$(git worktree list --porcelain | sed -n '1s/^worktree //p')"
+    [ "$PWD" = "$REPO_ROOT" ] || { echo "$PROG: not at the main repo root — cd to '$REPO_ROOT' first. (ClaudeZero's own ../ts-* task worktrees are never valid launch dirs.)"; exit 1; }
     [ -z "$(git status --porcelain)" ] || { echo "$PROG: working tree on '$BASE_BRANCH' is dirty — commit or stash first."; git status --short; exit 1; }
     printf '  zero mode · base %s · fork → implement → commit → merge\n\n' "$BASE_BRANCH"
     # todo path: from the positional arg, else ask interactively.

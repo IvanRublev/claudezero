@@ -178,14 +178,14 @@ echo "zero.sh wrote files: $(ls "$T"/repo/.git 2>/dev/null | grep -c '^todos-sec
 
 ## Scenario B — startup-guard refusals   `[$TESTROOT/B]`   (no claude)
 
-Three pristine repos: one with a dirty working tree, one on a detached HEAD, one clean
-launched from a subdir. Each must make claudezero refuse to start with the matching
-message and a non-zero exit.
+Four pristine repos: one with a dirty working tree, one on a detached HEAD, one clean
+launched from a subdir, one clean launched from inside a leftover `../ts-*` task worktree.
+Each must make claudezero refuse to start with the matching message and a non-zero exit.
 
 ### Setup
 ```bash
 TB="$TESTROOT/B"
-for name in dirty detached nested; do
+for name in dirty detached nested worktree; do
   mkdir -p "$TB/$name"
   ( cd "$TB/$name"; git init -q; git config user.email t@t.t; git config user.name test
     echo x > f; git add f; git commit -qm init
@@ -194,6 +194,9 @@ done
 ( cd "$TB/dirty";    echo change >> f )       # dirty working tree
 ( cd "$TB/detached"; git checkout -q --detach )
 mkdir -p "$TB/nested/sub"                      # clean repo; we launch from this subdir
+# leftover claim worktree, exactly what a crashed peer abandons: branch <base>-task-1 + ../ts-*
+( cd "$TB/worktree"; base="$(git rev-parse --abbrev-ref HEAD)"
+  git worktree add -q "$TB/ts-$base-task-1-dead" -b "$base-task-1" "$base" )
 ```
 
 ### Run + assert
@@ -208,11 +211,19 @@ if out=$(timeout 20 bash "$SCRIPT" todo.md -t x 2>&1); then rc=0; else rc=$?; fi
 
 cd "$TB/nested/sub"                            # clean repo, but not at the repo root
 if out=$(timeout 20 bash "$SCRIPT" ../todo.md -t x 2>&1); then rc=0; else rc=$?; fi
-{ [ "$rc" != 0 ] && echo "$out" | grep -qi 'not at repo root'; } && echo "B3 subdir-guard PASS" || echo "B3 FAIL (rc=$rc): $out"
+{ [ "$rc" != 0 ] && echo "$out" | grep -qi 'not at.*repo root'; } && echo "B3 subdir-guard PASS" || echo "B3 FAIL (rc=$rc): $out"
+
+cd "$TB/ts-$(git -C "$TB/worktree" rev-parse --abbrev-ref HEAD)-task-1-dead"   # a peer's claim worktree
+if out=$(timeout 20 bash "$SCRIPT" todo.md -t x 2>&1); then rc=0; else rc=$?; fi
+{ [ "$rc" != 0 ] && echo "$out" | grep -qi 'not at.*repo root'; } && echo "B4 worktree-guard PASS" || echo "B4 FAIL (rc=$rc): $out"
+git -C "$TB/worktree" branch --list '*-task-*-task-*' | grep -q . && echo "B4 FAIL: second-claim branch created"
 ```
-- **B PASS** — B1, B2, and B3 all report PASS (non-zero exit + the expected message,
-  before any claude launch). B3 proves the worktree-path assumption is enforced: a subdir
-  launch refuses rather than misfiring `../ts-*` paths.
+- **B PASS** — B1, B2, B3, and B4 all report PASS (non-zero exit + the expected message,
+  before any claude launch), and no `*-task-*-task-*` branch exists. B3 proves the
+  worktree-path assumption is enforced: a subdir launch refuses rather than misfiring
+  `../ts-*` paths. B4 proves the same for a launch *inside* a leftover claim worktree, where
+  the base branch would otherwise be poisoned to a peer's claim and both instances would take
+  the same todo (BUG-014).
 
 ---
 
