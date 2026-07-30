@@ -161,18 +161,22 @@ echo "latch opened    : $([ -f "$T/gate/opened" ] && echo yes || echo no)"
 echo "restarts (A/B/C): $(grep -c restarting "$T/log_AGENT_A.txt") $(grep -c restarting "$T/log_AGENT_B.txt") $(grep -c restarting "$T/log_AGENT_C.txt")"
 # timing / per-instance isolation:
 echo "instance ids    : $(grep -h -oE 'instance [^)]+' "$T"/log_AGENT_*.txt | sort -u | wc -l | tr -d ' ')"
-echo "report labels   : $(grep -h -cE '  (Todos|Claude loops|ClaudeZero run loop):' "$T"/log_AGENT_A.txt | tr -d ' ')"
+echo "report labels   : $(grep -h -cE '  (Todos|ClaudeZero run loop):' "$T"/log_AGENT_A.txt | tr -d ' ')"
+echo "stale loop line : $(grep -h -c 'Claude loops:' "$T"/log_AGENT_A.txt | tr -d ' ')  (want 0)"
+echo "todos counted   : $(grep -h -oE 'Todos:.*· [0-9]+ completed' "$T"/log_AGENT_A.txt | tail -1)"
 echo "zero.sh wrote files: $(ls "$T"/repo/.git 2>/dev/null | grep -c '^todos-seconds-')"
+echo "zero.sh wrote counts: $(ls "$T"/repo/.git 2>/dev/null | grep -c '^todos-done-')"
 ```
 - **Zero PASS** — all 5 markers present, `todos checked = 5/5`, `git clean = yes`.
 - **Parallel PASS** — `latch opened = yes` AND `distinct agents = 3`.
 - **Restart PASS** — restarts summed across the three logs ≥ 3.
 - **Timing PASS** — `instance ids = 3` (each instance a distinct id → isolation), each
-  agent's log shows the `Todos:` / `Claude loops:` / `ClaudeZero run loop:` lines, and
-  `zero.sh wrote files ≥ 1`. That last one is the **env-hop proof**: `zero.sh` only
-  writes `todos-seconds-<base>-<id>` when it received `CLAUDEZERO_INSTANCE` from claude's
-  env. (An instance that merged 0 tasks writes no file, so the count can be < 3; ≥ 1 is
-  the gate.)
+  agent's log shows the `Todos:` / `ClaudeZero run loop:` lines with `stale loop line = 0`,
+  `todos counted` shows a non-zero `N completed` for an agent that merged, the per-agent
+  counts sum to 5, and `zero.sh wrote files ≥ 1` / `zero.sh wrote counts ≥ 1`. Those last
+  two are the **env-hop proof**: `zero.sh` only writes `todos-seconds-<base>-<id>` and
+  `todos-done-<base>-<id>` when it received `CLAUDEZERO_INSTANCE` from claude's env. (An
+  instance that merged 0 tasks writes no file, so the count can be < 3; ≥ 1 is the gate.)
 
 ---
 
@@ -385,16 +389,21 @@ cd "$TE/repo"
 GC="$(cd "$(git rev-parse --git-common-dir)" && pwd)"; mkdir -p "$GC/instance"
 printf '%s\n%s\n' 999999 fake > "$GC/instance/DEADID"          # marker of a dead instance
 : > "$GC/todos-seconds-main-DEADID"; : > "$GC/todos-seconds-main-DEADID.lock"
+: > "$GC/todos-done-main-DEADID";    : > "$GC/todos-done-main-DEADID.lock"
 : > "$GC/todos-seconds-main-NOMARK"                             # file with no marker at all
+: > "$GC/todos-done-main-NOMARK"
 # run claudezero once more (stub claude) → startup registers our live instance, then GCs orphans
 PATH="$TE/bin:$PATH" timeout 30 env CLAUDEZERO_MAX_LOOPS=1 bash "$SCRIPT" todo.md -t x > "$TE/boot2.log" 2>&1 || true
 echo "E2 dead file gone   : $([ -f "$GC/todos-seconds-main-DEADID" ] && echo NO || echo yes)"
+echo "E2 dead count gone  : $([ -f "$GC/todos-done-main-DEADID" ] || [ -f "$GC/todos-done-main-DEADID.lock" ] && echo NO || echo yes)"
 echo "E2 dead marker gone : $([ -f "$GC/instance/DEADID" ] && echo NO || echo yes)"
 echo "E2 nomark file gone : $([ -f "$GC/todos-seconds-main-NOMARK" ] && echo NO || echo yes)"
+echo "E2 nomark count gone: $([ -f "$GC/todos-done-main-NOMARK" ] && echo NO || echo yes)"
 ```
-- **E2 PASS** — all three `gone = yes`: the dead instance's marker was reaped by liveness,
-  and both its time-file (+ `.lock`) and the unmarked file were deleted. (This run's own
-  instance marker is live during the sweep, so a real instance's file is never collateral.)
+- **E2 PASS** — all five `gone = yes`: the dead instance's marker was reaped by liveness,
+  and its time-file, its count-file (both + `.lock`) and the unmarked files were deleted.
+  (This run's own instance marker is live during the sweep, so a real instance's file is
+  never collateral.)
 
 ## Scenario F — fenced-checkbox immunity   `[$TESTROOT/F]`   (stub claude, deterministic)
 
@@ -478,10 +487,10 @@ cd "$REPO"
 echo "TESTROOT gone  : $([ -d "$TESTROOT" ] && echo NO || echo yes)"
 echo "stale worktrees: $(git worktree list | tail -n +2 | wc -l | tr -d ' ') (want 0)"
 echo "stale branches : $(git branch --list '*-task-*' | wc -l | tr -d ' ') (want 0)"
-echo "stray files    : $(ls .git 2>/dev/null | grep -c '^todos-seconds-\|^zero.sh$\|^instance$')  (want 0)"
+echo "stray files    : $(ls .git 2>/dev/null | grep -c '^todos-seconds-\|^todos-done-\|^zero.sh$\|^instance$')  (want 0)"
 git status --porcelain
 ```
 All counts must be 0 and `git status` empty. A leftover worktree, `*-task-*` branch, or
-`todos-seconds-*`/`zero.sh`/`instance/` under the project's `.git` means a test ran
+`todos-seconds-*`/`todos-done-*`/`zero.sh`/`instance/` under the project's `.git` means a test ran
 claudezero against the project repo instead of its `$TESTROOT` sandbox — report it, don't
 silently delete.
