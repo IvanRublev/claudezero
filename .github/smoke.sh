@@ -67,4 +67,17 @@ flock "$repo/.wtlock" git worktree remove --force "$wt"        || fail "git work
 git worktree prune                                             || fail "git worktree prune failed"
 ok "git worktree add/repair/remove/prune"
 
+# 7. main-worktree root — git worktree list --porcelain | sed -n '1s/^worktree //p' (claudezero.sh:191)
+#    First porcelain entry must be the MAIN worktree even when read from inside a linked one,
+#    which is what makes the root guard refuse a launch in a leftover ../ts-* worktree (BUG-014).
+main_root="$(cd "$repo" && pwd -P)"
+[ "$(git -C "$repo" worktree list --porcelain | sed -n '1s/^worktree //p')" = "$main_root" ] \
+  || fail "porcelain/sed main-root form failed from the main worktree"
+wt2="$tmp/repo-task-2"
+git -C "$repo" worktree add "$wt2" -b "$base-task-2" "$base" >/dev/null 2>&1 || fail "worktree add for root check failed"
+[ "$(cd "$wt2" && git worktree list --porcelain | sed -n '1s/^worktree //p')" = "$main_root" ] \
+  || fail "porcelain/sed answered the linked worktree instead of the main one"
+git -C "$repo" worktree remove --force "$wt2" >/dev/null 2>&1
+ok "git worktree list --porcelain | sed main-root"
+
 echo "SMOKE PASS ($(uname -s), bash $BASH_VERSION)"
