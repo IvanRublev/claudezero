@@ -450,6 +450,61 @@ cd "$TF/repo"
 
 ---
 
+## Scenario G — claude's output descriptor (fd 4)   `[$TESTROOT/G]`   (stub claude, deterministic)
+
+claude writes to fd 4 so `claudezero.sh … | tee run.log` logs the `❄` reports without the
+TUI. Only the *fallback* is deterministic here: with output captured to a file there is no
+controlling terminal, so fd 4 must fall back to plain stdout and the stub's bytes must still
+appear in the captured stream. The split itself needs a pty — manual check below.
+
+### Setup + assert
+```bash
+TG="$TESTROOT/G"; mkdir -p "$TG/repo" "$TG/bin"
+cat > "$TG/bin/claude" <<'EOF'
+#!/usr/bin/env bash
+echo "STUB-CLAUDE-MARKER"
+exit 0
+EOF
+chmod +x "$TG/bin/claude"
+cd "$TG/repo"
+git init -q -b main; git config user.email t@t.t; git config user.name test
+printf -- '- [ ] G1 x\n' > todo.md; git add -A; git commit -qm init
+# run as a session leader so there is genuinely no controlling terminal (macOS has no setsid)
+detach() {
+  if command -v setsid >/dev/null 2>&1; then setsid "$@"
+  elif command -v python3 >/dev/null 2>&1; then
+    python3 -c 'import os,sys; os.setsid(); os.execvp(sys.argv[1], sys.argv[1:])' "$@"
+  else echo "G1 SKIP — neither setsid nor python3 available to drop the controlling terminal" >&2; fi
+}
+detach env PATH="$TG/bin:$PATH" CLAUDEZERO_MAX_LOOPS=1 \
+  timeout 30 bash "$SCRIPT" todo.md -t x > "$TG/run.log" 2>&1 || true
+echo "G1 stub output kept : $(grep -c 'STUB-CLAUDE-MARKER' "$TG/run.log")  (want 1 — fd 4 fell back to stdout)"
+echo "G1 own output kept  : $(grep -c '❄ ClaudeZero' "$TG/run.log")  (want >=1)"
+```
+- **G1 PASS** — both counts as stated: with no controlling terminal the `(: >/dev/tty)` probe
+  fails, fd 4 is a dup of stdout, and no scenario that captures output loses stub-claude bytes.
+  Detaching explicitly matters — run from a terminal without `detach`, the probe succeeds and
+  the stub's bytes go to the terminal by design, which is the whole point of the split.
+
+### G2 — the split itself (manual, needs a pty)
+
+Not scripted: it needs a real terminal, and the two `script(1)` implementations take
+opposite argument orders. Run one of these by hand in a scratch repo with a real `claude`:
+
+```bash
+# macOS / BSD script — typescript to /dev/null; script's own stdout is the pipe
+script -q /dev/null ./claudezero.sh issues/todo.md 2>&1 | { trap '' INT; tee run.log; }
+# util-linux script — command via -c, typescript file last
+script -q -c "./claudezero.sh issues/todo.md 2>&1" /dev/null | { trap '' INT; tee run.log; }
+```
+`script` gives claudezero a pty (so `/dev/tty` opens) while its stdout is the pipe (so fd 1 is
+not a tty) — exactly the operator's situation.
+- **G2 PASS** — `run.log` holds the `❄` banner, reports, and loop notices and no TUI frames
+  (`grep -c $'\033' run.log` is `0`), the terminal shows both streams, and pressing Ctrl+C in
+  the between-runs gap still lands the closing report in `run.log`.
+
+---
+
 ## Run all in parallel (optional)
 
 After Section 0 and each Setup, launch the Run blocks together: put A's and C's run
