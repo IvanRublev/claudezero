@@ -65,10 +65,13 @@ $ claudezero todo.md
 
 … fresh context, next task …
 
-❄ execution time (instance a1b2c3d4)
+❄ execution stats (instance a1b2c3d4)
   Todos:               12m 30s
   Claude loops:        41m 02s
   ClaudeZero run loop: 48m 15s
+
+  Tokens: 5.8M Total
+  in 2.1k · out 84.3k · cache write 312k · cache read 5.4M
 
 ❄ ClaudeZero surveys the frozen field, and is proud.
 ```
@@ -106,6 +109,10 @@ Supported on **macOS and Linux** (the script is bash-3.2-safe, so stock macOS `b
    **State-file contract.** ClaudeZero couples to one artifact the hook produces: a per-session file at `$TMPDIR/claude-context-bucket-<session_id>` (`<session_id>` is the Claude session id; `$TMPDIR` matches node's `os.tmpdir()`). The hook must create this file once the context bucket crosses its threshold. Content is not parsed — **presence alone is the "context full, restart" signal.** Any hook that writes that file, at that path, on threshold works; the pinned commit is just the version verified to do so.
 
 Both prerequisites are guard-checked at startup; the script exits with a clear message if either is missing.
+
+**Transcript-schema contract.** The token figures in the execution-stats report are a second coupling to Claude Code internals, alongside the state file above. ClaudeZero's own Stop hook records each session's `transcript_path` (a field of the hook payload it already parses `session_id` from), and after `claude` exits the loop reads those session JSONL transcripts and sums the `message.usage` fields of every assistant line: `input_tokens`, `output_tokens`, `cache_creation_input_tokens`, `cache_read_input_tokens` — the four categories Anthropic bills separately. One API request is written as several transcript lines, one per content block, each repeating the same `usage` object verbatim, so records are **deduped by the line's `requestId`**, and only the first (parent) match of each field name on a line is taken: `usage.iterations[]` repeats all four names one level down, and `usage.cache_creation` carries the `ephemeral_5m`/`ephemeral_1h` leaves that already sum into the parent. Transcripts are only ever read, and no schema change can fail a run — any parse miss prints `Tokens: n/a` and the run continues.
+
+Two limits: **subagent tokens are invisible** — a session that used the Agent tool writes no `isSidechain` usage lines, so anything the task prompt spawns is missing from the totals, and the size of the under-count is not measurable from inside; and the figures are **per instance run, for this repo only**, unlike whole-machine tools such as `ccusage`, whose denominator is every Claude Code session on the box.
 
 ## Todo file format
 

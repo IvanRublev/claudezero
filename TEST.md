@@ -1,6 +1,6 @@
 # TEST.md — end-to-end tests for `claudezero.sh`
 
-Five scenarios, each in its own folder under a single **isolated TESTROOT created
+Each scenario lives in its own folder under a single **isolated TESTROOT created
 outside the repo** (via `mktemp -d`). They touch separate throwaway git repos, never
 the project's own working tree or history, and can run concurrently.
 
@@ -16,6 +16,10 @@ the project's own working tree or history, and can run concurrently.
   task's box; `merge_task` refuses with a pointer and the agent self-heals (step 2.f).
 - **E — timing accounting.** Deterministic, **no real claude** (a stub `claude` on PATH):
   per-instance in-flight credit routing + idempotency, and startup orphan-file GC.
+- **G — token accounting.** Deterministic, **no real claude** (a stub that fabricates a
+  session transcript and fires the real Stop hook): `requestId` dedupe, no double-count of
+  the nested `iterations`/`cache_creation` fields, accumulation across restarts, and
+  `Tokens: n/a` degradation.
 
 Parallelism (A, C) is enforced with a **file-lock barrier**, not `sleep`, so the
 proof is independent of claude startup/shutdown times.
@@ -32,10 +36,10 @@ reading this file can run it autonomously and report the results.
 **Prerequisites:** `flock`, `uuidgen`, `timeout`, `git`, `date`, `find`, `stat`, `mv`
 on PATH. A and C need real `claude` on PATH and the `suggest-compact` hook installed in
 `~/.claude/settings.json` (claudezero.sh refuses to start without it — if A/C logs show
-an immediate hook error, report "prerequisite missing — suggest-compact hook"). B and E
-do **not** need real claude but still need `flock` and the `suggest-compact` hook (both
-startup guards run before any claude launch; E supplies a stub `claude` so claudezero
-writes `zero.sh` and loops out at once). A missing hook makes B/E exit with the wrong
+an immediate hook error, report "prerequisite missing — suggest-compact hook"). B, E, F and
+G do **not** need real claude but still need `flock` and the `suggest-compact` hook (both
+startup guards run before any claude launch; E/F/G supply a stub `claude` so claudezero
+writes `zero.sh` and loops out at once). A missing hook makes them exit with the wrong
 message and their assertions fail.
 
 Inform about progress during the test; at the end return a summary report
@@ -437,6 +441,88 @@ cd "$TF/repo"
 - **F2 PASS** — `real done id = 0`, both fenced ids = `1`: a checked example box never
   reports a task as landed.
 
+## Scenario G — token accounting   `[$TESTROOT/G]`   (stub claude, deterministic)
+
+The token figures come from the session transcripts the Stop hook records, so a stub
+`claude` that fabricates a transcript and then fires the **real** hook exercises the whole
+path with no API calls and no real claude. `MAX_LOOPS=3` is deliberate: the report prints
+*between* runs (the `MAX_LOOPS` break comes before it), so three runs give two reports —
+the second proves figures accumulate across a context restart. Covers what a naive summer
+gets wrong: one API request writes one transcript line **per content block**, all repeating
+the same `usage`, and each `usage` repeats all four field names inside `iterations[]` plus
+the `cache_creation` ephemeral leaves that already sum into the parent.
+
+### Setup (stub + repo)
+```bash
+TG="$TESTROOT/G"; mkdir -p "$TG/repo" "$TG/bin" "$TG/tx"
+cat > "$TG/bin/claude" <<'EOF'
+#!/usr/bin/env bash
+# stub claude: no API calls. Fabricates ONE session transcript per run, then fires the real
+# Stop hook (path pulled out of the --settings JSON claudezero passed us) with the payload
+# shape claude sends, so transcript_path recording is exercised for real.
+n=$(( $(cat "$TG_TX/count" 2>/dev/null || echo 0) + 1 )); echo "$n" > "$TG_TX/count"
+t="$TG_TX/t$n.jsonl"
+case "${TG_MODE:-ok}" in
+  missing) : ;;                                              # record a path with no file
+  bad)     printf '{"message":{"usage":{"outp\n' > "$t" ;;   # truncated / invalid JSON
+  *) if [ "$n" = 1 ]; then
+       # req_A on 3 content-block lines with IDENTICAL usage (must count once), each carrying
+       # the usage.iterations[] copy and the cache_creation ephemeral leaves (148+100 = 248).
+       u='"input_tokens":10,"cache_creation_input_tokens":248,"cache_read_input_tokens":1000,"output_tokens":20,"cache_creation":{"ephemeral_5m_input_tokens":148,"ephemeral_1h_input_tokens":100},"iterations":[{"input_tokens":10,"output_tokens":20,"cache_read_input_tokens":1000,"cache_creation_input_tokens":248}]'
+       for i in 1 2 3; do printf '{"requestId":"req_A","type":"assistant","message":{"usage":{%s}}}\n' "$u"; done > "$t"
+       printf '{"requestId":"req_B","type":"assistant","message":{"usage":{"input_tokens":5,"cache_creation_input_tokens":0,"cache_read_input_tokens":500,"output_tokens":7}}}\n' >> "$t"
+     else
+       printf '{"requestId":"req_C","type":"assistant","message":{"usage":{"input_tokens":100,"cache_creation_input_tokens":300,"cache_read_input_tokens":400,"output_tokens":200}}}\n' > "$t"
+     fi ;;
+esac
+hook=""
+for a in "$@"; do case "$a" in *compact-exit-hook.sh*) hook="$(printf '%s' "$a" | sed -n 's/.*"command":"\([^"]*\)".*/\1/p')";; esac; done
+[ -n "$hook" ] && printf '{"session_id":"stub%s","transcript_path":"%s"}' "$n" "$t" | "$hook"
+exit 0
+EOF
+chmod +x "$TG/bin/claude"
+cd "$TG/repo"
+git init -q -b main; git config user.email t@t.t; git config user.name test
+printf -- '- [ ] G1 x\n' > todo.md; git add -A; git commit -qm init
+# $1 = stub mode, $2 = log file. Fresh transcript dir per run.
+grun() { rm -rf "$TG/tx"; mkdir -p "$TG/tx"
+  PATH="$TG/bin:$PATH" TG_TX="$TG/tx" TG_MODE="$1" \
+    timeout 90 env CLAUDEZERO_MAX_LOOPS=3 bash "$SCRIPT" todo.md -t x > "$2" 2>&1 || true; }
+```
+
+### G1 — dedupe, no double-count, accumulation across restarts
+```bash
+cd "$TG/repo"
+grun ok "$TG/ok.log"
+GC="$(cd "$(git rev-parse --git-common-dir)" && pwd)"
+inst="$(sed -n 's/.*execution stats (instance \([A-Za-z0-9]*\)).*/\1/p' "$TG/ok.log" | head -1)"
+echo "G1 heading       : $(grep -c 'execution stats' "$TG/ok.log")  (want 2 — renamed from 'execution time')"
+echo "G1 report 1      : $(grep -A1 'Tokens:' "$TG/ok.log" | sed -n '1,2p' | tr '\n' '|')"
+echo "G1 report 2      : $(grep -A1 'Tokens:' "$TG/ok.log" | sed -n '4,5p' | tr '\n' '|')"
+echo "G1 per-instance  : $([ -f "$GC/transcripts-main-$inst" ] && echo yes || echo NO)  (instance $inst)"
+```
+- **G1 PASS** — `heading = 2`, and the two reports read exactly:
+  - report 1: `  Tokens: 1.7k Total|  in 15 · out 27 · cache write 248 · cache read 1.5k|`
+    — `req_A`'s three identical lines counted **once** (10+5 in, 20+7 out), `iterations[]`
+    not added on top, and the cache write is `248`, not `496` (leaves not added to parent).
+    Total `15+27+248+1500 = 1790` → `1.7k`, i.e. exactly the sum of the four categories.
+  - report 2: `  Tokens: 2.7k Total|  in 115 · out 227 · cache write 548 · cache read 1.9k|`
+    — run 2's transcript **added** to run 1's, not replacing it (2790 → `2.7k`).
+  - `per-instance = yes`: the transcript list is namespaced `transcripts-main-<instance>`,
+    so parallel instances can never read each other's figures.
+
+### G2 — degradation: never lie, never fail the run
+```bash
+cd "$TG/repo"
+grun missing "$TG/missing.log"; grun bad "$TG/bad.log"
+echo "G2 missing file : $(grep -c 'Tokens: n/a' "$TG/missing.log")  (want 2)"
+echo "G2 invalid json : $(grep -c 'Tokens: n/a' "$TG/bad.log")  (want 2)"
+echo "G2 timing kept  : $(grep -c 'ClaudeZero run loop:' "$TG/bad.log")  (want 2)"
+```
+- **G2 PASS** — both runs print `Tokens: n/a` in every report and still print the timing
+  rows: a deleted transcript or a truncated/invalid line degrades to `n/a` and the run
+  completes normally instead of printing a wrong number.
+
 ---
 
 ## Run all in parallel (optional)
@@ -467,7 +553,7 @@ cd "$REPO"
 echo "TESTROOT gone  : $([ -d "$TESTROOT" ] && echo NO || echo yes)"
 echo "stale worktrees: $(git worktree list | tail -n +2 | wc -l | tr -d ' ') (want 0)"
 echo "stale branches : $(git branch --list '*-task-*' | wc -l | tr -d ' ') (want 0)"
-echo "stray files    : $(ls .git 2>/dev/null | grep -c '^todos-seconds-\|^zero.sh$\|^instance$')  (want 0)"
+echo "stray files    : $(ls .git 2>/dev/null | grep -c '^todos-seconds-\|^transcripts-\|^zero.sh$\|^instance$')  (want 0)"
 git status --porcelain
 ```
 All counts must be 0 and `git status` empty. A leftover worktree, `*-task-*` branch, or

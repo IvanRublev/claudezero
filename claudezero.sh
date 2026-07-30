@@ -112,7 +112,8 @@ while true; do
     RUN_START=$(date +%s)
     # done BEFORE this run? if so it's an idle restart and its time doesn't count.
     all_todos_done && WAS_DONE=1 || WAS_DONE=0
-    CLAUDEZERO_INSTANCE="$INSTANCE_ID" claude --settings "$STOP_SETTINGS" --permission-mode auto "$PROMPT" || true
+    CLAUDEZERO_INSTANCE="$INSTANCE_ID" CLAUDEZERO_TRANSCRIPTS="$TRANSCRIPTS_FILE" \
+        claude --settings "$STOP_SETTINGS" --permission-mode auto "$PROMPT" || true
     # claude killed mid-run (Ctrl+C/SIGTERM) can leave the tty in raw mode with ISIG off; then every
     # later Ctrl+C arrives as a 0x03 byte, not a SIGINT, so the INT trap never fires and the loop
     # spins forever restarting claude on a wedged terminal. Restore cooked mode so Ctrl+C signals again.
@@ -213,6 +214,9 @@ fi
 GITDIR_ABS="$(cd "$(git rev-parse --git-dir)" && pwd)"
 SESSION_DIR="$(cd "$(git rev-parse --git-common-dir)" && pwd)/session"   # matches zero.sh's marker dir
 TODOS_TIME_FILE="$(cd "$(git rev-parse --git-common-dir)" && pwd)/todos-seconds-${BASE_BRANCH//\//-}-$INSTANCE_ID"   # this instance's file (matches zero.sh's todos_file)
+# this instance's list of claude session transcripts (one path per line, appended by the Stop hook).
+# Namespaced like the time-file so parallel instances never read each other's token figures.
+TRANSCRIPTS_FILE="$(cd "$(git rev-parse --git-common-dir)" && pwd)/transcripts-${BASE_BRANCH//\//-}-$INSTANCE_ID"
 ZERO_SH="$GITDIR_ABS/zero.sh"   # where build_zero_prompt wrote the helper (zero mode only)
 INSTANCE_DIR="$(cd "$(git rev-parse --git-common-dir)" && pwd)/instance"
 
@@ -230,6 +234,15 @@ cat >"$STOP_HOOK" <<'HOOK_EOF'
 # loop restarts fresh. Reusing that bucket file as the signal means no separate flag and no edit
 # to the hook. Couples to its filename/tmpdir; update if ECC changes them.
 input="$(cat)"
+# token accounting: record this session's transcript path for the outer loop to sum after claude
+# exits. The hook file is shared by all instances in this git dir, so the destination comes from
+# the env of the claude WE launched (CLAUDEZERO_TRANSCRIPTS), never baked in. One line per path;
+# best-effort, never fails the turn.
+tf="${CLAUDEZERO_TRANSCRIPTS:-}"
+if [ -n "$tf" ]; then
+  tp="$(printf '%s' "$input" | sed -n 's/.*"transcript_path"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')"
+  [ -n "$tp" ] && ! grep -qxF "$tp" "$tf" 2>/dev/null && printf '%s\n' "$tp" >> "$tf"
+fi
 sid="$(printf '%s' "$input" | sed -n 's/.*"session_id"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | tr -cd 'A-Za-z0-9_-')"
 [ -n "$sid" ] || exit 0
 dir="${TMPDIR:-${TMP:-${TEMP:-/tmp}}}"; dir="${dir%/}"      # match node os.tmpdir()
@@ -269,6 +282,60 @@ fmt_dur() {
   else                         printf '%ds' "$s"; fi
 }
 
+# format a token count as 5.8M / 84.3k / 312 — integer arithmetic only (bash 3.2 has no floats).
+fmt_tok() {
+  local n=$1
+  if   [ "$n" -ge 1000000 ]; then printf '%d.%dM' $((n/1000000)) $(( (n%1000000)/100000 ))
+  elif [ "$n" -ge 1000 ];    then printf '%d.%dk' $((n/1000))    $(( (n%1000)/100 ))
+  else                            printf '%d' "$n"; fi
+}
+
+# sum this instance's claude token usage over the session transcripts its Stop hook recorded.
+# Echoes "input output cache_create cache_read total"; EMPTY when nothing parses → report says n/a.
+# Whole-file pass per call, not incremental byte offsets: a duplicate-requestId group can straddle
+# an incremental boundary and get double-counted. Transcripts are bounded by the restart-at-
+# context-threshold design, so re-reading them is cheap.
+#   dedupe by requestId — ONE API request is written as several transcript lines, one per content
+#     block (text, tool_use, thinking), each repeating the SAME usage object verbatim. Summing per
+#     line inflates every figure by the average blocks-per-turn.
+#   first match per line is the parent field — usage.iterations[] repeats all four names one level
+#     down, and usage.cache_creation carries the ephemeral_5m/1h leaves that already sum into
+#     cache_creation_input_tokens. Take the parent only, never the leaves or the nested copy.
+read_tokens_total() {
+  [ -n "${TRANSCRIPTS_FILE:-}" ] && [ -f "$TRANSCRIPTS_FILE" ] || return 0
+  local p
+  while IFS= read -r p; do
+    if [ -f "$p" ]; then cat "$p"; fi
+  done < "$TRANSCRIPTS_FILE" | awk '
+    function num(key,   s) {
+      if (!match($0, "\"" key "\":[0-9]+")) return 0
+      s = substr($0, RSTART, RLENGTH); sub(/.*:/, "", s); return s + 0
+    }
+    /"output_tokens":/ {
+      k = match($0, /"requestId":"[^"]+"/) ? substr($0, RSTART + 13, RLENGTH - 14) : "line" NR
+      if (k in seen) next
+      seen[k] = 1; n++
+      i  += num("input_tokens");                o  += num("output_tokens")
+      cc += num("cache_creation_input_tokens"); cr += num("cache_read_input_tokens")
+    }
+    END { if (n) printf "%d %d %d %d %d\n", i, o, cc, cr, i + o + cc + cr }' 2>/dev/null
+}
+
+# the report's token block: headline total, then the four billed categories beneath it. They do not
+# overlap (total_input = cache_read + cache_creation + input, output on its own axis) and each bills
+# at its own rate, so the total is a SCALE figure for comparison, not a cost. No money figure: there
+# is no first-party programmatic rate source, only a hardcoded table that would rot. Degrade, never
+# lie — a parse miss, a missing transcript or a schema change prints n/a and leaves the run alone.
+print_tokens() {
+  local t; t="$(read_tokens_total || true)"
+  # shellcheck disable=SC2086  # deliberate split: awk emits five space-separated integers
+  set -- $t
+  if [ "$#" -ne 5 ]; then printf '\n  Tokens: n/a\n'; return 0; fi
+  printf '\n  Tokens: %s Total\n' "$(fmt_tok "$5")"
+  printf '  in %s · out %s · cache write %s · cache read %s\n' \
+    "$(fmt_tok "$1")" "$(fmt_tok "$2")" "$(fmt_tok "$3")" "$(fmt_tok "$4")"
+}
+
 # read the shared todos-time aggregate (seconds of task ownership zero.sh records), 0 if absent.
 read_todos_total() {
   local v=0
@@ -290,18 +357,21 @@ all_todos_done() {
     END { exit (any && !unchecked) ? 0 : 1 }'
 }
 
-# multiline execution-time report. $1 = now epoch.
+# multiline execution-stats report. $1 = now epoch.
 #   Todos        = per-task ownership time, this run's delta of zero.sh's aggregate
 #   Claude loops = summed runtime of EVERY claude invocation up to the all-done moment (frozen
 #                  after) — sum across restarts, not one invocation
 #   Script loop  = wall time of the outer while loop (claude runs + between-run sleeps)
+#   Tokens       = this instance's claude token usage, own block (not a duration, so it does not
+#                  share the timing rows' label column)
 print_report() {
-  printf '\n❄ execution time (instance %s)\n' "${INSTANCE_ID:-?}"
+  printf '\n❄ execution stats (instance %s)\n' "${INSTANCE_ID:-?}"
   if [ "${MODE:-}" = zero ]; then
     printf '  %-20s %s\n' 'Todos:' "$(fmt_dur $(( $(read_todos_total) - TODOS_BASE )))"
   fi
   printf '  %-20s %s\n' 'Claude loops:'        "$(fmt_dur "$CLAUDE_TOTAL")"
   printf '  %-20s %s\n' 'ClaudeZero run loop:' "$(fmt_dur $(( $1 - LOOP_START )))"
+  print_tokens
 }
 
 # credit orphaned in-flight tasks before an exit-path report: zero.sh folds worktrees whose owner
@@ -372,6 +442,12 @@ cleanup_orphan_time_files() {
     id="${f##*/todos-seconds-"$slug"-}"
     [ -f "$INSTANCE_DIR/$id" ] && continue                # id still has a (live) marker → keep
     rm -f "$f" "$f.lock" "$f.tmp"
+  done
+  for f in "$gc/transcripts-$slug-"*; do                  # same rule for the token-accounting lists
+    [ -e "$f" ] || continue
+    id="${f##*/transcripts-"$slug"-}"
+    [ -f "$INSTANCE_DIR/$id" ] && continue
+    rm -f "$f"
   done
 }
 
