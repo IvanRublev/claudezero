@@ -167,7 +167,8 @@ echo "restarts (A/B/C): $(grep -c restarting "$T/log_AGENT_A.txt") $(grep -c res
 echo "instance ids    : $(grep -h -oE 'instance [^)]+' "$T"/log_AGENT_*.txt | sort -u | wc -l | tr -d ' ')"
 echo "report labels   : $(grep -h -cE '  (Todos|ClaudeZero run loop):' "$T"/log_AGENT_A.txt | tr -d ' ')"
 echo "stale loop line : $(grep -h -c 'Claude loops:' "$T"/log_AGENT_A.txt | tr -d ' ')  (want 0)"
-echo "todos counted   : $(grep -h -oE 'Todos:.*· [0-9]+ completed' "$T"/log_AGENT_A.txt | tail -1)"
+echo "todos counted   : $(awk '/❄ TOTAL/{exit} /Todos:.*· [0-9]+ completed/{l=$0} END{print l}' "$T"/log_AGENT_A.txt)"
+echo "TOTAL blocks    : $(grep -h -c '❄ TOTAL' "$T"/log_AGENT_*.txt | paste -sd' ' -)  (want 1 each — exit path)"
 echo "zero.sh wrote files: $(ls "$T"/repo/.git 2>/dev/null | grep -c '^todos-seconds-')"
 echo "zero.sh wrote counts: $(ls "$T"/repo/.git 2>/dev/null | grep -c '^todos-done-')"
 ```
@@ -181,6 +182,8 @@ echo "zero.sh wrote counts: $(ls "$T"/repo/.git 2>/dev/null | grep -c '^todos-do
   two are the **env-hop proof**: `zero.sh` only writes `todos-seconds-<base>-<id>` and
   `todos-done-<base>-<id>` when it received `CLAUDEZERO_INSTANCE` from claude's env. (An
   instance that merged 0 tasks writes no file, so the count can be < 3; ≥ 1 is the gate.)
+- **Fleet PASS** — `TOTAL blocks = 1 1 1`: each agent ended its run with one fleet TOTAL block
+  (the `todos counted` reading is taken from before it, so it stays the per-instance figure).
 
 ---
 
@@ -666,6 +669,80 @@ echo "H2 a1 vs b2      : $([ "$(dojo_student a1b2c3d4)" != "$(dojo_student b2b2c
 - **H2 PASS** — the loop-mode line shows `[--name] [(<id>) <activity>]`, both decimal ids render
   an activity with no arithmetic error, `deterministic = yes` (only the first two chars select),
   and `a1 vs b2 = differ` (`16#a1 % 10 = 1`, `16#b2 % 10 = 8`).
+
+---
+
+## Scenario I — fleet TOTAL on the exit path   `[$TESTROOT/I]`   (stub claude, deterministic)
+
+The exit path (Ctrl+C or `MAX_LOOPS`) prints this instance's report and then a fleet-wide
+TOTAL summed from every peer's per-instance files for this base. No real claude and no
+parallelism: the stub fabricates two peer instances **from inside the run**, so they land
+after startup GC — `PEER1` with a live marker, `DEADPEER` with files but no marker (a crashed
+peer's merged todos still belong in the total). The fabricated transcript repeats one
+`requestId` on three lines and carries the nested `iterations[]`/`cache_creation` copies, so
+the token sum also proves dedupe and no-double-count.
+
+### Setup
+```bash
+TI="$TESTROOT/I"; mkdir -p "$TI/repo" "$TI/bin"
+cat > "$TI/bin/claude" <<'EOF'
+#!/usr/bin/env bash
+GC="$(cd "$(git rev-parse --git-common-dir)" && pwd)"; mkdir -p "$GC/instance"
+# PEER1: live marker (this stub's own pid) → survives any later GC. DEADPEER: files only.
+printf '%s\n%s\n' "$$" "$(ps -o lstart= -p $$ | awk '{$1=$1;print}')" > "$GC/instance/PEER1"
+printf '100\n' > "$GC/todos-seconds-main-PEER1";   printf '2\n' > "$GC/todos-done-main-PEER1"
+printf '50\n'  > "$GC/todos-seconds-main-DEADPEER"; printf '1\n' > "$GC/todos-done-main-DEADPEER"
+tr="$GC/tx-PEER1.jsonl"; : > "$tr"
+u='"input_tokens":10,"output_tokens":20,"cache_creation_input_tokens":248,"cache_creation":{"ephemeral_5m_input_tokens":148,"ephemeral_1h_input_tokens":100},"cache_read_input_tokens":1000,"iterations":[{"input_tokens":10,"output_tokens":20,"cache_creation_input_tokens":248,"cache_read_input_tokens":1000}]'
+for i in 1 2 3; do printf '{"requestId":"req_AAA","message":{"usage":{%s}}}\n' "$u" >> "$tr"; done
+printf '%s\n' "$tr" > "$GC/transcripts-main-PEER1"
+exit 0
+EOF
+chmod +x "$TI/bin/claude"
+cd "$TI/repo"
+git init -q -b main; git config user.email t@t.t; git config user.name test
+printf -- '- [ ] I1 x\n' > todo.md; git add -A; git commit -qm init
+```
+
+### I1 — TOTAL equals the sum of the per-instance files
+```bash
+cd "$TI/repo"
+PATH="$TI/bin:$PATH" timeout 40 env CLAUDEZERO_MAX_LOOPS=1 bash "$SCRIPT" todo.md -t x > "$TI/run.log" 2>&1
+echo "I1 exit          : $?  (want 0 — the report never fails the exit path)"
+sed -n '/❄ TOTAL/,$p' "$TI/run.log"
+echo "I1 instances     : $(grep -o '❄ TOTAL ([0-9]*' "$TI/run.log" | tr -dc 0-9)  (want 2 — PEER1 + DEADPEER, dead peer counted)"
+echo "I1 todos sum     : $(sed -n '/❄ TOTAL/,$p' "$TI/run.log" | grep -oE '2m30s.*3 completed' | head -1)  (want 2m30s · 3 completed = 100+50s, 2+1)"
+echo "I1 token sum     : $(sed -n '/❄ TOTAL/,$p' "$TI/run.log" | grep -oE 'Tokens: [^ ]+ Total')  (want 1.2k = 10+20+248+1000, counted ONCE)"
+echo "I1 categories    : $(sed -n '/❄ TOTAL/,$p' "$TI/run.log" | grep -oE 'in 10 · out 20 · cache write 248 · cache read 1.0k')  (want that line)"
+echo "I1 no registry   : $(ls "$TI/repo/.git" | grep -cE '^(fleet|total)-')  (want 0 — glob, no aggregate file)"
+```
+- **I1 PASS** — `exit = 0`, `instances = 2`, the todo sum is `2m30s · 3 completed`, the token
+  total is `1.2k` with categories `in 10 · out 20 · cache write 248 · cache read 1.0k`
+  (the `requestId` appeared on three lines and the nested `iterations[]`/`ephemeral_*` copies
+  were ignored), and `no registry = 0`.
+
+### I2 — solo run prints no TOTAL; unreadable peer files degrade, never lie
+```bash
+cd "$TI/repo"
+printf '#!/usr/bin/env bash\nexit 0\n' > "$TI/bin/claude"       # no peers fabricated
+PATH="$TI/bin:$PATH" timeout 40 env CLAUDEZERO_MAX_LOOPS=1 bash "$SCRIPT" todo.md -t x > "$TI/solo.log" 2>&1 || true
+echo "I2 solo TOTAL    : $(grep -c '❄ TOTAL' "$TI/solo.log")  (want 0 — one id, the total would restate the block above)"
+cat > "$TI/bin/claude" <<'EOF'
+#!/usr/bin/env bash
+GC="$(cd "$(git rev-parse --git-common-dir)" && pwd)"
+printf 'not-a-number\n' > "$GC/todos-seconds-main-GARB"; printf 'xx\n' > "$GC/todos-done-main-GARB"
+printf '/nonexistent/transcript.jsonl\n' > "$GC/transcripts-main-GONE"
+exit 0
+EOF
+chmod +x "$TI/bin/claude"
+PATH="$TI/bin:$PATH" timeout 40 env CLAUDEZERO_MAX_LOOPS=1 bash "$SCRIPT" todo.md -t x > "$TI/degrade.log" 2>&1
+echo "I2 degrade exit  : $?  (want 0)"
+echo "I2 degrade TOTAL : $(sed -n '/❄ TOTAL/,$p' "$TI/degrade.log" | grep -cE '0s  ·  0 completed|Tokens: n/a')  (want 2 — zeroed todos row + n/a tokens)"
+echo "I2 loop mode     : $(PATH="$TI/bin:$PATH" timeout 40 env CLAUDEZERO_MAX_LOOPS=1 bash "$SCRIPT" -l hi 2>&1 | sed -n '/❄ TOTAL/,$p' | grep -c 'Todos:')  (want 0 — token rows only)"
+```
+- **I2 PASS** — `solo TOTAL = 0`, `degrade exit = 0` with `degrade TOTAL = 2` (a garbled counter
+  contributes 0 and a missing transcript degrades to `Tokens: n/a`), and `loop mode = 0` todo
+  rows in the TOTAL block.
 
 ---
 
