@@ -459,6 +459,65 @@ cd "$TF/repo"
 
 ---
 
+## Scenario G — claude session display name   `[$TESTROOT/G]`   (stub claude, deterministic)
+
+Each instance names its claude session `(<instance id>) <student activity>` via `--name`, so
+parallel terminals are told apart without reading hex. The name must reach claude as ONE argv
+element, and must be the SAME on every context restart (derived from the id, not `RANDOM`).
+The stub claude echoes its argv, so no real claude is needed.
+
+### Setup
+```bash
+TG="$TESTROOT/G"; mkdir -p "$TG/repo" "$TG/bin"
+cat > "$TG/bin/claude" <<'EOF'
+#!/usr/bin/env bash
+printf 'ARGV:'; for a in "$@"; do printf ' [%s]' "$a"; done; printf '\n'
+exit 0
+EOF
+chmod +x "$TG/bin/claude"
+cd "$TG/repo"
+git init -q -b main; git config user.email t@t.t; git config user.name test
+printf -- '- [ ] G1 x\n' > todo.md; git add -A; git commit -qm init
+# the ten activities, verbatim (claudezero.sh dojo_student)
+ACT=('drilling the fork-implement-merge kata' 'hauling snow buckets uphill' \
+     'claiming a track before stepping on it' 'reading the whole task before striking' \
+     'starting over on fresh snow' 'carving one checkbox into ice' 'chasing one unchecked box' \
+     'practicing one clean strike per task' "leaving a peer's branch untouched" \
+     'approaching the merge gate')
+```
+
+### G1 — name construction, unsplit argv, restart stability
+```bash
+cd "$TG/repo"
+PATH="$TG/bin:$PATH" timeout 90 env CLAUDEZERO_MAX_LOOPS=3 bash "$SCRIPT" todo.md -t x > "$TG/run.log" 2>&1 || true
+ID=$(grep -m1 -oE 'instance [0-9A-Za-z]+' "$TG/run.log" | awk '{print $2}')
+WANT="($ID) ${ACT[$(( 16#${ID:0:2} % 10 ))]}"
+echo "G1 want name     : $WANT"
+echo "G1 launches      : $(grep -c '^ARGV:' "$TG/run.log")  (want 3)"
+echo "G1 named+unsplit : $(grep -c -F -- "[--name] [$WANT]" "$TG/run.log")  (want 3)"
+```
+- **G1 PASS** — `launches = 3` and `named+unsplit = 3`: `--name` carries the parenthesised,
+  space-containing name as a single argv element, the activity is the one the id selects by
+  `16#<first two chars> % 10`, and all three restarts used the same name.
+
+### G2 — loop mode named too; decimal (`$$`-shaped) id picks an activity, not an error
+```bash
+cd "$TG/repo"
+PATH="$TG/bin:$PATH" timeout 60 env CLAUDEZERO_MAX_LOOPS=1 bash "$SCRIPT" -l 'hi' > "$TG/loop.log" 2>&1 || true
+echo "G2 loop-mode name: $(grep -m1 -oE '\[--name\] \[[^]]*\]' "$TG/loop.log" || echo NONE)"
+# the $$ fallback id (claudezero.sh:150) is decimal digits — valid hex, so the same derivation
+# applies with no branch. Drive the real function on such an id.
+eval "$(sed -n '/^dojo_student()/,/^}/p' "$SCRIPT")"
+echo "G2 decimal id    : $(dojo_student 48584); $(dojo_student 90210)  (two activities, no error)"
+echo "G2 deterministic : $([ "$(dojo_student a1b2c3d4)" = "$(dojo_student a1ffffff)" ] && echo yes || echo NO)"
+echo "G2 a1 vs b2      : $([ "$(dojo_student a1b2c3d4)" != "$(dojo_student b2b2c3d4)" ] && echo differ || echo same)"
+```
+- **G2 PASS** — the loop-mode line shows `[--name] [(<id>) <activity>]`, both decimal ids render
+  an activity with no arithmetic error, `deterministic = yes` (only the first two chars select),
+  and `a1 vs b2 = differ` (`16#a1 % 10 = 1`, `16#b2 % 10 = 8`).
+
+---
+
 ## Run all in parallel (optional)
 
 After Section 0 and each Setup, launch the Run blocks together: put A's and C's run
