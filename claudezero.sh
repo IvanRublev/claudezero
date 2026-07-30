@@ -19,6 +19,11 @@ PROG="$(basename "$0")"   # name shown in usage/errors, from how the script was 
 LOOP_INTERVAL="3m"   # cadence claude reschedules its zeroing pass at (baked into the /loop prompt)
 RESTART_WAIT=5       # seconds between claude restarts — the window to press Ctrl+C
 
+# The braces around the pipe reader in the logging example are load-bearing — do NOT tidy them
+# into a bare pipe. Ctrl+C signals the whole foreground group; the reader's default SIGINT action
+# is terminate, and once it dies the log has no writer left, losing exactly the closing report the
+# operator ran the pipe for. `trap '' INT` sets *ignore*, which survives `exec`, so the reader
+# inherits it and drains the pipe until ClaudeZero exits.
 usage() {
   # single-quoted heredoc keeps backticks literal; sed injects the RESTART_WAIT constant.
   sed -e "s/@@RESTART_WAIT@@/$RESTART_WAIT/g" -e "s/@@PROG@@/$PROG/g" <<'USAGE'
@@ -35,6 +40,12 @@ usage: @@PROG@@ [todo-file-path] [-t|--taskprompt TEXT | -l|--loopprompt TEXT]
   -h, --help             Show this help.
 
   -t and -l are mutually exclusive.
+
+  Log a run (ClaudeZero's own output only; claude's TUI stays on the terminal):
+
+    @@PROG@@ issues/todo.md 2>&1 | { trap '' INT; tee run.log; }
+
+  The `trap` keeps tee alive through Ctrl+C so the final report lands in the file.
 USAGE
 }
 
@@ -94,6 +105,11 @@ run_loop() {
 # CLAUDEZERO_MAX_LOOPS: exit after N iterations instead of looping until Ctrl+C. 0/unset =
 # unlimited (normal). Set >0 for tests so the loop self-terminates without a SIGINT.
 MAX_LOOPS="${CLAUDEZERO_MAX_LOOPS:-0}"
+# fd 4 = where claude's own chatter goes. Redirected stdout + a terminal present → claude keeps
+# writing to the terminal, so piping claudezero.sh to a log file records the ❄ reports, not the TUI.
+# No redirect, or no controlling terminal (tests, CI, nohup) → fd 4 is plain stdout, as today.
+# Probe in a subshell: a failed `exec` redirection is shell-fatal, not testable.
+if [ ! -t 1 ] && (: >/dev/tty) 2>/dev/null; then exec 4>/dev/tty; else exec 4>&1; fi
 LOOP_COUNT=0
 STOP=0                    # set by the INT trap; the loop breaks to the closer below
 TODOS_BASE=$(read_counter "${TODOS_TIME_FILE:-}")   # snapshot: report only THIS run's slice of the shared aggregates
@@ -109,7 +125,7 @@ reap_dead_sessions   # startup: clear markers left by crashed prior runs before 
 while true; do
     # first prompt submitted straight from the CLI arg. The session Stop hook SIGTERMs claude
     # when context fills; exit 143 is the normal restart path, so swallow it.
-    CLAUDEZERO_INSTANCE="$INSTANCE_ID" claude --settings "$STOP_SETTINGS" --permission-mode auto "$PROMPT" || true
+    CLAUDEZERO_INSTANCE="$INSTANCE_ID" claude --settings "$STOP_SETTINGS" --permission-mode auto "$PROMPT" >&4 2>&4 || true
     # claude killed mid-run (Ctrl+C/SIGTERM) can leave the tty in raw mode with ISIG off; then every
     # later Ctrl+C arrives as a 0x03 byte, not a SIGINT, so the INT trap never fires and the loop
     # spins forever restarting claude on a wedged terminal. Restore cooked mode so Ctrl+C signals again.
