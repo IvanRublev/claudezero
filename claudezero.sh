@@ -576,6 +576,33 @@ acquire_task() {
   setup_exclude "$wt"; claim_owner "$wt"; set_current "$n"; printf '%s' "$wt"; return 0
 }
 
+# claim: the WHOLE "is this task mine to work?" decision in one call — acquire, validate the
+# worktree, then re-check that no peer landed it first. Prints the worktree path (stdout, no
+# newline) + exit 0 when it is yours; every skip reason goes to stderr with a distinct exit code
+# so TEST.md can assert which path ran: 1 = not claimed, 3 = validation failed, 4 = already landed.
+# The agent treats all non-zero the same. Takes the RAW id: acquire/release want it sanitized,
+# is_done wants it raw (it matches the todo line's first token), so both values are held here.
+claim_task() {
+  local raw=$1 n wt br; n=$(sanitize_id "$raw")
+  if ! wt=$(acquire_task "$n"); then
+    echo "claim $raw: not claimed — a peer owns it or it is being rescued" >&2; return 1
+  fi
+  br=""   # set -e: keep the probe in an `if` — a bare failing `&&` chain would kill the process
+  if [ -n "$wt" ] && [ -d "$wt" ]; then br=$(git -C "$wt" symbolic-ref --short HEAD 2>/dev/null || true); fi
+  if [ "$br" != "$(task_branch "$n")" ]; then
+    # do NOT release: that would force-remove a worktree sitting on an unexpected branch with
+    # unknown contents. Just drop the session claim; a later acquire steals it the normal way.
+    set_current none
+    echo "claim $raw: validation failed — worktree ${wt:-<none>} is on ${br:-<none>}, want $(task_branch "$n")" >&2
+    return 3
+  fi
+  if is_done "$raw" "$wt"; then
+    release_task "$n" "$wt"
+    echo "claim $raw: already landed on $BASE_BRANCH by a peer — released" >&2; return 4
+  fi
+  printf '%s' "$wt"
+}
+
 # release: undo a claim (worktree + branch) and mark this session idle. -d refuses a branch with
 # unmerged commits (safety), leaving an orphan branch a later acquire reattaches.
 release_task() {
@@ -696,7 +723,7 @@ box_checked_on_base() {
 # done: deterministic "has this task already LANDED on the base branch?" — exit 0 = landed (safe to
 # release/skip), exit 1 = not landed (own it, drive+merge it). Given the RAW task id. Authoritative
 # signal is the base box: OR-merge + the one-box invariant mean a base [x] can only come from THIS
-# task's branch actually merging. A worktree that ticked its own TASK_BRANCH box but whose merge
+# task's branch actually merging. A worktree that ticked its own box on its task branch but whose merge
 # failed/aborted leaves base at [ ] = not done. If a wt is passed and still exists, also assert its
 # tip is an ancestor of base — catches the ticked-box-but-unmerged wt from the failed-merge rescue path.
 is_done() {
@@ -707,12 +734,13 @@ is_done() {
 }
 
 case "${1:-}" in
+  claim)   ensure_owner; claim_task "$2" ;;
   acquire) ensure_owner; acquire_task "$(sanitize_id "$2")" ;;
   release) ensure_owner; release_task "$(sanitize_id "$2")" "$3" ;;
   merge)   ensure_owner; merge_task "$(sanitize_id "$2")" "$3" && set_current none || exit $? ;;  # clear only on success
   done)    is_done "$2" "${3:-}" ;;
   credit_inflight_time)   credit_inflight_time ;;
-  *) echo "usage: zero.sh {acquire N | release N WT | merge N WT | done N [WT] | credit_inflight_time}" >&2; exit 64 ;;
+  *) echo "usage: zero.sh {claim N | acquire N | release N WT | merge N WT | done N [WT] | credit_inflight_time}" >&2; exit 64 ;;
 esac
 ZERO_EOF
     } > "$gitdir/zero.sh"
@@ -797,35 +825,30 @@ Keep these facts in mind for every iteration:
       - Any inbound edge to an unchecked task → skip to the next task_id.
       - No such edge (every claimed edge is either to a checked task or unquotable)
         → continue to step b.
-   b. ACQUIRE: wt=$(.git/zero.sh acquire task_id)
-      - exit ≠ 0 → could not claim it (a peer owns it, or it is being rescued) → skip to the next task_id.
+   b. CLAIM: wt=$(.git/zero.sh claim task_id)
+      - exit ≠ 0 → not yours (a peer owns it, it is being rescued, or a peer already landed it)
+        → skip to the next task_id. The reason is printed on stderr.
       - exit 0   → you OWN task_id; its git worktree is at $wt. Continue to step c.
-   c. VALIDATE: $wt is non-empty and a directory, and TASK_BRANCH=`git -C "$wt" symbolic-ref --short HEAD`
-      starts with "@@BASE_BRANCH@@-task-". If not, skip to the next task_id.
-   d. RE-CHECK for a race, deterministically: `.git/zero.sh done task_id "$wt"`.
-      - exit 0  → a peer already LANDED it on @@BASE_BRANCH@@ (box `[x]` on base AND merged) just before
-        your claim → run `.git/zero.sh release task_id "$wt"` and skip to the next task_id.
-      - exit ≠ 0 → NOT landed (base still `[ ]`, e.g. a ticked box left on an unmerged branch by an
-        earlier failed merge) → you own it, continue to step e. Do NOT trust the box in `$wt/@@TODO@@`.
-   e. IMPLEMENT task_id. Scope every edit to THIS task only before you skip to the next one; never touch 
-      another task, even one you will process later this same pass (you reach the next task_id 
-      at step g — this is per-task, not per-session).
+        Do NOT trust the box in `$wt/@@TODO@@` — the claim already re-checked @@BASE_BRANCH@@.
+   c. IMPLEMENT task_id. Scope every edit to THIS task only before you skip to the next one; never touch
+      another task, even one you will process later this same pass (you reach the next task_id
+      at step e — this is per-task, not per-session).
       @@LOOPPROMPT@@
-   f. CHECK OFF only your task_id's line in `$wt/@@TODO@@` (`[ ]`→`[x]`); touch no other line.
-      Then commit in `$wt` on TASK_BRANCH.
-   g. MERGE: .git/zero.sh merge task_id "$wt"
+   d. CHECK OFF only your task_id's line in `$wt/@@TODO@@` (`[ ]`→`[x]`); touch no other line.
+      Then commit in `$wt` on the worktree's branch.
+   e. MERGE: .git/zero.sh merge task_id "$wt"
       - exit 0 → merged to @@BASE_BRANCH@@, worktree + branch cleaned → continue to the next task_id.
       - exit ≠ 0 with output starting `checkbox-merge: refused` → you checked off more than your own
         task. The output lists each offending line as `<file>:<line> <text>`. In `$wt/@@TODO@@` uncheck
         every listed line EXCEPT task_id's (`[x]`→`[ ]`), keep yours checked, run
         `git -C "$wt" commit --amend --no-edit`, then retry `.git/zero.sh merge task_id "$wt"` ONCE.
         If it fails again for this cause, STOP THE LOOP IMMEDIATELY — report the offending lines, task_id,
-        and its worktree $wt (still on TASK_BRANCH), and ask the human to clear the unrelated checkboxes,
-        then merge by hand.
+        its worktree $wt and its branch (`git -C "$wt" symbolic-ref --short HEAD`), and ask the human to
+        clear the unrelated checkboxes, then merge by hand.
       - any other exit ≠ 0 → a merge conflict. Resolve it yourself, iterating until you merge or you see
-        no better merge option. If you cannot, MERGE FAILED: STOP THE LOOP IMMEDIATELY — report task_id 
-        and its worktree $wt (still on TASK_BRANCH), and ask the human to "resolve the conflict 
-        on that branch, then merge by hand".
+        no better merge option. If you cannot, MERGE FAILED: STOP THE LOOP IMMEDIATELY — report task_id,
+        its worktree $wt and its branch (`git -C "$wt" symbolic-ref --short HEAD`), and ask the human to
+        "resolve the conflict on that branch, then merge by hand".
 3. If every task in @@TODO@@ is now checked → announce "ALL TASKS DONE" and stop the loop: end this
    pass WITHOUT scheduling the next iteration. Otherwise end this pass and let the scheduled loop re-fire.
 PROMPT_EOF
