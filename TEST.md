@@ -165,31 +165,35 @@ echo "latch opened    : $([ -f "$T/gate/opened" ] && echo yes || echo no)"
 echo "restarts (A/B/C): $(grep -c restarting "$T/log_AGENT_A.txt") $(grep -c restarting "$T/log_AGENT_B.txt") $(grep -c restarting "$T/log_AGENT_C.txt")"
 # timing / per-instance isolation:
 echo "instance ids    : $(grep -h -oE 'instance [^)]+' "$T"/log_AGENT_*.txt | sort -u | wc -l | tr -d ' ')"
-echo "report labels   : $(grep -h -cE '  (Todos|Claude loops|ClaudeZero run loop):' "$T"/log_AGENT_A.txt | tr -d ' ')"
+echo "report labels   : $(grep -h -cE '  (Todos|ClaudeZero run loop):' "$T"/log_AGENT_A.txt | tr -d ' ')"
+echo "stale loop line : $(grep -h -c 'Claude loops:' "$T"/log_AGENT_A.txt | tr -d ' ')  (want 0)"
+echo "todos counted   : $(grep -h -oE 'Todos:.*· [0-9]+ completed' "$T"/log_AGENT_A.txt | tail -1)"
 echo "zero.sh wrote files: $(ls "$T"/repo/.git 2>/dev/null | grep -c '^todos-seconds-')"
+echo "zero.sh wrote counts: $(ls "$T"/repo/.git 2>/dev/null | grep -c '^todos-done-')"
 ```
 - **Zero PASS** — all 5 markers present, `todos checked = 5/5`, `git clean = yes`.
 - **Parallel PASS** — `latch opened = yes` AND `distinct agents = 3`.
 - **Restart PASS** — restarts summed across the three logs ≥ 3.
 - **Timing PASS** — `instance ids = 3` (each instance a distinct id → isolation), each
-  agent's log shows the `Todos:` / `Claude loops:` / `ClaudeZero run loop:` lines, and
-  `zero.sh wrote files ≥ 1`. That last one is the **env-hop proof**: `zero.sh` only
-  writes `todos-seconds-<base>-<id>` when it received `CLAUDEZERO_INSTANCE` from claude's
-  env. (An instance that merged 0 tasks writes no file, so the count can be < 3; ≥ 1 is
-  the gate.)
+  agent's log shows the `Todos:` / `ClaudeZero run loop:` lines with `stale loop line = 0`,
+  `todos counted` shows a non-zero `N completed` for an agent that merged, the per-agent
+  counts sum to 5, and `zero.sh wrote files ≥ 1` / `zero.sh wrote counts ≥ 1`. Those last
+  two are the **env-hop proof**: `zero.sh` only writes `todos-seconds-<base>-<id>` and
+  `todos-done-<base>-<id>` when it received `CLAUDEZERO_INSTANCE` from claude's env. (An
+  instance that merged 0 tasks writes no file, so the count can be < 3; ≥ 1 is the gate.)
 
 ---
 
 ## Scenario B — startup-guard refusals   `[$TESTROOT/B]`   (no claude)
 
-Three pristine repos: one with a dirty working tree, one on a detached HEAD, one clean
-launched from a subdir. Each must make claudezero refuse to start with the matching
-message and a non-zero exit.
+Four pristine repos: one with a dirty working tree, one on a detached HEAD, one clean
+launched from a subdir, one clean launched from inside a leftover `../ts-*` task worktree.
+Each must make claudezero refuse to start with the matching message and a non-zero exit.
 
 ### Setup
 ```bash
 TB="$TESTROOT/B"
-for name in dirty detached nested; do
+for name in dirty detached nested worktree; do
   mkdir -p "$TB/$name"
   ( cd "$TB/$name"; git init -q; git config user.email t@t.t; git config user.name test
     echo x > f; git add f; git commit -qm init
@@ -198,6 +202,9 @@ done
 ( cd "$TB/dirty";    echo change >> f )       # dirty working tree
 ( cd "$TB/detached"; git checkout -q --detach )
 mkdir -p "$TB/nested/sub"                      # clean repo; we launch from this subdir
+# leftover claim worktree, exactly what a crashed peer abandons: branch <base>-task-1 + ../ts-*
+( cd "$TB/worktree"; base="$(git rev-parse --abbrev-ref HEAD)"
+  git worktree add -q "$TB/ts-$base-task-1-dead" -b "$base-task-1" "$base" )
 ```
 
 ### Run + assert
@@ -212,11 +219,19 @@ if out=$(timeout 20 bash "$SCRIPT" todo.md -t x 2>&1); then rc=0; else rc=$?; fi
 
 cd "$TB/nested/sub"                            # clean repo, but not at the repo root
 if out=$(timeout 20 bash "$SCRIPT" ../todo.md -t x 2>&1); then rc=0; else rc=$?; fi
-{ [ "$rc" != 0 ] && echo "$out" | grep -qi 'not at repo root'; } && echo "B3 subdir-guard PASS" || echo "B3 FAIL (rc=$rc): $out"
+{ [ "$rc" != 0 ] && echo "$out" | grep -qi 'not at.*repo root'; } && echo "B3 subdir-guard PASS" || echo "B3 FAIL (rc=$rc): $out"
+
+cd "$TB/ts-$(git -C "$TB/worktree" rev-parse --abbrev-ref HEAD)-task-1-dead"   # a peer's claim worktree
+if out=$(timeout 20 bash "$SCRIPT" todo.md -t x 2>&1); then rc=0; else rc=$?; fi
+{ [ "$rc" != 0 ] && echo "$out" | grep -qi 'not at.*repo root'; } && echo "B4 worktree-guard PASS" || echo "B4 FAIL (rc=$rc): $out"
+git -C "$TB/worktree" branch --list '*-task-*-task-*' | grep -q . && echo "B4 FAIL: second-claim branch created"
 ```
-- **B PASS** — B1, B2, and B3 all report PASS (non-zero exit + the expected message,
-  before any claude launch). B3 proves the worktree-path assumption is enforced: a subdir
-  launch refuses rather than misfiring `../ts-*` paths.
+- **B PASS** — B1, B2, B3, and B4 all report PASS (non-zero exit + the expected message,
+  before any claude launch), and no `*-task-*-task-*` branch exists. B3 proves the
+  worktree-path assumption is enforced: a subdir launch refuses rather than misfiring
+  `../ts-*` paths. B4 proves the same for a launch *inside* a leftover claim worktree, where
+  the base branch would otherwise be poisoned to a peer's claim and both instances would take
+  the same todo (BUG-014).
 
 ---
 
@@ -378,16 +393,21 @@ cd "$TE/repo"
 GC="$(cd "$(git rev-parse --git-common-dir)" && pwd)"; mkdir -p "$GC/instance"
 printf '%s\n%s\n' 999999 fake > "$GC/instance/DEADID"          # marker of a dead instance
 : > "$GC/todos-seconds-main-DEADID"; : > "$GC/todos-seconds-main-DEADID.lock"
+: > "$GC/todos-done-main-DEADID";    : > "$GC/todos-done-main-DEADID.lock"
 : > "$GC/todos-seconds-main-NOMARK"                             # file with no marker at all
+: > "$GC/todos-done-main-NOMARK"
 # run claudezero once more (stub claude) → startup registers our live instance, then GCs orphans
 PATH="$TE/bin:$PATH" timeout 30 env CLAUDEZERO_MAX_LOOPS=1 bash "$SCRIPT" todo.md -t x > "$TE/boot2.log" 2>&1 || true
 echo "E2 dead file gone   : $([ -f "$GC/todos-seconds-main-DEADID" ] && echo NO || echo yes)"
+echo "E2 dead count gone  : $([ -f "$GC/todos-done-main-DEADID" ] || [ -f "$GC/todos-done-main-DEADID.lock" ] && echo NO || echo yes)"
 echo "E2 dead marker gone : $([ -f "$GC/instance/DEADID" ] && echo NO || echo yes)"
 echo "E2 nomark file gone : $([ -f "$GC/todos-seconds-main-NOMARK" ] && echo NO || echo yes)"
+echo "E2 nomark count gone: $([ -f "$GC/todos-done-main-NOMARK" ] && echo NO || echo yes)"
 ```
-- **E2 PASS** — all three `gone = yes`: the dead instance's marker was reaped by liveness,
-  and both its time-file (+ `.lock`) and the unmarked file were deleted. (This run's own
-  instance marker is live during the sweep, so a real instance's file is never collateral.)
+- **E2 PASS** — all five `gone = yes`: the dead instance's marker was reaped by liveness,
+  and its time-file, its count-file (both + `.lock`) and the unmarked files were deleted.
+  (This run's own instance marker is live during the sweep, so a real instance's file is
+  never collateral.)
 
 ## Scenario F — fenced-checkbox immunity   `[$TESTROOT/F]`   (stub claude, deterministic)
 
@@ -525,6 +545,61 @@ echo "G2 timing kept  : $(grep -c 'ClaudeZero run loop:' "$TG/bad.log")  (want 2
 
 ---
 
+## Scenario G — claude's output descriptor (fd 4)   `[$TESTROOT/G]`   (stub claude, deterministic)
+
+claude writes to fd 4 so `claudezero.sh … | tee run.log` logs the `❄` reports without the
+TUI. Only the *fallback* is deterministic here: with output captured to a file there is no
+controlling terminal, so fd 4 must fall back to plain stdout and the stub's bytes must still
+appear in the captured stream. The split itself needs a pty — manual check below.
+
+### Setup + assert
+```bash
+TG="$TESTROOT/G"; mkdir -p "$TG/repo" "$TG/bin"
+cat > "$TG/bin/claude" <<'EOF'
+#!/usr/bin/env bash
+echo "STUB-CLAUDE-MARKER"
+exit 0
+EOF
+chmod +x "$TG/bin/claude"
+cd "$TG/repo"
+git init -q -b main; git config user.email t@t.t; git config user.name test
+printf -- '- [ ] G1 x\n' > todo.md; git add -A; git commit -qm init
+# run as a session leader so there is genuinely no controlling terminal (macOS has no setsid)
+detach() {
+  if command -v setsid >/dev/null 2>&1; then setsid "$@"
+  elif command -v python3 >/dev/null 2>&1; then
+    python3 -c 'import os,sys; os.setsid(); os.execvp(sys.argv[1], sys.argv[1:])' "$@"
+  else echo "G1 SKIP — neither setsid nor python3 available to drop the controlling terminal" >&2; fi
+}
+detach env PATH="$TG/bin:$PATH" CLAUDEZERO_MAX_LOOPS=1 \
+  timeout 30 bash "$SCRIPT" todo.md -t x > "$TG/run.log" 2>&1 || true
+echo "G1 stub output kept : $(grep -c 'STUB-CLAUDE-MARKER' "$TG/run.log")  (want 1 — fd 4 fell back to stdout)"
+echo "G1 own output kept  : $(grep -c '❄ ClaudeZero' "$TG/run.log")  (want >=1)"
+```
+- **G1 PASS** — both counts as stated: with no controlling terminal the `(: >/dev/tty)` probe
+  fails, fd 4 is a dup of stdout, and no scenario that captures output loses stub-claude bytes.
+  Detaching explicitly matters — run from a terminal without `detach`, the probe succeeds and
+  the stub's bytes go to the terminal by design, which is the whole point of the split.
+
+### G2 — the split itself (manual, needs a pty)
+
+Not scripted: it needs a real terminal, and the two `script(1)` implementations take
+opposite argument orders. Run one of these by hand in a scratch repo with a real `claude`:
+
+```bash
+# macOS / BSD script — typescript to /dev/null; script's own stdout is the pipe
+script -q /dev/null ./claudezero.sh issues/todo.md 2>&1 | { trap '' INT; tee run.log; }
+# util-linux script — command via -c, typescript file last
+script -q -c "./claudezero.sh issues/todo.md 2>&1" /dev/null | { trap '' INT; tee run.log; }
+```
+`script` gives claudezero a pty (so `/dev/tty` opens) while its stdout is the pipe (so fd 1 is
+not a tty) — exactly the operator's situation.
+- **G2 PASS** — `run.log` holds the `❄` banner, reports, and loop notices and no TUI frames
+  (`grep -c $'\033' run.log` is `0`), the terminal shows both streams, and pressing Ctrl+C in
+  the between-runs gap still lands the closing report in `run.log`.
+
+---
+
 ## Run all in parallel (optional)
 
 After Section 0 and each Setup, launch the Run blocks together: put A's and C's run
@@ -553,10 +628,10 @@ cd "$REPO"
 echo "TESTROOT gone  : $([ -d "$TESTROOT" ] && echo NO || echo yes)"
 echo "stale worktrees: $(git worktree list | tail -n +2 | wc -l | tr -d ' ') (want 0)"
 echo "stale branches : $(git branch --list '*-task-*' | wc -l | tr -d ' ') (want 0)"
-echo "stray files    : $(ls .git 2>/dev/null | grep -c '^todos-seconds-\|^transcripts-\|^zero.sh$\|^instance$')  (want 0)"
+echo "stray files    : $(ls .git 2>/dev/null | grep -c '^todos-seconds-\|^todos-done-\|^transcripts-\|^zero.sh$\|^instance$')  (want 0)"
 git status --porcelain
 ```
 All counts must be 0 and `git status` empty. A leftover worktree, `*-task-*` branch, or
-`todos-seconds-*`/`zero.sh`/`instance/` under the project's `.git` means a test ran
+`todos-seconds-*`/`todos-done-*`/`zero.sh`/`instance/` under the project's `.git` means a test ran
 claudezero against the project repo instead of its `$TESTROOT` sandbox — report it, don't
 silently delete.
