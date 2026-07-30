@@ -65,9 +65,8 @@ $ claudezero todo.md
 
 … fresh context, next task …
 
-❄ execution time (instance a1b2c3d4)
-  Todos:               12m 30s
-  Claude loops:        41m 02s
+❄ execution stats (instance a1b2c3d4)
+  Todos:               12m 30s  ·  5 completed
   ClaudeZero run loop: 48m 15s
 
 ❄ ClaudeZero surveys the frozen field, and is proud.
