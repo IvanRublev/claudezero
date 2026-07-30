@@ -80,4 +80,28 @@ git -C "$repo" worktree add "$wt2" -b "$base-task-2" "$base" >/dev/null 2>&1 || 
 git -C "$repo" worktree remove --force "$wt2" >/dev/null 2>&1
 ok "git worktree list --porcelain | sed main-root"
 
+# 8. token accounting — transcript_path sed (claudezero.sh:243) + the usage awk (claudezero.sh:304).
+# The awk must dedupe by requestId and take the PARENT field on each line, never the
+# usage.iterations[] copy or the cache_creation ephemeral leaves.
+tp="$(printf '%s' '{"transcript_path": "/a b/c.jsonl"}' \
+  | sed -n 's/.*"transcript_path"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')"
+[ "$tp" = "/a b/c.jsonl" ] || fail "transcript_path parse got '$tp'"
+u='"input_tokens":10,"cache_creation_input_tokens":248,"cache_read_input_tokens":1000,"output_tokens":20,"cache_creation":{"ephemeral_5m_input_tokens":148,"ephemeral_1h_input_tokens":100},"iterations":[{"input_tokens":10,"output_tokens":20,"cache_read_input_tokens":1000,"cache_creation_input_tokens":248}]'
+for _ in 1 2; do printf '{"requestId":"req_A","message":{"usage":{%s}}}\n' "$u"; done > "$tmp/t.jsonl"
+sums="$(awk '
+  function num(key,   s) {
+    if (!match($0, "\"" key "\":[0-9]+")) return 0
+    s = substr($0, RSTART, RLENGTH); sub(/.*:/, "", s); return s + 0
+  }
+  /"output_tokens":/ {
+    k = match($0, /"requestId":"[^"]+"/) ? substr($0, RSTART + 13, RLENGTH - 14) : "line" NR
+    if (k in seen) next
+    seen[k] = 1; n++
+    i  += num("input_tokens");                o  += num("output_tokens")
+    cc += num("cache_creation_input_tokens"); cr += num("cache_read_input_tokens")
+  }
+  END { if (n) printf "%d %d %d %d %d\n", i, o, cc, cr, i + o + cc + cr }' "$tmp/t.jsonl")"
+[ "$sums" = "10 20 248 1000 1278" ] || fail "usage awk got '$sums' (want '10 20 248 1000 1278')"
+ok "sed transcript_path / awk usage dedupe"
+
 echo "SMOKE PASS ($(uname -s), bash $BASH_VERSION)"

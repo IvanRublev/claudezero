@@ -1,6 +1,6 @@
 # TEST.md — end-to-end tests for `claudezero.sh`
 
-Five scenarios, each in its own folder under a single **isolated TESTROOT created
+Each scenario lives in its own folder under a single **isolated TESTROOT created
 outside the repo** (via `mktemp -d`). They touch separate throwaway git repos, never
 the project's own working tree or history, and can run concurrently.
 
@@ -16,6 +16,10 @@ the project's own working tree or history, and can run concurrently.
   task's box; `merge_task` refuses with a pointer and the agent self-heals (step 2.e).
 - **E — timing accounting.** Deterministic, **no real claude** (a stub `claude` on PATH):
   per-instance in-flight credit routing + idempotency, and startup orphan-file GC.
+- **G — token accounting.** Deterministic, **no real claude** (a stub that fabricates a
+  session transcript and fires the real Stop hook): `requestId` dedupe, no double-count of
+  the nested `iterations`/`cache_creation` fields, accumulation across restarts, and
+  `Tokens: n/a` degradation.
 
 Parallelism (A, C) is enforced with a **file-lock barrier**, not `sleep`, so the
 proof is independent of claude startup/shutdown times.
@@ -32,10 +36,10 @@ reading this file can run it autonomously and report the results.
 **Prerequisites:** `flock`, `uuidgen`, `timeout`, `git`, `date`, `find`, `stat`, `mv`
 on PATH. A and C need real `claude` on PATH and the `suggest-compact` hook installed in
 `~/.claude/settings.json` (claudezero.sh refuses to start without it — if A/C logs show
-an immediate hook error, report "prerequisite missing — suggest-compact hook"). B and E
-do **not** need real claude but still need `flock` and the `suggest-compact` hook (both
-startup guards run before any claude launch; E supplies a stub `claude` so claudezero
-writes `zero.sh` and loops out at once). A missing hook makes B/E exit with the wrong
+an immediate hook error, report "prerequisite missing — suggest-compact hook"). B, E, F and
+G do **not** need real claude but still need `flock` and the `suggest-compact` hook (both
+startup guards run before any claude launch; E/F/G supply a stub `claude` so claudezero
+writes `zero.sh` and loops out at once). A missing hook makes them exit with the wrong
 message and their assertions fail.
 
 Inform about progress during the test; at the end return a summary report
@@ -281,7 +285,7 @@ grep -Eril 'conflict|merge fail|resolve|stop' "$TC"/log_*.txt >/dev/null && echo
 ## Scenario D — foreign check-off refusal + self-heal   `[$TESTROOT/D]`
 
 One agent, two tasks. The `-t` prompt **induces** the agent to tick a SECOND checkbox
-(a task it does not own) and ignore step 2.d's `touch no other line` rule, so the foreign tick
+(a task it does not own) and ignore step 2.d's touch-no-other-line rule, so the foreign tick
 reaches the merge. `merge_task` enforces the one-box invariant on **every** merge (not
 just conflicting ones), refuses with a `checkbox-merge: refused` pointer listing the
 offending `file:line`s, and step 2.e self-heals: uncheck the foreign line, amend, retry —
@@ -305,7 +309,7 @@ printf '%s\n%s\n' "$U1" "$U2" > "$H/uuids.txt"
 ```bash
 cd "$H/repo"
 timeout -k 10 300 env CLAUDEZERO_MAX_LOOPS=3 bash "$SCRIPT" todo.md \
-  -t "You are agent HEAL. TEST INDUCEMENT for step d only: after doing your acquired task, ALSO tick the OTHER task's checkbox to [x] in todo.md, and IGNORE step 2.d's \`touch no other line\` rule — commit both ticks on your task branch. Then proceed to the merge (step 2.e) normally and follow its instructions to the letter." \
+  -t "You are agent HEAL. TEST INDUCEMENT for step d only: after doing your acquired task, ALSO tick the OTHER task's checkbox to [x] in todo.md, and IGNORE step 2.d's touch-no-other-line rule — commit both ticks on your task branch. Then proceed to the merge (step 2.e) normally and follow its instructions to the letter." \
   > "$H/log.txt" 2>&1 || true
 ```
 
@@ -457,6 +461,88 @@ cd "$TF/repo"
 - **F2 PASS** — `real done id = 0`, both fenced ids = `1`: a checked example box never
   reports a task as landed.
 
+## Scenario G — token accounting   `[$TESTROOT/G]`   (stub claude, deterministic)
+
+The token figures come from the session transcripts the Stop hook records, so a stub
+`claude` that fabricates a transcript and then fires the **real** hook exercises the whole
+path with no API calls and no real claude. `MAX_LOOPS=3` is deliberate: the report prints
+*between* runs (the `MAX_LOOPS` break comes before it), so three runs give two reports —
+the second proves figures accumulate across a context restart. Covers what a naive summer
+gets wrong: one API request writes one transcript line **per content block**, all repeating
+the same `usage`, and each `usage` repeats all four field names inside `iterations[]` plus
+the `cache_creation` ephemeral leaves that already sum into the parent.
+
+### Setup (stub + repo)
+```bash
+TG="$TESTROOT/G"; mkdir -p "$TG/repo" "$TG/bin" "$TG/tx"
+cat > "$TG/bin/claude" <<'EOF'
+#!/usr/bin/env bash
+# stub claude: no API calls. Fabricates ONE session transcript per run, then fires the real
+# Stop hook (path pulled out of the --settings JSON claudezero passed us) with the payload
+# shape claude sends, so transcript_path recording is exercised for real.
+n=$(( $(cat "$TG_TX/count" 2>/dev/null || echo 0) + 1 )); echo "$n" > "$TG_TX/count"
+t="$TG_TX/t$n.jsonl"
+case "${TG_MODE:-ok}" in
+  missing) : ;;                                              # record a path with no file
+  bad)     printf '{"message":{"usage":{"outp\n' > "$t" ;;   # truncated / invalid JSON
+  *) if [ "$n" = 1 ]; then
+       # req_A on 3 content-block lines with IDENTICAL usage (must count once), each carrying
+       # the usage.iterations[] copy and the cache_creation ephemeral leaves (148+100 = 248).
+       u='"input_tokens":10,"cache_creation_input_tokens":248,"cache_read_input_tokens":1000,"output_tokens":20,"cache_creation":{"ephemeral_5m_input_tokens":148,"ephemeral_1h_input_tokens":100},"iterations":[{"input_tokens":10,"output_tokens":20,"cache_read_input_tokens":1000,"cache_creation_input_tokens":248}]'
+       for i in 1 2 3; do printf '{"requestId":"req_A","type":"assistant","message":{"usage":{%s}}}\n' "$u"; done > "$t"
+       printf '{"requestId":"req_B","type":"assistant","message":{"usage":{"input_tokens":5,"cache_creation_input_tokens":0,"cache_read_input_tokens":500,"output_tokens":7}}}\n' >> "$t"
+     else
+       printf '{"requestId":"req_C","type":"assistant","message":{"usage":{"input_tokens":100,"cache_creation_input_tokens":300,"cache_read_input_tokens":400,"output_tokens":200}}}\n' > "$t"
+     fi ;;
+esac
+hook=""
+for a in "$@"; do case "$a" in *compact-exit-hook.sh*) hook="$(printf '%s' "$a" | sed -n 's/.*"command":"\([^"]*\)".*/\1/p')";; esac; done
+[ -n "$hook" ] && printf '{"session_id":"stub%s","transcript_path":"%s"}' "$n" "$t" | "$hook"
+exit 0
+EOF
+chmod +x "$TG/bin/claude"
+cd "$TG/repo"
+git init -q -b main; git config user.email t@t.t; git config user.name test
+printf -- '- [ ] G1 x\n' > todo.md; git add -A; git commit -qm init
+# $1 = stub mode, $2 = log file. Fresh transcript dir per run.
+grun() { rm -rf "$TG/tx"; mkdir -p "$TG/tx"
+  PATH="$TG/bin:$PATH" TG_TX="$TG/tx" TG_MODE="$1" \
+    timeout 90 env CLAUDEZERO_MAX_LOOPS=3 bash "$SCRIPT" todo.md -t x > "$2" 2>&1 || true; }
+```
+
+### G1 — dedupe, no double-count, accumulation across restarts
+```bash
+cd "$TG/repo"
+grun ok "$TG/ok.log"
+GC="$(cd "$(git rev-parse --git-common-dir)" && pwd)"
+inst="$(sed -n 's/.*execution stats (instance \([A-Za-z0-9]*\)).*/\1/p' "$TG/ok.log" | head -1)"
+echo "G1 heading       : $(grep -c 'execution stats' "$TG/ok.log")  (want 2 — renamed from 'execution time')"
+echo "G1 report 1      : $(grep -A1 'Tokens:' "$TG/ok.log" | sed -n '1,2p' | tr '\n' '|')"
+echo "G1 report 2      : $(grep -A1 'Tokens:' "$TG/ok.log" | sed -n '4,5p' | tr '\n' '|')"
+echo "G1 per-instance  : $([ -f "$GC/transcripts-main-$inst" ] && echo yes || echo NO)  (instance $inst)"
+```
+- **G1 PASS** — `heading = 2`, and the two reports read exactly:
+  - report 1: `  Tokens: 1.7k Total|  in 15 · out 27 · cache write 248 · cache read 1.5k|`
+    — `req_A`'s three identical lines counted **once** (10+5 in, 20+7 out), `iterations[]`
+    not added on top, and the cache write is `248`, not `496` (leaves not added to parent).
+    Total `15+27+248+1500 = 1790` → `1.7k`, i.e. exactly the sum of the four categories.
+  - report 2: `  Tokens: 2.7k Total|  in 115 · out 227 · cache write 548 · cache read 1.9k|`
+    — run 2's transcript **added** to run 1's, not replacing it (2790 → `2.7k`).
+  - `per-instance = yes`: the transcript list is namespaced `transcripts-main-<instance>`,
+    so parallel instances can never read each other's figures.
+
+### G2 — degradation: never lie, never fail the run
+```bash
+cd "$TG/repo"
+grun missing "$TG/missing.log"; grun bad "$TG/bad.log"
+echo "G2 missing file : $(grep -c 'Tokens: n/a' "$TG/missing.log")  (want 2)"
+echo "G2 invalid json : $(grep -c 'Tokens: n/a' "$TG/bad.log")  (want 2)"
+echo "G2 timing kept  : $(grep -c 'ClaudeZero run loop:' "$TG/bad.log")  (want 2)"
+```
+- **G2 PASS** — both runs print `Tokens: n/a` in every report and still print the timing
+  rows: a deleted transcript or a truncated/invalid line degrades to `n/a` and the run
+  completes normally instead of printing a wrong number.
+
 ---
 
 ## Scenario G — claude's output descriptor (fd 4)   `[$TESTROOT/G]`   (stub claude, deterministic)
@@ -514,7 +600,76 @@ not a tty) — exactly the operator's situation.
 
 ---
 
-## Scenario H — `zero.sh claim` exit paths   `[$TESTROOT/H]`   (stub claude, deterministic)
+## Scenario H — claude session display name   `[$TESTROOT/H]`   (stub claude, deterministic)
+
+Each instance names its claude session `(<instance id>) <student activity>` via `--name`, so
+parallel terminals are told apart without reading hex. The name must reach claude as ONE argv
+element, and must be the SAME on every context restart (derived from the id, never from chance).
+The stub claude echoes its argv, so no real claude is needed.
+
+### Setup
+```bash
+TH="$TESTROOT/H"; mkdir -p "$TH/repo" "$TH/bin"
+cat > "$TH/bin/claude" <<'EOF'
+#!/usr/bin/env bash
+printf 'ARGV:'; for a in "$@"; do printf ' [%s]' "$a"; done; printf '\n'
+exit 0
+EOF
+chmod +x "$TH/bin/claude"
+cd "$TH/repo"
+git init -q -b main; git config user.email t@t.t; git config user.name test
+printf -- '- [ ] H1 x\n' > todo.md; git add -A; git commit -qm init
+# the ten activities, verbatim (claudezero.sh dojo_student)
+ACT=('drilling the fork-implement-merge kata' 'hauling snow buckets uphill' \
+     'claiming a track before stepping on it' 'reading the whole task before striking' \
+     'starting over on fresh snow' 'carving one checkbox into ice' 'chasing one unchecked box' \
+     'practicing one clean strike per task' "leaving a peer's branch untouched" \
+     'approaching the merge gate')
+# claude's own output goes to fd 4, which falls back to stdout only when there is no controlling
+# terminal — run detached so the stub's ARGV line lands in the capture file (see Scenario G).
+detachH() {
+  if command -v setsid >/dev/null 2>&1; then setsid "$@"
+  elif command -v python3 >/dev/null 2>&1; then
+    python3 -c 'import os,sys; os.setsid(); os.execvp(sys.argv[1], sys.argv[1:])' "$@"
+  else echo "H SKIP — neither setsid nor python3 available to drop the controlling terminal" >&2; fi
+}
+```
+
+### H1 — name construction, unsplit argv, restart stability
+```bash
+cd "$TH/repo"
+detachH env PATH="$TH/bin:$PATH" CLAUDEZERO_MAX_LOOPS=3 \
+  timeout 90 bash "$SCRIPT" todo.md -t x > "$TH/run.log" 2>&1 || true
+ID=$(grep -m1 -oE 'instance [0-9A-Za-z]+' "$TH/run.log" | awk '{print $2}')
+WANT="($ID) ${ACT[$(( 16#${ID:0:2} % 10 ))]}"
+echo "H1 want name     : $WANT"
+echo "H1 launches      : $(grep -c '^ARGV:' "$TH/run.log")  (want 3)"
+echo "H1 named+unsplit : $(grep -c -F -- "[--name] [$WANT]" "$TH/run.log")  (want 3)"
+```
+- **H1 PASS** — `launches = 3` and `named+unsplit = 3`: `--name` carries the parenthesised,
+  space-containing name as a single argv element, the activity is the one the id selects by
+  `16#<first two chars> % 10`, and all three restarts used the same name.
+
+### H2 — loop mode named too; decimal (`$$`-shaped) id picks an activity, not an error
+```bash
+cd "$TH/repo"
+detachH env PATH="$TH/bin:$PATH" CLAUDEZERO_MAX_LOOPS=1 \
+  timeout 60 bash "$SCRIPT" -l 'hi' > "$TH/loop.log" 2>&1 || true
+echo "H2 loop-mode name: $(grep -m1 -oE '\[--name\] \[[^]]*\]' "$TH/loop.log" || echo NONE)"
+# the $$ fallback id is decimal digits — valid hex, so the same derivation applies with no
+# branch. Drive the real function on such an id.
+eval "$(sed -n '/^dojo_student()/,/^}/p' "$SCRIPT")"
+echo "H2 decimal id    : $(dojo_student 48584); $(dojo_student 90210)  (two activities, no error)"
+echo "H2 deterministic : $([ "$(dojo_student a1b2c3d4)" = "$(dojo_student a1ffffff)" ] && echo yes || echo NO)"
+echo "H2 a1 vs b2      : $([ "$(dojo_student a1b2c3d4)" != "$(dojo_student b2b2c3d4)" ] && echo differ || echo same)"
+```
+- **H2 PASS** — the loop-mode line shows `[--name] [(<id>) <activity>]`, both decimal ids render
+  an activity with no arithmetic error, `deterministic = yes` (only the first two chars select),
+  and `a1 vs b2 = differ` (`16#a1 % 10 = 1`, `16#b2 % 10 = 8`).
+
+---
+
+## Scenario I — `zero.sh claim` exit paths   `[$TESTROOT/I]`   (stub claude, deterministic)
 
 `claim` is the whole "is this task mine to work?" decision: acquire, validate, re-check. It
 prints the worktree path on stdout and exits 0 when the task is yours, else 1 (not claimed),
@@ -524,73 +679,73 @@ below is executed by a copy of `bash` named `claude`.
 
 ### Setup
 ```bash
-TH="$TESTROOT/H"; mkdir -p "$TH/repo" "$TH/bin"
-printf '#!/usr/bin/env bash\nexit 0\n' > "$TH/bin/claude"; chmod +x "$TH/bin/claude"
-cd "$TH/repo"
+TI="$TESTROOT/I"; mkdir -p "$TI/repo" "$TI/bin"
+printf '#!/usr/bin/env bash\nexit 0\n' > "$TI/bin/claude"; chmod +x "$TI/bin/claude"
+cd "$TI/repo"
 git init -q -b main; git config user.email t@t.t; git config user.name test
-printf -- '- [ ] H1 a\n- [ ] H3 b\n- [ ] H4 c\n- [ ] H5 d\n- [ ] H6/a e\n' > todo.md
+printf -- '- [ ] I1 a\n- [ ] I3 b\n- [ ] I4 c\n- [ ] I5 d\n- [ ] I6/a e\n' > todo.md
 git add -A; git commit -qm init
 # bootstrap: real claudezero writes .git/zero.sh, stub claude exits, loop ends
-PATH="$TH/bin:$PATH" timeout 30 env CLAUDEZERO_MAX_LOOPS=1 bash "$SCRIPT" todo.md -t x > "$TH/boot.log" 2>&1 || true
-cp "$(command -v bash)" "$TH/bin/claude"   # ensure_owner walks `ps -o comm=` for an ancestor named claude
-cat > "$TH/drive.sh" <<'DRIVE'
+PATH="$TI/bin:$PATH" timeout 30 env CLAUDEZERO_MAX_LOOPS=1 bash "$SCRIPT" todo.md -t x > "$TI/boot.log" 2>&1 || true
+cp "$(command -v bash)" "$TI/bin/claude"   # ensure_owner walks `ps -o comm=` for an ancestor named claude
+cat > "$TI/drive.sh" <<'DRIVE'
 set -uo pipefail
-cd "$TH/repo"
+cd "$TI/repo"
 ZERO="$(cd "$(git rev-parse --git-dir)" && pwd)/zero.sh"
 GC="$(cd "$(git rev-parse --git-common-dir)" && pwd)"
 
-# H1 — free task: exit 0, worktree path on stdout and nothing else
-wt=$("$ZERO" claim H1); rc=$?
-echo "H1 exit            : $rc  (want 0)"
-echo "H1 branch          : $(git -C "$wt" symbolic-ref --short HEAD 2>/dev/null)  (want main-task-H1)"
-echo "H1 stdout clean    : $([ "$(printf '%s' "$wt" | wc -l | tr -d ' ')" = 0 ] && [ "$(printf '%s' "$wt" | wc -w | tr -d ' ')" = 1 ] && echo yes || echo NO)"
+# I1 — free task: exit 0, worktree path on stdout and nothing else
+wt=$("$ZERO" claim I1); rc=$?
+echo "I1 exit            : $rc  (want 0)"
+echo "I1 branch          : $(git -C "$wt" symbolic-ref --short HEAD 2>/dev/null)  (want main-task-I1)"
+echo "I1 stdout clean    : $([ "$(printf '%s' "$wt" | wc -l | tr -d ' ')" = 0 ] && [ "$(printf '%s' "$wt" | wc -w | tr -d ' ')" = 1 ] && echo yes || echo NO)"
 
-# H2 — already held by a live session: exit 1, no second worktree
-before=$(git worktree list | grep -c 'task-H1')
-out=$("$ZERO" claim H1 2>&1 >/dev/null); rc=$?
-echo "H2 exit            : $rc  (want 1)"
-echo "H2 stderr          : $out"
-echo "H2 no new worktree : $([ "$(git worktree list | grep -c 'task-H1')" = "$before" ] && echo yes || echo NO)"
+# I2 — already held by a live session: exit 1, no second worktree
+before=$(git worktree list | grep -c 'task-I1')
+out=$("$ZERO" claim I1 2>&1 >/dev/null); rc=$?
+echo "I2 exit            : $rc  (want 1)"
+echo "I2 stderr          : $out"
+echo "I2 no new worktree : $([ "$(git worktree list | grep -c 'task-I1')" = "$before" ] && echo yes || echo NO)"
 
-# H3 — a peer landed it on base first: exit 4, and the worktree/branch it briefly held are gone
-sed -i'' -e 's/^- \[ \] H3 /- [x] H3 /' todo.md; git commit -qam 'peer landed H3'
-out=$("$ZERO" claim H3 2>&1 >/dev/null); rc=$?
-echo "H3 exit            : $rc  (want 4)"
-echo "H3 stderr          : $out"
-echo "H3 worktree gone   : $(git worktree list | grep -c 'task-H3')  (want 0)"
-echo "H3 branch gone     : $(git branch --list 'main-task-H3' | wc -l | tr -d ' ')  (want 0)"
+# I3 — a peer landed it on base first: exit 4, and the worktree/branch it briefly held are gone
+sed -i'' -e 's/^- \[ \] I3 /- [x] I3 /' todo.md; git commit -qam 'peer landed I3'
+out=$("$ZERO" claim I3 2>&1 >/dev/null); rc=$?
+echo "I3 exit            : $rc  (want 4)"
+echo "I3 stderr          : $out"
+echo "I3 worktree gone   : $(git worktree list | grep -c 'task-I3')  (want 0)"
+echo "I3 branch gone     : $(git branch --list 'main-task-I3' | wc -l | tr -d ' ')  (want 0)"
 
-# H4 — validation failure, FAULT-INJECTED: acquire hands back a detached worktree. Unreachable in
+# I4 — validation failure, FAULT-INJECTED: acquire hands back a detached worktree. Unreachable in
 # normal operation (acquire always lands on the task branch), so inject rather than fabricate.
 sed 's|^  setup_exclude "$wt"; claim_owner "$wt"; set_current "$n"; printf|  setup_exclude "$wt"; claim_owner "$wt"; set_current "$n"; git -C "$wt" checkout -q --detach; printf|' \
-  "$ZERO" > "$TH/zero-bad.sh"; chmod +x "$TH/zero-bad.sh"
-out=$("$TH/zero-bad.sh" claim H4 2>&1 >/dev/null); rc=$?
-echo "H4 exit            : $rc  (want 3)"
-echo "H4 stderr          : $out"
-echo "H4 worktree kept   : $(git worktree list | grep -c 'task-H4')  (want 1 — exit 3 must NOT remove it)"
-echo "H4 marker cleared  : $(grep -l '^H4$' "$GC"/session/* 2>/dev/null | wc -l | tr -d ' ')  (want 0 — no session still names H4)"
+  "$ZERO" > "$TI/zero-bad.sh"; chmod +x "$TI/zero-bad.sh"
+out=$("$TI/zero-bad.sh" claim I4 2>&1 >/dev/null); rc=$?
+echo "I4 exit            : $rc  (want 3)"
+echo "I4 stderr          : $out"
+echo "I4 worktree kept   : $(git worktree list | grep -c 'task-I4')  (want 1 — exit 3 must NOT remove it)"
+echo "I4 marker cleared  : $(grep -l '^I4$' "$GC"/session/* 2>/dev/null | wc -l | tr -d ' ')  (want 0 — no session still names I4)"
 
-# H5 — the leaked-claim regression: after an exit 3 the session may still claim another task
-wt5=$("$ZERO" claim H5); rc=$?
-echo "H5 exit            : $rc  (want 0 — the failed claim did not leak)"
-echo "H5 branch          : $(git -C "$wt5" symbolic-ref --short HEAD 2>/dev/null)  (want main-task-H5)"
+# I5 — the leaked-claim regression: after an exit 3 the session may still claim another task
+wt5=$("$ZERO" claim I5); rc=$?
+echo "I5 exit            : $rc  (want 0 — the failed claim did not leak)"
+echo "I5 branch          : $(git -C "$wt5" symbolic-ref --short HEAD 2>/dev/null)  (want main-task-I5)"
 
-# H6 — the RAW id reaches is_done: an id needing sanitization still matches its todo line
-sed -i'' -e 's|^- \[ \] H6/a |- [x] H6/a |' todo.md; git commit -qam 'peer landed H6/a'
-out=$("$ZERO" claim 'H6/a' 2>&1 >/dev/null); rc=$?
-echo "H6 exit            : $rc  (want 4 — raw 'H6/a' matched the todo line, the branch used the slug)"
+# I6 — the RAW id reaches is_done: an id needing sanitization still matches its todo line
+sed -i'' -e 's|^- \[ \] I6/a |- [x] I6/a |' todo.md; git commit -qam 'peer landed I6/a'
+out=$("$ZERO" claim 'I6/a' 2>&1 >/dev/null); rc=$?
+echo "I6 exit            : $rc  (want 4 — raw 'I6/a' matched the todo line, the branch used the slug)"
 
-echo "H7 usage           : $("$ZERO" 2>&1 | grep -c 'claim N')  (want 1)"
+echo "I7 usage           : $("$ZERO" 2>&1 | grep -c 'claim N')  (want 1)"
 DRIVE
 ```
 
 ### Run + assert
 ```bash
-TH="$TH" "$TH/bin/claude" "$TH/drive.sh"
+TI="$TI" "$TI/bin/claude" "$TI/drive.sh"
 ```
-- **H PASS** — every line reports its `want` value. Together they cover the four exit paths, the
-  single-field stdout the prompt's `wt=$(…)` depends on, the exit-3 claim leak (H4/H5), and the
-  raw-vs-sanitized id split (H6).
+- **I PASS** — every line reports its `want` value. Together they cover the four exit paths, the
+  single-field stdout the prompt's `wt=$(…)` depends on, the exit-3 claim leak (I4/I5), and the
+  raw-vs-sanitized id split (I6).
 
 ---
 
@@ -622,7 +777,7 @@ cd "$REPO"
 echo "TESTROOT gone  : $([ -d "$TESTROOT" ] && echo NO || echo yes)"
 echo "stale worktrees: $(git worktree list | tail -n +2 | wc -l | tr -d ' ') (want 0)"
 echo "stale branches : $(git branch --list '*-task-*' | wc -l | tr -d ' ') (want 0)"
-echo "stray files    : $(ls .git 2>/dev/null | grep -c '^todos-seconds-\|^todos-done-\|^zero.sh$\|^instance$')  (want 0)"
+echo "stray files    : $(ls .git 2>/dev/null | grep -c '^todos-seconds-\|^todos-done-\|^transcripts-\|^zero.sh$\|^instance$')  (want 0)"
 git status --porcelain
 ```
 All counts must be 0 and `git status` empty. A leftover worktree, `*-task-*` branch, or
