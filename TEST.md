@@ -13,7 +13,7 @@ the project's own working tree or history, and can run concurrently.
   hits a conflict, and the zero run aborts cleanly leaving the base green and the branch for
   a human.
 - **D — foreign check-off refusal + self-heal.** one agent is induced to tick a second
-  task's box; `merge_task` refuses with a pointer and the agent self-heals (step 2.f).
+  task's box; `merge_task` refuses with a pointer and the agent self-heals (step 2.e).
 - **E — timing accounting.** Deterministic, **no real claude** (a stub `claude` on PATH):
   per-instance in-flight credit routing + idempotency, and startup orphan-file GC.
 - **G — token accounting.** Deterministic, **no real claude** (a stub that fabricates a
@@ -243,7 +243,7 @@ git -C "$TB/worktree" branch --list '*-task-*-task-*' | grep -q . && echo "B4 FA
 Two tasks overwrite the same line of `conflict.txt`. The barrier (`need=2`) forces
 both agents to branch off the same base before either merges, so the second merge is
 a guaranteed modify/modify conflict. Zero mode must abort it, keep the base green, and
-leave the losing branch for a human (zero algorithm, step 2.f).
+leave the losing branch for a human (zero algorithm, step 2.e).
 
 ### Setup
 ```bash
@@ -288,10 +288,10 @@ grep -Eril 'conflict|merge fail|resolve|stop' "$TC"/log_*.txt >/dev/null && echo
 ## Scenario D — foreign check-off refusal + self-heal   `[$TESTROOT/D]`
 
 One agent, two tasks. The `-t` prompt **induces** the agent to tick a SECOND checkbox
-(a task it does not own) and skip the step-2.e pre-commit check, so the foreign tick
+(a task it does not own) and ignore step 2.d's touch-no-other-line rule, so the foreign tick
 reaches the merge. `merge_task` enforces the one-box invariant on **every** merge (not
 just conflicting ones), refuses with a `checkbox-merge: refused` pointer listing the
-offending `file:line`s, and step 2.f self-heals: uncheck the foreign line, amend, retry —
+offending `file:line`s, and step 2.e self-heals: uncheck the foreign line, amend, retry —
 then the merge lands. No parallelism, no gate; a single instance triggers it because the
 branch carries two check-offs vs its fork point.
 
@@ -312,7 +312,7 @@ printf '%s\n%s\n' "$U1" "$U2" > "$H/uuids.txt"
 ```bash
 cd "$H/repo"
 timeout -k 10 300 env CLAUDEZERO_MAX_LOOPS=3 bash "$SCRIPT" todo.md \
-  -t "You are agent HEAL. TEST INDUCEMENT for step d only: after doing your acquired task, ALSO tick the OTHER task's checkbox to [x] in todo.md, and DO NOT run the step 2.e diff self-check — commit both ticks on your task branch. Then proceed to the merge (step 2.f) normally and follow its instructions to the letter." \
+  -t "You are agent HEAL. TEST INDUCEMENT for step d only: after doing your acquired task, ALSO tick the OTHER task's checkbox to [x] in todo.md, and IGNORE step 2.d's touch-no-other-line rule — commit both ticks on your task branch. Then proceed to the merge (step 2.e) normally and follow its instructions to the letter." \
   > "$H/log.txt" 2>&1 || true
 ```
 
@@ -672,7 +672,87 @@ echo "H2 a1 vs b2      : $([ "$(dojo_student a1b2c3d4)" != "$(dojo_student b2b2c
 
 ---
 
-## Scenario I — fleet TOTAL on the exit path   `[$TESTROOT/I]`   (stub claude, deterministic)
+## Scenario I — `zero.sh claim` exit paths   `[$TESTROOT/I]`   (stub claude, deterministic)
+
+`claim` is the whole "is this task mine to work?" decision: acquire, validate, re-check. It
+prints the worktree path on stdout and exits 0 when the task is yours, else 1 (not claimed),
+3 (validation failed) or 4 (a peer already landed it). No real claude needed — but `claim`
+goes through `ensure_owner`, which requires a `claude` **ancestor process**, so the driver
+below is executed by a copy of `bash` named `claude`.
+
+### Setup
+```bash
+TI="$TESTROOT/I"; mkdir -p "$TI/repo" "$TI/bin"
+printf '#!/usr/bin/env bash\nexit 0\n' > "$TI/bin/claude"; chmod +x "$TI/bin/claude"
+cd "$TI/repo"
+git init -q -b main; git config user.email t@t.t; git config user.name test
+printf -- '- [ ] I1 a\n- [ ] I3 b\n- [ ] I4 c\n- [ ] I5 d\n- [ ] I6/a e\n' > todo.md
+git add -A; git commit -qm init
+# bootstrap: real claudezero writes .git/zero.sh, stub claude exits, loop ends
+PATH="$TI/bin:$PATH" timeout 30 env CLAUDEZERO_MAX_LOOPS=1 bash "$SCRIPT" todo.md -t x > "$TI/boot.log" 2>&1 || true
+cp "$(command -v bash)" "$TI/bin/claude"   # ensure_owner walks `ps -o comm=` for an ancestor named claude
+cat > "$TI/drive.sh" <<'DRIVE'
+set -uo pipefail
+cd "$TI/repo"
+ZERO="$(cd "$(git rev-parse --git-dir)" && pwd)/zero.sh"
+GC="$(cd "$(git rev-parse --git-common-dir)" && pwd)"
+
+# I1 — free task: exit 0, worktree path on stdout and nothing else
+wt=$("$ZERO" claim I1); rc=$?
+echo "I1 exit            : $rc  (want 0)"
+echo "I1 branch          : $(git -C "$wt" symbolic-ref --short HEAD 2>/dev/null)  (want main-task-I1)"
+echo "I1 stdout clean    : $([ "$(printf '%s' "$wt" | wc -l | tr -d ' ')" = 0 ] && [ "$(printf '%s' "$wt" | wc -w | tr -d ' ')" = 1 ] && echo yes || echo NO)"
+
+# I2 — already held by a live session: exit 1, no second worktree
+before=$(git worktree list | grep -c 'task-I1')
+out=$("$ZERO" claim I1 2>&1 >/dev/null); rc=$?
+echo "I2 exit            : $rc  (want 1)"
+echo "I2 stderr          : $out"
+echo "I2 no new worktree : $([ "$(git worktree list | grep -c 'task-I1')" = "$before" ] && echo yes || echo NO)"
+
+# I3 — a peer landed it on base first: exit 4, and the worktree/branch it briefly held are gone
+sed -i'' -e 's/^- \[ \] I3 /- [x] I3 /' todo.md; git commit -qam 'peer landed I3'
+out=$("$ZERO" claim I3 2>&1 >/dev/null); rc=$?
+echo "I3 exit            : $rc  (want 4)"
+echo "I3 stderr          : $out"
+echo "I3 worktree gone   : $(git worktree list | grep -c 'task-I3')  (want 0)"
+echo "I3 branch gone     : $(git branch --list 'main-task-I3' | wc -l | tr -d ' ')  (want 0)"
+
+# I4 — validation failure, FAULT-INJECTED: acquire hands back a detached worktree. Unreachable in
+# normal operation (acquire always lands on the task branch), so inject rather than fabricate.
+sed 's|^  setup_exclude "$wt"; claim_owner "$wt"; set_current "$n"; printf|  setup_exclude "$wt"; claim_owner "$wt"; set_current "$n"; git -C "$wt" checkout -q --detach; printf|' \
+  "$ZERO" > "$TI/zero-bad.sh"; chmod +x "$TI/zero-bad.sh"
+out=$("$TI/zero-bad.sh" claim I4 2>&1 >/dev/null); rc=$?
+echo "I4 exit            : $rc  (want 3)"
+echo "I4 stderr          : $out"
+echo "I4 worktree kept   : $(git worktree list | grep -c 'task-I4')  (want 1 — exit 3 must NOT remove it)"
+echo "I4 marker cleared  : $(grep -l '^I4$' "$GC"/session/* 2>/dev/null | wc -l | tr -d ' ')  (want 0 — no session still names I4)"
+
+# I5 — the leaked-claim regression: after an exit 3 the session may still claim another task
+wt5=$("$ZERO" claim I5); rc=$?
+echo "I5 exit            : $rc  (want 0 — the failed claim did not leak)"
+echo "I5 branch          : $(git -C "$wt5" symbolic-ref --short HEAD 2>/dev/null)  (want main-task-I5)"
+
+# I6 — the RAW id reaches is_done: an id needing sanitization still matches its todo line
+sed -i'' -e 's|^- \[ \] I6/a |- [x] I6/a |' todo.md; git commit -qam 'peer landed I6/a'
+out=$("$ZERO" claim 'I6/a' 2>&1 >/dev/null); rc=$?
+echo "I6 exit            : $rc  (want 4 — raw 'I6/a' matched the todo line, the branch used the slug)"
+
+echo "I7 usage           : $("$ZERO" 2>&1 | grep -c 'claim N')  (want 1)"
+DRIVE
+```
+
+### Run + assert
+```bash
+TI="$TI" "$TI/bin/claude" "$TI/drive.sh"
+```
+- **I PASS** — every line reports its `want` value. Together they cover the four exit paths, the
+  single-field stdout the prompt's `wt=$(…)` depends on, the exit-3 claim leak (I4/I5), and the
+  raw-vs-sanitized id split (I6).
+
+---
+
+## Scenario J — fleet TOTAL on the exit path   `[$TESTROOT/J]`   (stub claude, deterministic)
 
 The exit path (Ctrl+C or `MAX_LOOPS`) prints this instance's report and then a fleet-wide
 TOTAL summed from every peer's per-instance files for this base. No real claude and no
@@ -684,8 +764,8 @@ the token sum also proves dedupe and no-double-count.
 
 ### Setup
 ```bash
-TI="$TESTROOT/I"; mkdir -p "$TI/repo" "$TI/bin"
-cat > "$TI/bin/claude" <<'EOF'
+TJ="$TESTROOT/J"; mkdir -p "$TJ/repo" "$TJ/bin"
+cat > "$TJ/bin/claude" <<'EOF'
 #!/usr/bin/env bash
 GC="$(cd "$(git rev-parse --git-common-dir)" && pwd)"; mkdir -p "$GC/instance"
 # PEER1: live marker (this stub's own pid) → survives any later GC. DEADPEER: files only.
@@ -698,49 +778,49 @@ for i in 1 2 3; do printf '{"requestId":"req_AAA","message":{"usage":{%s}}}\n' "
 printf '%s\n' "$tr" > "$GC/transcripts-main-PEER1"
 exit 0
 EOF
-chmod +x "$TI/bin/claude"
-cd "$TI/repo"
+chmod +x "$TJ/bin/claude"
+cd "$TJ/repo"
 git init -q -b main; git config user.email t@t.t; git config user.name test
-printf -- '- [ ] I1 x\n' > todo.md; git add -A; git commit -qm init
+printf -- '- [ ] J1 x\n' > todo.md; git add -A; git commit -qm init
 ```
 
-### I1 — TOTAL equals the sum of the per-instance files
+### J1 — TOTAL equals the sum of the per-instance files
 ```bash
-cd "$TI/repo"
-PATH="$TI/bin:$PATH" timeout 40 env CLAUDEZERO_MAX_LOOPS=1 bash "$SCRIPT" todo.md -t x > "$TI/run.log" 2>&1
-echo "I1 exit          : $?  (want 0 — the report never fails the exit path)"
-sed -n '/❄ TOTAL/,$p' "$TI/run.log"
-echo "I1 instances     : $(grep -o '❄ TOTAL ([0-9]*' "$TI/run.log" | tr -dc 0-9)  (want 2 — PEER1 + DEADPEER, dead peer counted)"
-echo "I1 todos sum     : $(sed -n '/❄ TOTAL/,$p' "$TI/run.log" | grep -oE '2m30s.*3 completed' | head -1)  (want 2m30s · 3 completed = 100+50s, 2+1)"
-echo "I1 token sum     : $(sed -n '/❄ TOTAL/,$p' "$TI/run.log" | grep -oE 'Tokens: [^ ]+ Total')  (want 1.2k = 10+20+248+1000, counted ONCE)"
-echo "I1 categories    : $(sed -n '/❄ TOTAL/,$p' "$TI/run.log" | grep -oE 'in 10 · out 20 · cache write 248 · cache read 1.0k')  (want that line)"
-echo "I1 no registry   : $(ls "$TI/repo/.git" | grep -cE '^(fleet|total)-')  (want 0 — glob, no aggregate file)"
+cd "$TJ/repo"
+PATH="$TJ/bin:$PATH" timeout 40 env CLAUDEZERO_MAX_LOOPS=1 bash "$SCRIPT" todo.md -t x > "$TJ/run.log" 2>&1
+echo "J1 exit          : $?  (want 0 — the report never fails the exit path)"
+sed -n '/❄ TOTAL/,$p' "$TJ/run.log"
+echo "J1 instances     : $(grep -o '❄ TOTAL ([0-9]*' "$TJ/run.log" | tr -dc 0-9)  (want 2 — PEER1 + DEADPEER, dead peer counted)"
+echo "J1 todos sum     : $(sed -n '/❄ TOTAL/,$p' "$TJ/run.log" | grep -oE '2m30s.*3 completed' | head -1)  (want 2m30s · 3 completed = 100+50s, 2+1)"
+echo "J1 token sum     : $(sed -n '/❄ TOTAL/,$p' "$TJ/run.log" | grep -oE 'Tokens: [^ ]+ Total')  (want 1.2k = 10+20+248+1000, counted ONCE)"
+echo "J1 categories    : $(sed -n '/❄ TOTAL/,$p' "$TJ/run.log" | grep -oE 'in 10 · out 20 · cache write 248 · cache read 1.0k')  (want that line)"
+echo "J1 no registry   : $(ls "$TJ/repo/.git" | grep -cE '^(fleet|total)-')  (want 0 — glob, no aggregate file)"
 ```
-- **I1 PASS** — `exit = 0`, `instances = 2`, the todo sum is `2m30s · 3 completed`, the token
+- **J1 PASS** — `exit = 0`, `instances = 2`, the todo sum is `2m30s · 3 completed`, the token
   total is `1.2k` with categories `in 10 · out 20 · cache write 248 · cache read 1.0k`
   (the `requestId` appeared on three lines and the nested `iterations[]`/`ephemeral_*` copies
   were ignored), and `no registry = 0`.
 
-### I2 — solo run prints no TOTAL; unreadable peer files degrade, never lie
+### J2 — solo run prints no TOTAL; unreadable peer files degrade, never lie
 ```bash
-cd "$TI/repo"
-printf '#!/usr/bin/env bash\nexit 0\n' > "$TI/bin/claude"       # no peers fabricated
-PATH="$TI/bin:$PATH" timeout 40 env CLAUDEZERO_MAX_LOOPS=1 bash "$SCRIPT" todo.md -t x > "$TI/solo.log" 2>&1 || true
-echo "I2 solo TOTAL    : $(grep -c '❄ TOTAL' "$TI/solo.log")  (want 0 — one id, the total would restate the block above)"
-cat > "$TI/bin/claude" <<'EOF'
+cd "$TJ/repo"
+printf '#!/usr/bin/env bash\nexit 0\n' > "$TJ/bin/claude"       # no peers fabricated
+PATH="$TJ/bin:$PATH" timeout 40 env CLAUDEZERO_MAX_LOOPS=1 bash "$SCRIPT" todo.md -t x > "$TJ/solo.log" 2>&1 || true
+echo "J2 solo TOTAL    : $(grep -c '❄ TOTAL' "$TJ/solo.log")  (want 0 — one id, the total would restate the block above)"
+cat > "$TJ/bin/claude" <<'EOF'
 #!/usr/bin/env bash
 GC="$(cd "$(git rev-parse --git-common-dir)" && pwd)"
 printf 'not-a-number\n' > "$GC/todos-seconds-main-GARB"; printf 'xx\n' > "$GC/todos-done-main-GARB"
 printf '/nonexistent/transcript.jsonl\n' > "$GC/transcripts-main-GONE"
 exit 0
 EOF
-chmod +x "$TI/bin/claude"
-PATH="$TI/bin:$PATH" timeout 40 env CLAUDEZERO_MAX_LOOPS=1 bash "$SCRIPT" todo.md -t x > "$TI/degrade.log" 2>&1
-echo "I2 degrade exit  : $?  (want 0)"
-echo "I2 degrade TOTAL : $(sed -n '/❄ TOTAL/,$p' "$TI/degrade.log" | grep -cE '0s  ·  0 completed|Tokens: n/a')  (want 2 — zeroed todos row + n/a tokens)"
-echo "I2 loop mode     : $(PATH="$TI/bin:$PATH" timeout 40 env CLAUDEZERO_MAX_LOOPS=1 bash "$SCRIPT" -l hi 2>&1 | sed -n '/❄ TOTAL/,$p' | grep -c 'Todos:')  (want 0 — token rows only)"
+chmod +x "$TJ/bin/claude"
+PATH="$TJ/bin:$PATH" timeout 40 env CLAUDEZERO_MAX_LOOPS=1 bash "$SCRIPT" todo.md -t x > "$TJ/degrade.log" 2>&1
+echo "J2 degrade exit  : $?  (want 0)"
+echo "J2 degrade TOTAL : $(sed -n '/❄ TOTAL/,$p' "$TJ/degrade.log" | grep -cE '0s  ·  0 completed|Tokens: n/a')  (want 2 — zeroed todos row + n/a tokens)"
+echo "J2 loop mode     : $(PATH="$TJ/bin:$PATH" timeout 40 env CLAUDEZERO_MAX_LOOPS=1 bash "$SCRIPT" -l hi 2>&1 | sed -n '/❄ TOTAL/,$p' | grep -c 'Todos:')  (want 0 — token rows only)"
 ```
-- **I2 PASS** — `solo TOTAL = 0`, `degrade exit = 0` with `degrade TOTAL = 2` (a garbled counter
+- **J2 PASS** — `solo TOTAL = 0`, `degrade exit = 0` with `degrade TOTAL = 2` (a garbled counter
   contributes 0 and a missing transcript degrades to `Tokens: n/a`), and `loop mode = 0` todo
   rows in the TOTAL block.
 
