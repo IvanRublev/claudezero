@@ -13,7 +13,7 @@
 # Run -h for usage.
 set -euo pipefail
 
-VERSION="0.0.14"
+VERSION="0.0.15"
 PROG="$(basename "$0")"   # name shown in usage/errors, from how the script was invoked
 
 LOOP_INTERVAL="3m"   # cadence claude reschedules its zeroing pass at (baked into the /loop prompt)
