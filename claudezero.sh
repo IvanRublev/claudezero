@@ -166,10 +166,6 @@ BASE_BRANCH="$(git rev-parse --abbrev-ref HEAD)"
 # compare instances after a run and size the fleet next time. Exported into claude's env below,
 # inherited by its Bash-tool children; zero.sh reads it (CLAUDEZERO_INSTANCE) to route credit.
 INSTANCE_ID="$(uuidgen 2>/dev/null | tr -d - | head -c8)"; [ -n "$INSTANCE_ID" ] || INSTANCE_ID="$$"
-# claude's display name (prompt box, /resume picker, terminal title) — the same id the report heads
-# its stats with, plus a dojo-student activity so parallel terminals are told apart without reading
-# hex. Derived from the id, never from chance, so every restart re-launches under the same name.
-SESSION_NAME="($INSTANCE_ID) $(dojo_student "$INSTANCE_ID")"
 
 # -t/--taskprompt sets the zero task prompt; -l/--loopprompt runs claude on a
 # literal prompt (skips zero mode). They are mutually exclusive.
@@ -249,6 +245,12 @@ INSTANCE_DIR="$(cd "$(git rev-parse --git-common-dir)" && pwd)/instance"
 mkdir -p "$INSTANCE_DIR"; printf '%s\n%s\n' "$$" "$(proc_start "$$")" > "$INSTANCE_DIR/$INSTANCE_ID"
 trap 'rm -f "$INSTANCE_DIR/$INSTANCE_ID" 2>/dev/null' EXIT
 cleanup_orphan_time_files
+
+# claude's display name (prompt box, /resume picker, terminal title) — the same id the report heads
+# its stats with, a nickname short enough to say out loud, and a dojo-student activity, so parallel
+# terminals are told apart without reading hex. The id and activity are derived from the id, never
+# from chance; the nickname is picked once here, so every restart re-launches under the same name.
+SESSION_NAME="($INSTANCE_ID) $(pick_nickname) · $(dojo_student "$INSTANCE_ID")"
 
 STOP_HOOK="$GITDIR_ABS/compact-exit-hook.sh"
 cat >"$STOP_HOOK" <<'HOOK_EOF'
@@ -543,6 +545,36 @@ cleanup_orphan_time_files() {
     [ -f "$INSTANCE_DIR/$id" ] && continue
     rm -f "$f"
   done
+}
+
+# a short, speakable handle for this instance — one of the fifteen below, held by no peer running
+# against this repo right now, so "kill kit" beats reading eight hex chars aloud. Line 3 of a
+# marker is its holder's nickname (line 1/2 untouched, so the GC above still reads them), which
+# makes the liveness registry the name registry too — no second list to disagree with the first.
+# Call ONCE, AFTER cleanup_orphan_time_files, or dead peers' markers still hold names hostage.
+# scan-then-claim runs under one lock so two instances launched together cannot draw the same word.
+# Past fifteen live instances the names take an ascending suffix ("bob 1", then "bob 2", …).
+# Degrade, never lie: an unwritable lock or registry costs uniqueness, never the launch.
+pick_nickname() {
+  local names=(ash bob cleo dax elk finn gus hana ivo jun kit lux moss nix opal)
+  local m taken="" free=() cand n suffix=0
+  { exec 6>"$INSTANCE_DIR.lock" && flock 6; } 2>/dev/null || true
+  for m in "$INSTANCE_DIR"/*; do
+    [ -e "$m" ] || continue
+    taken+="$(sed -n 3p "$m" 2>/dev/null)"$'\n'     # no line 3 = a peer not yet at the lock: takes nothing
+  done
+  while [ ${#free[@]} -eq 0 ]; do
+    for n in "${names[@]}"; do
+      [ "$suffix" -eq 0 ] || n="$n $suffix"
+      case $'\n'"$taken" in *$'\n'"$n"$'\n'*) continue;; esac
+      free+=("$n")
+    done
+    suffix=$((suffix+1))
+  done
+  cand="${free[RANDOM % ${#free[@]}]}"              # random among the free, never derived from the id
+  printf '%s\n' "$cand" 2>/dev/null >> "$INSTANCE_DIR/$INSTANCE_ID" || true
+  exec 6>&-                                        # close fd, release lock
+  printf '%s' "$cand"
 }
 
 # write .git/zero.sh (the per-task acquire/release/merge helper the zero prompt calls) with

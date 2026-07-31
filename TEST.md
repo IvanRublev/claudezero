@@ -605,10 +605,12 @@ not a tty) — exactly the operator's situation.
 
 ## Scenario H — claude session display name   `[$TESTROOT/H]`   (stub claude, deterministic)
 
-Each instance names its claude session `(<instance id>) <student activity>` via `--name`, so
-parallel terminals are told apart without reading hex. The name must reach claude as ONE argv
-element, and must be the SAME on every context restart (derived from the id, never from chance).
-The stub claude echoes its argv, so no real claude is needed.
+Each instance names its claude session `(<instance id>) <nickname> · <student activity>` via
+`--name`, so parallel terminals are told apart without reading hex. The name must reach claude as
+ONE argv element, and must be the SAME on every context restart (the id and the activity are
+derived from the id; the nickname is picked once at launch and stored on the liveness marker).
+The nickname must differ from every peer live in this repo. The stub claude echoes its argv, so no
+real claude is needed.
 
 ### Setup
 ```bash
@@ -636,6 +638,13 @@ detachH() {
     python3 -c 'import os,sys; os.setsid(); os.execvp(sys.argv[1], sys.argv[1:])' "$@"
   else echo "H SKIP — neither setsid nor python3 available to drop the controlling terminal" >&2; fi
 }
+# the fifteen nicknames, verbatim (claudezero.sh pick_nickname)
+NICKS=(ash bob cleo dax elk finn gus hana ivo jun kit lux moss nix opal)
+GCH="$(cd "$(git rev-parse --git-common-dir)" && pwd)"
+# a fabricated LIVE peer holding nickname $1 (pid/start of this shell, so liveness keeps it)
+mkpeer() { mkdir -p "$GCH/instance"
+  printf '%s\n%s\n%s\n' "$$" "$(ps -o lstart= -p $$ | awk '{$1=$1;print}')" "$1" > "$GCH/instance/fake-$2"; }
+nick_of() { sed -E 's/.*\) (.*) · .*/\1/'; }   # nickname out of a `[--name] [...]` line
 ```
 
 ### H1 — name construction, unsplit argv, restart stability
@@ -644,14 +653,19 @@ cd "$TH/repo"
 detachH env PATH="$TH/bin:$PATH" CLAUDEZERO_MAX_LOOPS=3 \
   timeout 90 bash "$SCRIPT" todo.md -t x > "$TH/run.log" 2>&1 || true
 ID=$(grep -m1 -oE 'instance [0-9A-Za-z]+' "$TH/run.log" | awk '{print $2}')
-WANT="($ID) ${ACT[$(( 16#${ID:0:2} % 10 ))]}"
+NICK=$(grep -m1 -oE '\[--name\] \[[^]]*\]' "$TH/run.log" | nick_of)
+WANT="($ID) $NICK · ${ACT[$(( 16#${ID:0:2} % 10 ))]}"
 echo "H1 want name     : $WANT"
 echo "H1 launches      : $(grep -c '^ARGV:' "$TH/run.log")  (want 3)"
 echo "H1 named+unsplit : $(grep -c -F -- "[--name] [$WANT]" "$TH/run.log")  (want 3)"
+echo "H1 nick in list  : $(printf '%s\n' "${NICKS[@]}" | grep -qxF "$NICK" && echo yes || echo NO)"
+echo "H1 name released : $(ls "$GCH/instance" 2>/dev/null | wc -l | tr -d ' ')  (want 0 — marker gone on exit)"
 ```
 - **H1 PASS** — `launches = 3` and `named+unsplit = 3`: `--name` carries the parenthesised,
   space-containing name as a single argv element, the activity is the one the id selects by
-  `16#<first two chars> % 10`, and all three restarts used the same name.
+  `16#<first two chars> % 10`, the nickname sits between id and activity, and all three restarts
+  used the same name. `nick in list = yes` (one of the fifteen, lowercase) and
+  `name released = 0` — the exiting instance unlinked its marker, so its nickname is free again.
 
 ### H2 — loop mode named too; decimal (`$$`-shaped) id picks an activity, not an error
 ```bash
@@ -666,9 +680,56 @@ echo "H2 decimal id    : $(dojo_student 48584); $(dojo_student 90210)  (two acti
 echo "H2 deterministic : $([ "$(dojo_student a1b2c3d4)" = "$(dojo_student a1ffffff)" ] && echo yes || echo NO)"
 echo "H2 a1 vs b2      : $([ "$(dojo_student a1b2c3d4)" != "$(dojo_student b2b2c3d4)" ] && echo differ || echo same)"
 ```
-- **H2 PASS** — the loop-mode line shows `[--name] [(<id>) <activity>]`, both decimal ids render
-  an activity with no arithmetic error, `deterministic = yes` (only the first two chars select),
-  and `a1 vs b2 = differ` (`16#a1 % 10 = 1`, `16#b2 % 10 = 8`).
+- **H2 PASS** — the loop-mode line shows `[--name] [(<id>) <nickname> · <activity>]`, both decimal
+  ids render an activity with no arithmetic error, `deterministic = yes` (only the first two chars
+  select), and `a1 vs b2 = differ` (`16#a1 % 10 = 1`, `16#b2 % 10 = 8`).
+
+### H3 — two instances launched at the same moment draw different nicknames
+```bash
+cd "$TH/repo"; rm -rf "$GCH/instance"
+detachH env PATH="$TH/bin:$PATH" CLAUDEZERO_MAX_LOOPS=1 timeout 90 bash "$SCRIPT" todo.md -t x > "$TH/a.log" 2>&1 &
+detachH env PATH="$TH/bin:$PATH" CLAUDEZERO_MAX_LOOPS=1 timeout 90 bash "$SCRIPT" todo.md -t x > "$TH/b.log" 2>&1 &
+wait
+NA=$(grep -m1 -oE '\[--name\] \[[^]]*\]' "$TH/a.log" | nick_of)
+NB=$(grep -m1 -oE '\[--name\] \[[^]]*\]' "$TH/b.log" | nick_of)
+echo "H3 nicks         : '$NA' '$NB'"
+echo "H3 differ        : $([ -n "$NA" ] && [ "$NA" != "$NB" ] && echo yes || echo NO)"
+```
+- **H3 PASS** — `differ = yes`: the scan-then-claim ran under `instance.lock`, so the second
+  instance saw the first's line 3 and picked another word.
+
+### H4 — the free set is what the live markers leave; suffix past fifteen; a crashed peer frees its name
+```bash
+cd "$TH/repo"
+rm -rf "$GCH/instance"; i=0; for n in "${NICKS[@]}"; do [ "$n" = moss ] || mkpeer "$n" $((i++)); done
+detachH env PATH="$TH/bin:$PATH" CLAUDEZERO_MAX_LOOPS=1 timeout 90 bash "$SCRIPT" todo.md -t x > "$TH/c.log" 2>&1 || true
+echo "H4 fourteen held : $(grep -m1 -oE '\[--name\] \[[^]]*\]' "$TH/c.log" | nick_of)  (want moss)"
+rm -rf "$GCH/instance"; i=0; for n in "${NICKS[@]}"; do mkpeer "$n" $((i++)); done
+detachH env PATH="$TH/bin:$PATH" CLAUDEZERO_MAX_LOOPS=1 timeout 90 bash "$SCRIPT" todo.md -t x > "$TH/d.log" 2>&1 || true
+echo "H4 all fifteen   : $(grep -m1 -oE '\[--name\] \[[^]]*\]' "$TH/d.log" | nick_of)  (want '<name> 1')"
+rm -rf "$GCH/instance"; i=0; for n in "${NICKS[@]}"; do mkpeer "$n" $((i++)); mkpeer "$n 1" $((i++)); done
+detachH env PATH="$TH/bin:$PATH" CLAUDEZERO_MAX_LOOPS=1 timeout 90 bash "$SCRIPT" todo.md -t x > "$TH/e.log" 2>&1 || true
+echo "H4 both levels   : $(grep -m1 -oE '\[--name\] \[[^]]*\]' "$TH/e.log" | nick_of)  (want '<name> 2')"
+# crashed peer: a marker whose pid is dead still names moss — the startup GC unlinks it first
+rm -rf "$GCH/instance"; mkdir -p "$GCH/instance"; printf '999999\ndead\nmoss\n' > "$GCH/instance/crashed"
+i=0; for n in "${NICKS[@]}"; do [ "$n" = moss ] || mkpeer "$n" $((i++)); done
+detachH env PATH="$TH/bin:$PATH" CLAUDEZERO_MAX_LOOPS=1 timeout 90 bash "$SCRIPT" todo.md -t x > "$TH/f.log" 2>&1 || true
+echo "H4 crashed freed : $(grep -m1 -oE '\[--name\] \[[^]]*\]' "$TH/f.log" | nick_of)  (want moss)"
+rm -rf "$GCH/instance"
+```
+- **H4 PASS** — `fourteen held = moss` (the one free word), `all fifteen` is a `<name> 1` form and
+  `both levels` a `<name> 2` form (ascending suffix, random within the level), and
+  `crashed freed = moss` — the dead peer's marker was GC'd before the pick, so its name came back.
+
+### H5 — degradation: an unreadable registry still names the session
+```bash
+cd "$TH/repo"
+eval "$(sed -n '/^pick_nickname()/,/^}/p' "$SCRIPT")"
+( set -euo pipefail; INSTANCE_DIR="$TH/gone/instance"; INSTANCE_ID=zz
+  echo "H5 fallback name : '$(pick_nickname)'  rc=$?" )
+```
+- **H5 PASS** — a name from the full fifteen is printed and `rc=0`: a missing registry costs
+  uniqueness, never the launch. (`$TH/gone` is never created — nothing is written.)
 
 ---
 
