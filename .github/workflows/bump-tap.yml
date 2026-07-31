@@ -20,3 +20,4 @@ jobs:
           tag: ${{ github.ref_name }}
           revision: ${{ github.sha }}
           # Opens a PR on the tap by default. Add `push: true` to commit direct.
+          push: true
