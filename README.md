@@ -13,7 +13,7 @@ Spawn many instances to parallelize.
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-green.svg" alt="License: MIT" /></a>
 </p>
 
-Runs [`claude`](https://claude.com/product/claude-code) on a predefined prompt in a loop on the given todo list file. Makes it complete, commit, and check off each todo. The session stays interactive, so you can add prompts and make choices as it runs. Launches `claude` in permission auto mode by default, restarts it on a fresh context before rot sets in.
+Runs [`claude`](https://claude.com/product/claude-code) on a predefined prompt in a loop on the given todo list file. Makes it complete, commit, and check off each todo. The session stays interactive, so you can add prompts and make choices as it runs. Launches `claude` in auto permission mode by default, restarts it on a fresh context before rot sets in.
 
 ## Contents
 
@@ -45,7 +45,7 @@ Change to your repo root with a todo-list file, and make sure the working tree i
 claudezero todo.md
 ```
 
-Run that command in multiple parallel terminals to zero todos faster.
+Run that command in multiple parallel terminals to work out todos faster.
 
 > ⚠️ ClaudeZero runs `claude` **unattended with permissions auto-approved** and **commits on its own** to the branch you launch it on. Only ever point it at a todo file you wrote or reviewed, on a branch with a clean, committed tree — git is your only undo.
 
