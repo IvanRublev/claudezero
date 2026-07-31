@@ -17,6 +17,9 @@ All notable changes to ClaudeZero are documented here. Format follows
   print confidently wrong money after any model launch.
 - Per-instance count of todos zeroed, credited at the same point as the
   ownership time so the two always agree.
+- The `-h`/`--help` screen states the script version on its own line below the
+  `usage:` heading, so a bug report can quote the release without opening the
+  script or starting a run to read the launch banner (ISSUE-028).
 - Each `claude` session is named `(<instance id>) <nick> · <activity>`, visible
   in the prompt box, `/resume` picker and terminal title. The nickname is a
   short word no live peer holds, so you can say "kill kit" instead of reading
