@@ -11,6 +11,6 @@
 - [x] BUG-022 Print the `TOTAL` block on solo runs too, singular heading — its absence today is indistinguishable from a fleet sum that matched nothing
 - [x] BUG-023 Reword the two dojo activities that say `one` checkbox (plus the merge-gate arrival) so a session name reads as a continuing series, not a one-todo run
 - [x] BUG-024 Take the zero prompt's heredoc out of the command substitution so `claudezero.sh` parses under bash 3.2 — stock macOS `/bin/bash` dies at parse time today and the macOS CI leg is red
-- [ ] BUG-025 Source fd 4 from a dup of stdin instead of `/dev/tty` — a descriptor opened from the clone device is not kqueue-registrable on macOS, so a piped run kills claude at startup with `EINVAL … kqueue`
+- [x] BUG-025 Source fd 4 from a dup of stdin instead of `/dev/tty` — a descriptor opened from the clone device is not kqueue-registrable on macOS, so a piped run kills claude at startup with `EINVAL … kqueue`
 - [x] BUG-026 Refuse a zero-mode launch when the todo is not tracked on the base branch — untracked today means every merge is refused and nothing can ever land
 - [x] ISSUE-027 Print the instance nickname next to its id in the execution stats header

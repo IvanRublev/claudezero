@@ -26,7 +26,7 @@ All notable changes to ClaudeZero are documented here. Format follows
 
 - `claude`'s TUI goes to fd 4, so `claudezero.sh 2>&1 | tee run.log` captures
   only ClaudeZero's own output instead of every TUI redraw. Falls back to
-  stdout when there is no redirect or no controlling terminal. `-h` documents
+  stdout when there is no redirect or stdin is not a terminal. `-h` documents
   the Ctrl+C-safe pipe form.
 - The zero prompt's acquire / validate / re-check steps collapse into one
   `claim` call, so a failed validation no longer leaves a claim behind until a
@@ -51,6 +51,10 @@ All notable changes to ClaudeZero are documented here. Format follows
 - The script parses under bash 3.2, the `/bin/bash` macOS ships. The zero
   prompt's heredoc sat inside a command substitution, which bash 3.2 cannot
   parse, so every macOS run died before doing anything (BUG-024).
+- A piped run on macOS reaches the prompt instead of killing `claude` at startup
+  with `EINVAL … kqueue`. fd 4 is a dup of stdin, not a fresh open of `/dev/tty`
+  — a descriptor from the clone device cannot be registered with kqueue
+  (BUG-025).
 
 ## [0.0.14] — 2026-07-26
 
