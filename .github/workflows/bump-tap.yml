@@ -10,11 +10,7 @@ jobs:
   bump:
     runs-on: ubuntu-latest
     steps:
-      # Homebrew refuses to load formulae from untrusted taps; trust ours before the action taps+loads it.
-      - run: |
-          brew tap IvanRublev/homebrew-tap
-          brew trust IvanRublev/homebrew-tap
-      - uses: dawidd6/action-homebrew-bump-formula@v3
+      - uses: dawidd6/action-homebrew-bump-formula@v8
         with:
           # PAT with `repo` scope on the tap repo. Store as an Actions secret.
           token: ${{ secrets.TAP_TOKEN }}
