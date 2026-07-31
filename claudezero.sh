@@ -246,11 +246,12 @@ mkdir -p "$INSTANCE_DIR"; printf '%s\n%s\n' "$$" "$(proc_start "$$")" > "$INSTAN
 trap 'rm -f "$INSTANCE_DIR/$INSTANCE_ID" 2>/dev/null' EXIT
 cleanup_orphan_time_files
 
-# claude's display name (prompt box, /resume picker, terminal title) — the same id the report heads
-# its stats with, a nickname short enough to say out loud, and a dojo-student activity, so parallel
+# claude's display name (prompt box, /resume picker, terminal title) — the same id and nickname the
+# report heads its stats with, the nickname short enough to say out loud, and a dojo-student activity, so parallel
 # terminals are told apart without reading hex. The id and activity are derived from the id, never
 # from chance; the nickname is picked once here, so every restart re-launches under the same name.
-SESSION_NAME="($INSTANCE_ID) $(pick_nickname) · $(dojo_student "$INSTANCE_ID")"
+INSTANCE_NICK="$(pick_nickname)"    # kept in a var: the report header says it too, and it is drawn once
+SESSION_NAME="($INSTANCE_ID) $INSTANCE_NICK · $(dojo_student "$INSTANCE_ID")"
 
 STOP_HOOK="$GITDIR_ABS/compact-exit-hook.sh"
 cat >"$STOP_HOOK" <<'HOOK_EOF'
@@ -392,7 +393,7 @@ all_todos_done() {
 #   Tokens      = this instance's claude token usage, own block (not a duration, so it does not
 #                 share the timing rows' label column)
 print_report() {
-  printf '\n❄ execution stats (instance %s)\n' "${INSTANCE_ID:-?}"
+  printf '\n❄ execution stats (instance %s · %s)\n' "${INSTANCE_ID:-?}" "${INSTANCE_NICK:-?}"
   if [ "${MODE:-}" = zero ]; then
     printf '  %-20s %s  ·  %s completed\n' 'Todos:' \
       "$(fmt_dur $(( $(read_counter "${TODOS_TIME_FILE:-}") - TODOS_BASE )))" \
