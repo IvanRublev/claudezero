@@ -26,8 +26,9 @@ RESTART_WAIT=5       # seconds between claude restarts — the window to press C
 # inherits it and drains the pipe until ClaudeZero exits.
 usage() {
   # single-quoted heredoc keeps backticks literal; sed injects the RESTART_WAIT constant.
-  sed -e "s/@@RESTART_WAIT@@/$RESTART_WAIT/g" -e "s/@@PROG@@/$PROG/g" <<'USAGE'
+  sed -e "s/@@RESTART_WAIT@@/$RESTART_WAIT/g" -e "s/@@PROG@@/$PROG/g" -e "s/@@VERSION@@/$VERSION/g" <<'USAGE'
 usage: @@PROG@@ [todo-file-path] [-t|--taskprompt TEXT | -l|--loopprompt TEXT]
+version @@VERSION@@
 
   Loops claude to zero a Markdown todo file — fork a worktree per task, implement,
   commit, merge, restart on fresh context — until every box is checked. Run several
