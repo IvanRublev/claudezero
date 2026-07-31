@@ -627,9 +627,9 @@ printf -- '- [ ] H1 x\n' > todo.md; git add -A; git commit -qm init
 # the ten activities, verbatim (claudezero.sh dojo_student)
 ACT=('drilling the fork-implement-merge kata' 'hauling snow buckets uphill' \
      'claiming a track before stepping on it' 'reading the whole task before striking' \
-     'starting over on fresh snow' 'carving one checkbox into ice' 'chasing one unchecked box' \
+     'starting over on fresh snow' 'carving checkbox after checkbox into ice' 'hunting the next box on the list' \
      'practicing one clean strike per task' "leaving a peer's branch untouched" \
-     'approaching the merge gate')
+     'walking back to the merge gate')
 # claude's own output goes to fd 4, which falls back to stdout only when there is no controlling
 # terminal — run detached so the stub's ARGV line lands in the capture file (see Scenario G).
 detachH() {

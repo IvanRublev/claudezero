@@ -490,11 +490,11 @@ dojo_student() {
     'claiming a track before stepping on it'
     'reading the whole task before striking'
     'starting over on fresh snow'
-    'carving one checkbox into ice'
-    'chasing one unchecked box'
+    'carving checkbox after checkbox into ice'
+    'hunting the next box on the list'
     'practicing one clean strike per task'
     "leaving a peer's branch untouched"
-    'approaching the merge gate'
+    'walking back to the merge gate'
   )
   printf '%s' "${a[$(( 16#${1:0:2} % 10 ))]}"
 }
