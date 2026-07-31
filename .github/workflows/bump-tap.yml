@@ -1,10 +1,10 @@
 name: Bump Homebrew tap
 
-# On a published release, bump url + sha256 in the tap formula.
+# On a pushed v* tag, bump url + sha256 in the tap formula.
 # Wraps `brew bump-formula-pr`. Does not build bottles or touch this repo.
 on:
-  release:
-    types: [published]
+  push:
+    tags: ['v*']
 
 jobs:
   bump:
@@ -16,4 +16,8 @@ jobs:
           token: ${{ secrets.TAP_TOKEN }}
           tap: IvanRublev/homebrew-tap
           formula: claudezero
+          # No release payload on a tag push — name the tag and commit explicitly.
+          tag: ${{ github.ref_name }}
+          revision: ${{ github.sha }}
           # Opens a PR on the tap by default. Add `push: true` to commit direct.
+          push: true

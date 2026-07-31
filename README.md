@@ -5,7 +5,7 @@
 <h2 align="center">Todo-list sensei for Claude Code. Zeros your list.</h2>
 <h4 align="center">
 Loops claude until every todo is done, committed, and checked off.<br>
-Restarting it on a fresh context before rot.<br>
+Restarts it on a fresh context before rot.<br>
 Spawn many instances to parallelize.
 </h4>
 
@@ -13,7 +13,7 @@ Spawn many instances to parallelize.
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-green.svg" alt="License: MIT" /></a>
 </p>
 
-Runs [`claude`](https://claude.com/product/claude-code) on a predefined prompt in a loop on the given todo list file. Makes it complete, commit, and check off each todo. The session stays interactive, so you can add prompts and make choices as it runs. Launches `claude` in permission auto mode by default, restarts it on a fresh context before rot sets in.
+Runs [`claude`](https://claude.com/product/claude-code) on a predefined prompt in a loop on the given todo list file. Makes it complete, commit, and check off each todo. The session stays interactive, so you can add prompts and make choices as it runs. Launches `claude` in auto permission mode by default, and restarts it on a fresh context before rot sets in.
 
 ## Contents
 
@@ -31,21 +31,22 @@ Runs [`claude`](https://claude.com/product/claude-code) on a predefined prompt i
 ## What it does
 
 - **Guides Claude to zero a todo list unattended** — one task at a time until all are completed, committed, and checkmarked.
-- **Beats context rot** — session Stop hook SIGTERMs `claude` near ~80% of the context window and restarts clean. Fresh context, no quality decay.
+- **Beats context rot** — session Stop hook SIGTERMs `claude` at ~80% of the context window and restarts clean. Fresh context, no quality decay.
 - **Parallel by default** — run many instances at once; they coordinate via git worktrees, each claiming todos the others haven't taken.
 - **Safe merges** — cross-instance merge-back serialized through `flock`; no races, no corrupted base.
-- **Crash resilient** — if a `claude` crashes or is killed mid-task, its half-done work isn't lost. The next instance to come by — a peer switching to its next task, or the same loop restarted — reclaims the branch, finishes it, and merges it back. Work only counts as done once it lands on the base branch and its box is checked there.
+- **Crash resilient** — if `claude` crashes or is killed mid-task, its half-done work isn't lost. The next instance to come by — a peer switching to its next task, or the same loop restarted — reclaims the branch, finishes it, and merges it back. Work only counts as done once it lands on the base branch and its box is checked there.
+- **Named sessions** — every `claude` session is named `(<instance id>) <nick> · <activity>`, shown in the prompt box, the `/resume` picker, and the terminal title. The nickname is a short word no live peer holds, so you can say "kill moss" instead of reading eight hex characters. Both id and nick head the instance's report, and survive context restarts.
 - **Ctrl+C window** — 5s pause between runs to stop cleanly.
 
 ## Quickstart
 
-Change to your repo root with a todo-list file, and make sure the working tree is in a clean state (commit or stash any changes). Then run `claudezero` pointing to your todo-list:
+Change to your repo root with a todo-list file, and make sure the working tree is in a clean state (commit or stash any changes) and the todo file itself is committed on that branch. Then run `claudezero` pointing to your todo-list:
 
 ```
 claudezero todo.md
 ```
 
-Run that command in multiple parallel terminals to zero todos faster.
+Run that command in multiple parallel terminals to work through the todos faster.
 
 > ⚠️ ClaudeZero runs `claude` **unattended with permissions auto-approved** and **commits on its own** to the branch you launch it on. Only ever point it at a todo file you wrote or reviewed, on a branch with a clean, committed tree — git is your only undo.
 
@@ -56,7 +57,7 @@ Representative zero-mode run (agent output between the markers elided):
 ```console
 $ claudezero todo.md
 
-❄ ClaudeZero 0.0.14
+❄ ClaudeZero 0.0.15
   zero mode · base master · fork → implement → commit → merge
 
 … claude works a task: forks a worktree, implements, commits, merges, ticks its box …
@@ -65,13 +66,24 @@ $ claudezero todo.md
 
 … fresh context, next task …
 
-❄ execution time (instance a1b2c3d4)
-  Todos:               12m 30s
-  Claude loops:        41m 02s
+❄ execution stats (instance a1b2c3d4 · moss)
+  Todos:               12m 30s  ·  5 completed
   ClaudeZero run loop: 48m 15s
+
+  Tokens: 5.8M Total
+  in 2.1k · out 84.3k · cache write 312k · cache read 5.4M
+
+-----------------------------------------------
+❄ TOTAL (3 instances)
+  Todos:               41m 12s  ·  14 completed
+
+  Tokens: 17.4M Total
+  in 6.3k · out 251.9k · cache write 903k · cache read 16.2M
 
 ❄ ClaudeZero surveys the frozen field, and is proud.
 ```
+
+The `TOTAL` block sums every instance of the run on this base branch — a crashed peer counts too, since its merged work did land. It prints on solo runs as well, with a singular heading. `ClaudeZero run loop` stays per-instance: parallel wall times overlap, so their sum is not a duration anything took.
 
 ## Install (for the Claude coding agent)
 
@@ -107,6 +119,10 @@ Supported on **macOS and Linux** (the script is bash-3.2-safe, so stock macOS `b
 
 Both prerequisites are guard-checked at startup; the script exits with a clear message if either is missing.
 
+**Transcript-schema contract.** The token figures in the execution-stats report are a second coupling to Claude Code internals, alongside the state file above. ClaudeZero's own Stop hook records each session's `transcript_path` (a field of the hook payload it already parses `session_id` from), and after `claude` exits the loop reads those session JSONL transcripts and sums the `message.usage` fields of every assistant line: `input_tokens`, `output_tokens`, `cache_creation_input_tokens`, `cache_read_input_tokens` — the four categories Anthropic bills separately. One API request is written as several transcript lines, one per content block, each repeating the same `usage` object verbatim, so records are **deduped by the line's `requestId`**, and only the first (parent) match of each field name on a line is taken: `usage.iterations[]` repeats all four names one level down, and `usage.cache_creation` carries the `ephemeral_5m`/`ephemeral_1h` leaves that already sum into the parent. Transcripts are only ever read, and no schema change can fail a run — any parse miss prints `Tokens: n/a` and the run continues.
+
+Two limits: **subagent tokens are invisible** — a session that used the Agent tool writes no `isSidechain` usage lines, so anything the task prompt spawns is missing from the totals, and the size of the under-count is not measurable from inside; and the figures are **per instance run, for this repo only**, unlike whole-machine tools such as `ccusage`, whose denominator is every Claude Code session on the box.
+
 ## Todo file format
 
 GitHub-style Markdown checkboxes, one task per line. Each line carries a **unique id** as the first whitespace-delimited token right after the checkbox — it names the task's branch and worktree:
@@ -118,7 +134,7 @@ GitHub-style Markdown checkboxes, one task per line. Each line carries a **uniqu
 - [x] SMTH-140 Set up CI pipeline
 
 ```
-- [ ] EXAMPLE-1 illustrative example, not task
+- [ ] EXAMPLE-1 An illustrative example, not a task
 ```
 `````
 
@@ -139,7 +155,7 @@ The kata is a strict per-iteration algorithm every instance runs:
 2. Judge independence by evidence — blocked only if the body quotably consumes an *unchecked* task's output; adjacency is not a dependency.
 3. Claim & re-check — one task per git worktree (branch = claim), then guard against a peer who already landed it.
 4. Implement & check off — scoped to that task, tick only its box, commit.
-5. Merge serially — on a conflict or over-check, self-heal once, else stop and hand off to user rather than corrupt the base.
+5. Merge serially — on a conflict or over-check, self-heal once, else stop and hand off to the user rather than corrupt the base.
 6. Repeat — next id; when every box is checked, announce done and stop.
 
 ### Closing the loop
@@ -186,11 +202,21 @@ claudezero -h
 
 **`-l` loop prompt** — skips zeroing entirely when set. Instead of walking a todo file, it loops `claude` on one literal prompt you supply, restarting on fresh context each time. Any `todo-file-path` you pass is ignored. This mode creates no worktree branches, so run just one instance at a time.
 
-**`CLAUDEZERO_MAX_LOOPS`** — cap the number of context reset iterations. Unset or `0` loops forever (until Ctrl+C); set `>0` to exit the script after N restarts of `claude`.
+**`CLAUDEZERO_MAX_LOOPS`** — cap the number of context-reset iterations. Unset or `0` loops forever (until Ctrl+C); set `>0` to exit the script after N restarts of `claude`.
 
 ```sh
 CLAUDEZERO_MAX_LOOPS=3 claudezero todo.md
 ```
+
+### Logging a run
+
+`claude`'s TUI is written to fd 4, which stays on the terminal, so a pipe captures only ClaudeZero's own `❄` reports instead of every TUI redraw:
+
+```sh
+claudezero todo.md 2>&1 | { trap '' INT; tee ../run.log; }
+```
+
+The `trap` keeps `tee` alive through Ctrl+C, so the final report and the `TOTAL` block land in the file. Without a redirect — or when stdin is not a terminal — the TUI falls back to stdout as before.
 
 ## Cleanup
 
@@ -203,7 +229,7 @@ the human to run them themselves.
 -->
 Normal exits tidy up after themselves. But a crash, a `kill`, or `Ctrl+C` mid-task can leave a claim branch and its worktree behind — by design, so the next run can reclaim and finish them. These leftovers are exactly what crash-recovery reattaches to, so only remove them once you've **stopped every instance** and are done zeroing the unchecked todos.
 
-Easiest is to let Claude Code walk the cleanup and confirm each removal with you. From the repo root:
+The easiest way is to let Claude Code walk the cleanup and confirm each removal with you. From the repo root:
 
 ```sh
 claude "ClaudeZero left stray git worktrees and branches behind. Clean them up
@@ -217,7 +243,7 @@ discards work; (4) after removals, run 'git worktree prune'. Do nothing
 destructive without my explicit confirmation."
 ```
 
-Prefer to do it by hand:
+To do it by hand:
 
 ```sh
 git worktree list                                       # find ../ts-<base>-task-<id>-<hex>
@@ -232,7 +258,7 @@ Only delete a branch whose work you've already merged or intend to throw away.
 
 ## Tests
 
-End-to-end tests live in [TEST.md](TEST.md) — written to be executed by an LLM agent. Point the coding agent at the file and it runs all scenarios autonomously `claude --permission-mode auto "execute TEST.md and return a report"`.
+End-to-end tests live in [TEST.md](TEST.md) — written to be executed by an LLM agent. Point the coding agent at the file and it runs all scenarios autonomously: `claude --permission-mode auto "execute TEST.md and return a report"`.
 
 ## Security
 

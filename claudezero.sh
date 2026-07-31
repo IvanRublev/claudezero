@@ -13,16 +13,22 @@
 # Run -h for usage.
 set -euo pipefail
 
-VERSION="0.0.14"
+VERSION="0.0.15"
 PROG="$(basename "$0")"   # name shown in usage/errors, from how the script was invoked
 
 LOOP_INTERVAL="3m"   # cadence claude reschedules its zeroing pass at (baked into the /loop prompt)
 RESTART_WAIT=5       # seconds between claude restarts — the window to press Ctrl+C
 
+# The braces around the pipe reader in the logging example are load-bearing — do NOT tidy them
+# into a bare pipe. Ctrl+C signals the whole foreground group; the reader's default SIGINT action
+# is terminate, and once it dies the log has no writer left, losing exactly the closing report the
+# operator ran the pipe for. `trap '' INT` sets *ignore*, which survives `exec`, so the reader
+# inherits it and drains the pipe until ClaudeZero exits.
 usage() {
   # single-quoted heredoc keeps backticks literal; sed injects the RESTART_WAIT constant.
-  sed -e "s/@@RESTART_WAIT@@/$RESTART_WAIT/g" -e "s/@@PROG@@/$PROG/g" <<'USAGE'
+  sed -e "s/@@RESTART_WAIT@@/$RESTART_WAIT/g" -e "s/@@PROG@@/$PROG/g" -e "s/@@VERSION@@/$VERSION/g" <<'USAGE'
 usage: @@PROG@@ [todo-file-path] [-t|--taskprompt TEXT | -l|--loopprompt TEXT]
+version @@VERSION@@
 
   Loops claude to zero a Markdown todo file — fork a worktree per task, implement,
   commit, merge, restart on fresh context — until every box is checked. Run several
@@ -35,6 +41,12 @@ usage: @@PROG@@ [todo-file-path] [-t|--taskprompt TEXT | -l|--loopprompt TEXT]
   -h, --help             Show this help.
 
   -t and -l are mutually exclusive.
+
+  Log a run (ClaudeZero's own output only; claude's TUI stays on the terminal):
+
+    @@PROG@@ issues/todo.md 2>&1 | { trap '' INT; tee ../run.log; }
+
+  The `trap` keeps tee alive through Ctrl+C so the final report lands in the file.
 USAGE
 }
 
@@ -94,10 +106,17 @@ run_loop() {
 # CLAUDEZERO_MAX_LOOPS: exit after N iterations instead of looping until Ctrl+C. 0/unset =
 # unlimited (normal). Set >0 for tests so the loop self-terminates without a SIGINT.
 MAX_LOOPS="${CLAUDEZERO_MAX_LOOPS:-0}"
+# fd 4 = where claude's own chatter goes. Redirected stdout + stdin still on the terminal → claude
+# keeps writing to the terminal, so piping claudezero.sh to a log file records the ❄ reports, not
+# the TUI. No redirect, or stdin not a terminal (tests, CI, nohup) → fd 4 is plain stdout, as today.
+# Dup stdin rather than open /dev/tty: on macOS a descriptor opened from the /dev/tty clone device
+# is not kqueue-registrable, and claude dies at startup with `EINVAL … kqueue`. The tty stdin the
+# shell was handed is a real terminal fd, opened read-write, so it takes writes and kqueue both.
+if [ ! -t 1 ] && [ -t 0 ]; then exec 4>&0; else exec 4>&1; fi
 LOOP_COUNT=0
-CLAUDE_TOTAL=0            # summed claude runtime, frozen once all todos land
 STOP=0                    # set by the INT trap; the loop breaks to the closer below
-TODOS_BASE=$(read_todos_total)   # snapshot: report only THIS run's slice of the shared aggregate
+TODOS_BASE=$(read_counter "${TODOS_TIME_FILE:-}")   # snapshot: report only THIS run's slice of the shared aggregates
+TODOS_DONE_BASE=$(read_counter "${TODOS_DONE_FILE:-}")
 LOOP_START=$(date +%s)   # script loop (outer while loop) starts here
 
 # Ctrl+C during the between-runs sleep (cooked mode) requests a clean stop; the loop breaks to the
@@ -109,16 +128,13 @@ reap_dead_sessions   # startup: clear markers left by crashed prior runs before 
 while true; do
     # first prompt submitted straight from the CLI arg. The session Stop hook SIGTERMs claude
     # when context fills; exit 143 is the normal restart path, so swallow it.
-    RUN_START=$(date +%s)
-    # done BEFORE this run? if so it's an idle restart and its time doesn't count.
-    all_todos_done && WAS_DONE=1 || WAS_DONE=0
-    CLAUDEZERO_INSTANCE="$INSTANCE_ID" claude --settings "$STOP_SETTINGS" --permission-mode auto "$PROMPT" || true
+    CLAUDEZERO_INSTANCE="$INSTANCE_ID" CLAUDEZERO_TRANSCRIPTS="$TRANSCRIPTS_FILE" \
+        claude --settings "$STOP_SETTINGS" --permission-mode auto --name "$SESSION_NAME" "$PROMPT" >&4 2>&4 || true
     # claude killed mid-run (Ctrl+C/SIGTERM) can leave the tty in raw mode with ISIG off; then every
     # later Ctrl+C arrives as a 0x03 byte, not a SIGINT, so the INT trap never fires and the loop
     # spins forever restarting claude on a wedged terminal. Restore cooked mode so Ctrl+C signals again.
     if [ -t 0 ]; then stty sane 2>/dev/null || true; fi
     NOW=$(date +%s)
-    if [ "$WAS_DONE" = 0 ]; then CLAUDE_TOTAL=$(( CLAUDE_TOTAL + (NOW - RUN_START) )); fi
     LOOP_COUNT=$((LOOP_COUNT+1))
     printf '\n\n'
     if [ "$MAX_LOOPS" -gt 0 ] && [ "$LOOP_COUNT" -ge "$MAX_LOOPS" ]; then
@@ -133,7 +149,12 @@ while true; do
 done
 
 # single closer — every exit path (Ctrl+C or MAX_LOOPS) lands here, so dojo_proud lives in one place.
+# The exit report goes here too: the loop's own report prints before the between-runs sleep, so a
+# Ctrl+C in that gap used to end the run on figures stale by one claude run. After credit_inflight_time
+# so a task still in flight is folded in before the files are read.
 credit_inflight_time
+print_report "$(date +%s)"
+print_fleet_total
 if all_todos_done; then dojo_proud; fi
 reap_dead_sessions   # no future acquire will reap this session's marker
 }
@@ -186,9 +207,11 @@ else
     # (not detached) and CLEAN before we start — else refuse and let the human decide.
     [ "$BASE_BRANCH" != HEAD ] || { echo "$PROG: detached HEAD — check out the base branch first."; exit 1; }
     # guardrail: claude's Bash calls run from cwd, and the zero prompt + `.git/zero.sh` + `../ts-*`
-    # worktree paths all assume cwd is the repo root — refuse a subdir launch so they never misfire.
-    REPO_ROOT="$(git rev-parse --show-toplevel)"
-    [ "$PWD" = "$REPO_ROOT" ] || { echo "$PROG: not at repo root — cd to '$REPO_ROOT' first."; exit 1; }
+    # worktree paths all assume cwd is the main worktree's root — refuse a subdir launch, and a
+    # launch inside a leftover `../ts-*` claim worktree, so they never misfire. The first entry of
+    # `git worktree list --porcelain` is always the main worktree, so one compare covers both.
+    REPO_ROOT="$(git worktree list --porcelain | sed -n '1s/^worktree //p')"
+    [ "$PWD" = "$REPO_ROOT" ] || { echo "$PROG: not at the main repo root — cd to '$REPO_ROOT' first. (ClaudeZero's own ../ts-* task worktrees are never valid launch dirs.)"; exit 1; }
     [ -z "$(git status --porcelain)" ] || { echo "$PROG: working tree on '$BASE_BRANCH' is dirty — commit or stash first."; git status --short; exit 1; }
     printf '  zero mode · base %s · fork → implement → commit → merge\n\n' "$BASE_BRANCH"
     # todo path: from the positional arg, else ask interactively.
@@ -202,6 +225,10 @@ else
         "$PWD/"*) TODO_PATH="${ABS_PATH#"$PWD"/}" ;;
         *) echo "$PROG: path not under working dir $PWD: $TODO_PATH"; exit 1 ;;
     esac
+    # guardrail: the merge gate diffs the todo against the branch's fork point on the base, so a
+    # todo that is not tracked there (never added, or gitignored — the dirty-tree guard above misses
+    # a gitignored file) makes EVERY merge refuse "newly checks 0 boxes" and nothing can ever land.
+    git cat-file -e "$BASE_BRANCH:$TODO_PATH" 2>/dev/null || { echo "$PROG: '$TODO_PATH' is not tracked on '$BASE_BRANCH' — commit it there first, else every merge is refused and no task can land."; exit 1; }
     PROMPT="$(build_zero_prompt "$TODO_PATH" "$TASK_PROMPT")"
 fi
 
@@ -213,6 +240,10 @@ fi
 GITDIR_ABS="$(cd "$(git rev-parse --git-dir)" && pwd)"
 SESSION_DIR="$(cd "$(git rev-parse --git-common-dir)" && pwd)/session"   # matches zero.sh's marker dir
 TODOS_TIME_FILE="$(cd "$(git rev-parse --git-common-dir)" && pwd)/todos-seconds-${BASE_BRANCH//\//-}-$INSTANCE_ID"   # this instance's file (matches zero.sh's todos_file)
+TODOS_DONE_FILE="$(cd "$(git rev-parse --git-common-dir)" && pwd)/todos-done-${BASE_BRANCH//\//-}-$INSTANCE_ID"      # count of todos this instance merged (matches zero.sh's todos_done_file)
+# this instance's list of claude session transcripts (one path per line, appended by the Stop hook).
+# Namespaced like the time-file so parallel instances never read each other's token figures.
+TRANSCRIPTS_FILE="$(cd "$(git rev-parse --git-common-dir)" && pwd)/transcripts-${BASE_BRANCH//\//-}-$INSTANCE_ID"
 ZERO_SH="$GITDIR_ABS/zero.sh"   # where build_zero_prompt wrote the helper (zero mode only)
 INSTANCE_DIR="$(cd "$(git rev-parse --git-common-dir)" && pwd)/instance"
 
@@ -222,6 +253,13 @@ mkdir -p "$INSTANCE_DIR"; printf '%s\n%s\n' "$$" "$(proc_start "$$")" > "$INSTAN
 trap 'rm -f "$INSTANCE_DIR/$INSTANCE_ID" 2>/dev/null' EXIT
 cleanup_orphan_time_files
 
+# claude's display name (prompt box, /resume picker, terminal title) — the same id and nickname the
+# report heads its stats with, the nickname short enough to say out loud, and a dojo-student activity, so parallel
+# terminals are told apart without reading hex. The id and activity are derived from the id, never
+# from chance; the nickname is picked once here, so every restart re-launches under the same name.
+INSTANCE_NICK="$(pick_nickname)"    # kept in a var: the report header says it too, and it is drawn once
+SESSION_NAME="($INSTANCE_ID) $INSTANCE_NICK · $(dojo_student "$INSTANCE_ID")"
+
 STOP_HOOK="$GITDIR_ABS/compact-exit-hook.sh"
 cat >"$STOP_HOOK" <<'HOOK_EOF'
 #!/usr/bin/env bash
@@ -230,6 +268,15 @@ cat >"$STOP_HOOK" <<'HOOK_EOF'
 # loop restarts fresh. Reusing that bucket file as the signal means no separate flag and no edit
 # to the hook. Couples to its filename/tmpdir; update if ECC changes them.
 input="$(cat)"
+# token accounting: record this session's transcript path for the outer loop to sum after claude
+# exits. The hook file is shared by all instances in this git dir, so the destination comes from
+# the env of the claude WE launched (CLAUDEZERO_TRANSCRIPTS), never baked in. One line per path;
+# best-effort, never fails the turn.
+tf="${CLAUDEZERO_TRANSCRIPTS:-}"
+if [ -n "$tf" ]; then
+  tp="$(printf '%s' "$input" | sed -n 's/.*"transcript_path"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')"
+  [ -n "$tp" ] && ! grep -qxF "$tp" "$tf" 2>/dev/null && printf '%s\n' "$tp" >> "$tf"
+fi
 sid="$(printf '%s' "$input" | sed -n 's/.*"session_id"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | tr -cd 'A-Za-z0-9_-')"
 [ -n "$sid" ] || exit 0
 dir="${TMPDIR:-${TMP:-${TEMP:-/tmp}}}"; dir="${dir%/}"      # match node os.tmpdir()
@@ -269,10 +316,66 @@ fmt_dur() {
   else                         printf '%ds' "$s"; fi
 }
 
-# read the shared todos-time aggregate (seconds of task ownership zero.sh records), 0 if absent.
-read_todos_total() {
-  local v=0
-  [ -n "${TODOS_TIME_FILE:-}" ] && [ -f "$TODOS_TIME_FILE" ] && { read -r v < "$TODOS_TIME_FILE" 2>/dev/null || v=0; }
+# format a token count as 5.8M / 84.3k / 312 — integer arithmetic only (bash 3.2 has no floats).
+fmt_tok() {
+  local n=$1
+  if   [ "$n" -ge 1000000 ]; then printf '%d.%dM' $((n/1000000)) $(( (n%1000000)/100000 ))
+  elif [ "$n" -ge 1000 ];    then printf '%d.%dk' $((n/1000))    $(( (n%1000)/100 ))
+  else                            printf '%d' "$n"; fi
+}
+
+# sum this instance's claude token usage over the session transcripts its Stop hook recorded.
+# Echoes "input output cache_create cache_read total"; EMPTY when nothing parses → report says n/a.
+# Whole-file pass per call, not incremental byte offsets: a duplicate-requestId group can straddle
+# an incremental boundary and get double-counted. Transcripts are bounded by the restart-at-
+# context-threshold design, so re-reading them is cheap.
+#   dedupe by requestId — ONE API request is written as several transcript lines, one per content
+#     block (text, tool_use, thinking), each repeating the SAME usage object verbatim. Summing per
+#     line inflates every figure by the average blocks-per-turn.
+#   first match per line is the parent field — usage.iterations[] repeats all four names one level
+#     down, and usage.cache_creation carries the ephemeral_5m/1h leaves that already sum into
+#     cache_creation_input_tokens. Take the parent only, never the leaves or the nested copy.
+# $1 = transcript-list file, default this instance's — the fleet total passes each peer's in turn.
+read_tokens_total() {
+  local tf=${1:-${TRANSCRIPTS_FILE:-}} p
+  [ -n "$tf" ] && [ -f "$tf" ] || return 0
+  while IFS= read -r p; do
+    if [ -f "$p" ]; then cat "$p"; fi
+  done < "$tf" | awk '
+    function num(key,   s) {
+      if (!match($0, "\"" key "\":[0-9]+")) return 0
+      s = substr($0, RSTART, RLENGTH); sub(/.*:/, "", s); return s + 0
+    }
+    /"output_tokens":/ {
+      k = match($0, /"requestId":"[^"]+"/) ? substr($0, RSTART + 13, RLENGTH - 14) : "line" NR
+      if (k in seen) next
+      seen[k] = 1; n++
+      i  += num("input_tokens");                o  += num("output_tokens")
+      cc += num("cache_creation_input_tokens"); cr += num("cache_read_input_tokens")
+    }
+    END { if (n) printf "%d %d %d %d %d\n", i, o, cc, cr, i + o + cc + cr }' 2>/dev/null
+}
+
+# the report's token block: headline total, then the four billed categories beneath it. They do not
+# overlap (total_input = cache_read + cache_creation + input, output on its own axis) and each bills
+# at its own rate, so the total is a SCALE figure for comparison, not a cost. No money figure: there
+# is no first-party programmatic rate source, only a hardcoded table that would rot. Degrade, never
+# lie — a parse miss, a missing transcript or a schema change prints n/a and leaves the run alone.
+print_tokens() {
+  local t; t="$(read_tokens_total || true)"
+  # shellcheck disable=SC2086  # deliberate split: awk emits five space-separated integers
+  set -- $t
+  if [ "$#" -ne 5 ]; then printf '\n  Tokens: n/a\n'; return 0; fi
+  printf '\n  Tokens: %s Total\n' "$(fmt_tok "$5")"
+  printf '  in %s · out %s · cache write %s · cache read %s\n' \
+    "$(fmt_tok "$1")" "$(fmt_tok "$2")" "$(fmt_tok "$3")" "$(fmt_tok "$4")"
+}
+
+# read one of zero.sh's per-instance aggregates ($1 = path: seconds of task ownership, or todos
+# merged), 0 if absent/unset/garbled.
+read_counter() {
+  local v=0 f=${1:-}
+  [ -n "$f" ] && [ -f "$f" ] && { read -r v < "$f" 2>/dev/null || v=0; }
   case "$v" in ''|*[!0-9]*) v=0;; esac
   printf '%s' "$v"
 }
@@ -290,18 +393,72 @@ all_todos_done() {
     END { exit (any && !unchecked) ? 0 : 1 }'
 }
 
-# multiline execution-time report. $1 = now epoch.
-#   Todos        = per-task ownership time, this run's delta of zero.sh's aggregate
-#   Claude loops = summed runtime of EVERY claude invocation up to the all-done moment (frozen
-#                  after) — sum across restarts, not one invocation
-#   Script loop  = wall time of the outer while loop (claude runs + between-run sleeps)
+# multiline execution-stats report. $1 = now epoch.
+#   Todos       = per-task ownership time and count of todos merged, this run's delta of zero.sh's
+#                 aggregates
+#   Script loop = wall time of the outer while loop (claude runs + between-run sleeps)
+#   Tokens      = this instance's claude token usage, own block (not a duration, so it does not
+#                 share the timing rows' label column)
 print_report() {
-  printf '\n❄ execution time (instance %s)\n' "${INSTANCE_ID:-?}"
+  printf '\n❄ execution stats (instance %s · %s)\n' "${INSTANCE_ID:-?}" "${INSTANCE_NICK:-?}"
   if [ "${MODE:-}" = zero ]; then
-    printf '  %-20s %s\n' 'Todos:' "$(fmt_dur $(( $(read_todos_total) - TODOS_BASE )))"
+    printf '  %-20s %s  ·  %s completed\n' 'Todos:' \
+      "$(fmt_dur $(( $(read_counter "${TODOS_TIME_FILE:-}") - TODOS_BASE )))" \
+      "$(( $(read_counter "${TODOS_DONE_FILE:-}") - TODOS_DONE_BASE ))"
   fi
-  printf '  %-20s %s\n' 'Claude loops:'        "$(fmt_dur "$CLAUDE_TOTAL")"
   printf '  %-20s %s\n' 'ClaudeZero run loop:' "$(fmt_dur $(( $1 - LOOP_START )))"
+  print_tokens
+}
+
+# fleet-wide TOTAL for this base, printed once on the exit path beneath this instance's report.
+# The sum is a GLOB, not a registry: every figure is already one file per instance in the git common
+# dir, so a shared aggregate would only be a second copy that can disagree with the first. Read
+# without flock — all three writers publish with temp-file + mv, so a reader sees the old file or
+# the new one, never a torn line. No baseline: per-instance files are created fresh under a new
+# INSTANCE_ID each launch and dead runs' files are GC'd at startup, so what is on disk IS this run;
+# subtracting a startup snapshot would under-report peers that started earlier. A crashed peer's
+# files are summed too — its merged todos did land. A solo run prints the block as well: its figures
+# restate the block above, but the heading carries the instance count, which nothing else prints and
+# which is worth most when it reads 1 — that is the case an absent block cannot be told apart from a
+# sum that matched no files (BUG-022). Zero ids stays silent, so absence keeps one meaning.
+# `ClaudeZero run loop:` is omitted — instances' wall times overlap, so their sum is not a duration
+# anything took.
+print_fleet_total() {
+  local gc slug pre f id ids="" n=0 secs=0 done_n=0 t any=0 ti=0 to=0 tcc=0 tcr=0 tt=0 plural=s
+  gc="$(cd "$(git rev-parse --git-common-dir)" 2>/dev/null && pwd)" || return 0
+  [ -n "$gc" ] || return 0
+  slug="${BASE_BRANCH//\//-}"
+  for pre in todos-seconds todos-done transcripts; do    # union: an instance that merged nothing
+    for f in "$gc/$pre-$slug-"*; do                      # writes no todos-done file, but has tokens
+      [ -e "$f" ] || continue
+      case "$f" in *.lock|*.tmp) continue;; esac
+      id="${f##*/"$pre"-"$slug"-}"
+      case " $ids " in *" $id "*) continue;; esac
+      ids="$ids $id"; n=$((n+1))
+    done
+  done
+  [ "$n" -ge 1 ] || return 0    # n=0: no files for this slug — stay silent, absence means only that
+  if [ "$n" -eq 1 ]; then plural=""; fi
+  for id in $ids; do
+    secs=$((   secs   + $(read_counter "$gc/todos-seconds-$slug-$id") ))
+    done_n=$(( done_n + $(read_counter "$gc/todos-done-$slug-$id") ))
+    t="$(read_tokens_total "$gc/transcripts-$slug-$id" || true)"
+    # shellcheck disable=SC2086  # deliberate split: awk emits five space-separated integers
+    set -- $t
+    if [ "$#" -eq 5 ]; then any=1; ti=$((ti+$1)); to=$((to+$2)); tcc=$((tcc+$3)); tcr=$((tcr+$4)); tt=$((tt+$5)); fi
+  done
+  printf '\n-----------------------------------------------\n'
+  printf '❄ TOTAL (%s instance%s)\n' "$n" "$plural"
+  if [ "${MODE:-}" = zero ]; then
+    printf '  %-20s %s  ·  %s completed\n' 'Todos:' "$(fmt_dur "$secs")" "$done_n"
+  fi
+  if [ "$any" = 1 ]; then
+    printf '\n  Tokens: %s Total\n' "$(fmt_tok "$tt")"
+    printf '  in %s · out %s · cache write %s · cache read %s\n' \
+      "$(fmt_tok "$ti")" "$(fmt_tok "$to")" "$(fmt_tok "$tcc")" "$(fmt_tok "$tcr")"
+  else
+    printf '\n  Tokens: n/a\n'
+  fi
 }
 
 # credit orphaned in-flight tasks before an exit-path report: zero.sh folds worktrees whose owner
@@ -331,6 +488,24 @@ dojo_wisdom() {
   )
   printf '\n❄ %s\n' "${w[RANDOM % ${#w[@]}]}"
 }
+# what the student under ClaudeZero's guidance is busy with — the tail of a claude session's
+# display name. $1 = instance id; the first two chars (hex from uuidgen, decimal from the $$
+# fallback — both valid hex) pick the line, so the name is stable across context restarts.
+dojo_student() {
+  local a=(
+    'drilling the fork-implement-merge kata'
+    'hauling snow buckets uphill'
+    'claiming a track before stepping on it'
+    'reading the whole task before striking'
+    'starting over on fresh snow'
+    'carving checkbox after checkbox into ice'
+    'hunting the next box on the list'
+    'practicing one clean strike per task'
+    "leaving a peer's branch untouched"
+    'walking back to the merge gate'
+  )
+  printf '%s' "${a[$(( 16#${1:0:2} % 10 ))]}"
+}
 # the proud closer — his quiet nod of pride, printed independently once every todo has landed.
 dojo_proud() { printf '\n❄ ClaudeZero surveys the frozen field, and is proud.\n'; }
 
@@ -353,11 +528,12 @@ reap_dead_sessions() {
 # A time-file is an orphan iff its id has no LIVE marker (crash-leaked markers are GC'd by liveness).
 proc_start() { ps -o lstart= -p "$1" 2>/dev/null | awk '{$1=$1;print}'; }
 instance_alive() { kill -0 "$1" 2>/dev/null && [ "$(proc_start "$1")" = "$2" ]; }   # $1=pid $2=start
-# delete todos-seconds-<base>-<id> (+ .lock/.tmp sidecars) whose instance is not live. Called at
-# startup AFTER our marker is written, so this instance and live peers are always preserved.
+# delete todos-seconds-<base>-<id> / todos-done-<base>-<id> (+ .lock/.tmp sidecars) whose instance
+# is not live. Called at startup AFTER our marker is written, so this instance and live peers are
+# always preserved.
 cleanup_orphan_time_files() {
   [ -n "${INSTANCE_DIR:-}" ] || return 0
-  local gc slug f id m pid st
+  local gc slug f id m pid st pre
   gc="$(cd "$(git rev-parse --git-common-dir)" && pwd)"; slug="${BASE_BRANCH//\//-}"
   if [ -d "$INSTANCE_DIR" ]; then                       # GC crash-leaked markers first
     for m in "$INSTANCE_DIR"/*; do
@@ -366,13 +542,51 @@ cleanup_orphan_time_files() {
       instance_alive "${pid:-0}" "${st:-}" || rm -f "$m"
     done
   fi
-  for f in "$gc/todos-seconds-$slug-"*; do
-    [ -e "$f" ] || continue
-    case "$f" in *.lock|*.tmp) continue;; esac           # sidecars swept with their base file below
-    id="${f##*/todos-seconds-"$slug"-}"
-    [ -f "$INSTANCE_DIR/$id" ] && continue                # id still has a (live) marker → keep
-    rm -f "$f" "$f.lock" "$f.tmp"
+  for pre in todos-seconds todos-done; do
+    for f in "$gc/$pre-$slug-"*; do
+      [ -e "$f" ] || continue
+      case "$f" in *.lock|*.tmp) continue;; esac           # sidecars swept with their base file below
+      id="${f##*/"$pre"-"$slug"-}"
+      [ -f "$INSTANCE_DIR/$id" ] && continue                # id still has a (live) marker → keep
+      rm -f "$f" "$f.lock" "$f.tmp"
+    done
   done
+  for f in "$gc/transcripts-$slug-"*; do                  # same rule for the token-accounting lists
+    [ -e "$f" ] || continue
+    id="${f##*/transcripts-"$slug"-}"
+    [ -f "$INSTANCE_DIR/$id" ] && continue
+    rm -f "$f"
+  done
+}
+
+# a short, speakable handle for this instance — one of the fifteen below, held by no peer running
+# against this repo right now, so "kill kit" beats reading eight hex chars aloud. Line 3 of a
+# marker is its holder's nickname (line 1/2 untouched, so the GC above still reads them), which
+# makes the liveness registry the name registry too — no second list to disagree with the first.
+# Call ONCE, AFTER cleanup_orphan_time_files, or dead peers' markers still hold names hostage.
+# scan-then-claim runs under one lock so two instances launched together cannot draw the same word.
+# Past fifteen live instances the names take an ascending suffix ("bob 1", then "bob 2", …).
+# Degrade, never lie: an unwritable lock or registry costs uniqueness, never the launch.
+pick_nickname() {
+  local names=(ash bob cleo dax elk finn gus hana ivo jun kit lux moss nix opal)
+  local m taken="" free=() cand n suffix=0
+  { exec 6>"$INSTANCE_DIR.lock" && flock 6; } 2>/dev/null || true
+  for m in "$INSTANCE_DIR"/*; do
+    [ -e "$m" ] || continue
+    taken+="$(sed -n 3p "$m" 2>/dev/null)"$'\n'     # no line 3 = a peer not yet at the lock: takes nothing
+  done
+  while [ ${#free[@]} -eq 0 ]; do
+    for n in "${names[@]}"; do
+      [ "$suffix" -eq 0 ] || n="$n $suffix"
+      case $'\n'"$taken" in *$'\n'"$n"$'\n'*) continue;; esac
+      free+=("$n")
+    done
+    suffix=$((suffix+1))
+  done
+  cand="${free[RANDOM % ${#free[@]}]}"              # random among the free, never derived from the id
+  printf '%s\n' "$cand" 2>/dev/null >> "$INSTANCE_DIR/$INSTANCE_ID" || true
+  exec 6>&-                                        # close fd, release lock
+  printf '%s' "$cand"
 }
 
 # write .git/zero.sh (the per-task acquire/release/merge helper the zero prompt calls) with
@@ -399,6 +613,8 @@ INSTANCE_ID="${CLAUDEZERO_INSTANCE:-shared}"
 # per-instance aggregate path: seconds of task ownership credited to instance $1. Namespaced by base
 # slug (like branches/worktrees/reclaim-locks) AND instance id, so peers keep separate, comparable totals.
 todos_file() { printf '%s/todos-seconds-%s-%s' "$GITDIR" "${BASE_BRANCH//\//-}" "$1"; }
+# same namespacing for the count of todos instance $1 landed on the base branch.
+todos_done_file() { printf '%s/todos-done-%s-%s' "$GITDIR" "${BASE_BRANCH//\//-}" "$1"; }
 
 # stat mtime-epoch flavor, probed once: BSD/macOS `-f %m` vs GNU/Linux `-c %Y`.
 if stat -f %m . >/dev/null 2>&1; then STAT_MTIME=(stat -f %m); else STAT_MTIME=(stat -c %Y); fi
@@ -414,10 +630,21 @@ newest_mtime() {
 # fd 9 is acquire's). Credit goes to the instance that WORKED the span, not necessarily the caller
 # (a stealer credits the crashed owner). Silently ignores non-numeric / non-positive / no-instance.
 add_todos_time() {
-  local add=${1:-0} inst=${2:-} cur=0 f
+  local add=${1:-0} inst=${2:-}
   case "$add" in ''|*[!0-9]*) return 0;; esac; [ "$add" -gt 0 ] || return 0
   [ -n "$inst" ] || inst=shared
-  f=$(todos_file "$inst")
+  add_counter "$add" "$(todos_file "$inst")"
+}
+# +1 to instance $1's completed-todo count, from the same rc=0 point that credits its time, so
+# the count and the time credit can never disagree about who did the work.
+add_todos_done() {
+  local inst=${1:-}
+  [ -n "$inst" ] || inst=shared
+  add_counter 1 "$(todos_done_file "$inst")"
+}
+# add $1 (positive int) to counter file $2, under a per-file lock.
+add_counter() {
+  local add=$1 f=$2 cur=0
   exec 8>"$f.lock"; flock 8
   [ -f "$f" ] && { read -r cur < "$f" 2>/dev/null || cur=0; }
   case "$cur" in ''|*[!0-9]*) cur=0;; esac
@@ -544,6 +771,33 @@ acquire_task() {
   setup_exclude "$wt"; claim_owner "$wt"; set_current "$n"; printf '%s' "$wt"; return 0
 }
 
+# claim: the WHOLE "is this task mine to work?" decision in one call — acquire, validate the
+# worktree, then re-check that no peer landed it first. Prints the worktree path (stdout, no
+# newline) + exit 0 when it is yours; every skip reason goes to stderr with a distinct exit code
+# so TEST.md can assert which path ran: 1 = not claimed, 3 = validation failed, 4 = already landed.
+# The agent treats all non-zero the same. Takes the RAW id: acquire/release want it sanitized,
+# is_done wants it raw (it matches the todo line's first token), so both values are held here.
+claim_task() {
+  local raw=$1 n wt br; n=$(sanitize_id "$raw")
+  if ! wt=$(acquire_task "$n"); then
+    echo "claim $raw: not claimed — a peer owns it or it is being rescued" >&2; return 1
+  fi
+  br=""   # set -e: keep the probe in an `if` — a bare failing `&&` chain would kill the process
+  if [ -n "$wt" ] && [ -d "$wt" ]; then br=$(git -C "$wt" symbolic-ref --short HEAD 2>/dev/null || true); fi
+  if [ "$br" != "$(task_branch "$n")" ]; then
+    # do NOT release: that would force-remove a worktree sitting on an unexpected branch with
+    # unknown contents. Just drop the session claim; a later acquire steals it the normal way.
+    set_current none
+    echo "claim $raw: validation failed — worktree ${wt:-<none>} is on ${br:-<none>}, want $(task_branch "$n")" >&2
+    return 3
+  fi
+  if is_done "$raw" "$wt"; then
+    release_task "$n" "$wt"
+    echo "claim $raw: already landed on $BASE_BRANCH by a peer — released" >&2; return 4
+  fi
+  printf '%s' "$wt"
+}
+
 # release: undo a claim (worktree + branch) and mark this session idle. -d refuses a branch with
 # unmerged commits (safety), leaving an orphan branch a later acquire reattaches.
 release_task() {
@@ -591,8 +845,10 @@ merge_task() {
       flock "$wtlock" git worktree remove --force "$wt" || true
       git branch -d "$branch" >/dev/null 2>&1 || true
     ' _ "$wt" "$branch" "$BASE_BRANCH" "$GITDIR/checkbox-merge.err" "$TODO_PATH" "$WT_LOCK"; then rc=0; else rc=$?; fi
-  # merged → credit full elapsed (acquire → now) to the instance that held it (line4).
+  # merged → credit full elapsed (acquire → now) and one completed todo to the instance that held
+  # it (line4). The branch is deleted right above, so no todo can be counted twice.
   if [ "$rc" -eq 0 ] && [ -n "$acq" ]; then add_todos_time "$(( $(date +%s) - acq ))" "$inst"; fi
+  if [ "$rc" -eq 0 ]; then add_todos_done "$inst"; fi
   return $rc
 }
 
@@ -662,7 +918,7 @@ box_checked_on_base() {
 # done: deterministic "has this task already LANDED on the base branch?" — exit 0 = landed (safe to
 # release/skip), exit 1 = not landed (own it, drive+merge it). Given the RAW task id. Authoritative
 # signal is the base box: OR-merge + the one-box invariant mean a base [x] can only come from THIS
-# task's branch actually merging. A worktree that ticked its own TASK_BRANCH box but whose merge
+# task's branch actually merging. A worktree that ticked its own box on its task branch but whose merge
 # failed/aborted leaves base at [ ] = not done. If a wt is passed and still exists, also assert its
 # tip is an ancestor of base — catches the ticked-box-but-unmerged wt from the failed-merge rescue path.
 is_done() {
@@ -673,12 +929,13 @@ is_done() {
 }
 
 case "${1:-}" in
+  claim)   ensure_owner; claim_task "$2" ;;
   acquire) ensure_owner; acquire_task "$(sanitize_id "$2")" ;;
   release) ensure_owner; release_task "$(sanitize_id "$2")" "$3" ;;
   merge)   ensure_owner; merge_task "$(sanitize_id "$2")" "$3" && set_current none || exit $? ;;  # clear only on success
   done)    is_done "$2" "${3:-}" ;;
   credit_inflight_time)   credit_inflight_time ;;
-  *) echo "usage: zero.sh {acquire N | release N WT | merge N WT | done N [WT] | credit_inflight_time}" >&2; exit 64 ;;
+  *) echo "usage: zero.sh {claim N | acquire N | release N WT | merge N WT | done N [WT] | credit_inflight_time}" >&2; exit 64 ;;
 esac
 ZERO_EOF
     } > "$gitdir/zero.sh"
@@ -724,7 +981,10 @@ DRIVER_EOF
 
     # single-quoted heredoc keeps $wt/backticks literal; inject params via bash replace (safe for
     # arbitrary @@LOOPPROMPT@@ text — no sed metachar/delimiter escaping).
-    local prompt; prompt=$(cat <<'PROMPT_EOF'
+    # `read -d ''` not `$(cat <<EOF)`: bash 3.2 (stock macOS) cannot parse a heredoc inside a
+    # command substitution. It exits 1 at EOF, hence `|| :`.
+    local prompt
+    IFS= read -r -d '' prompt <<'PROMPT_EOF' || :
 /loop @@LOOP_INTERVAL@@
 
 You are ONE of many independent Claude instances zeroing tasks from @@TODO@@ in PARALLEL.
@@ -763,39 +1023,34 @@ Keep these facts in mind for every iteration:
       - Any inbound edge to an unchecked task → skip to the next task_id.
       - No such edge (every claimed edge is either to a checked task or unquotable)
         → continue to step b.
-   b. ACQUIRE: wt=$(.git/zero.sh acquire task_id)
-      - exit ≠ 0 → could not claim it (a peer owns it, or it is being rescued) → skip to the next task_id.
+   b. CLAIM: wt=$(.git/zero.sh claim task_id)
+      - exit ≠ 0 → not yours (a peer owns it, it is being rescued, or a peer already landed it)
+        → skip to the next task_id. The reason is printed on stderr.
       - exit 0   → you OWN task_id; its git worktree is at $wt. Continue to step c.
-   c. VALIDATE: $wt is non-empty and a directory, and TASK_BRANCH=`git -C "$wt" symbolic-ref --short HEAD`
-      starts with "@@BASE_BRANCH@@-task-". If not, skip to the next task_id.
-   d. RE-CHECK for a race, deterministically: `.git/zero.sh done task_id "$wt"`.
-      - exit 0  → a peer already LANDED it on @@BASE_BRANCH@@ (box `[x]` on base AND merged) just before
-        your claim → run `.git/zero.sh release task_id "$wt"` and skip to the next task_id.
-      - exit ≠ 0 → NOT landed (base still `[ ]`, e.g. a ticked box left on an unmerged branch by an
-        earlier failed merge) → you own it, continue to step e. Do NOT trust the box in `$wt/@@TODO@@`.
-   e. IMPLEMENT task_id. Scope every edit to THIS task only before you skip to the next one; never touch 
-      another task, even one you will process later this same pass (you reach the next task_id 
-      at step g — this is per-task, not per-session).
+        Do NOT trust the box in `$wt/@@TODO@@` — the claim already re-checked @@BASE_BRANCH@@.
+   c. IMPLEMENT task_id. Scope every edit to THIS task only before you skip to the next one; never touch
+      another task, even one you will process later this same pass (you reach the next task_id
+      at step e — this is per-task, not per-session).
       @@LOOPPROMPT@@
-   f. CHECK OFF only your task_id's line in `$wt/@@TODO@@` (`[ ]`→`[x]`); touch no other line.
-      Then commit in `$wt` on TASK_BRANCH.
-   g. MERGE: .git/zero.sh merge task_id "$wt"
+   d. CHECK OFF only your task_id's line in `$wt/@@TODO@@` (`[ ]`→`[x]`); touch no other line.
+      Then commit in `$wt` on the worktree's branch.
+   e. MERGE: .git/zero.sh merge task_id "$wt"
       - exit 0 → merged to @@BASE_BRANCH@@, worktree + branch cleaned → continue to the next task_id.
       - exit ≠ 0 with output starting `checkbox-merge: refused` → you checked off more than your own
         task. The output lists each offending line as `<file>:<line> <text>`. In `$wt/@@TODO@@` uncheck
         every listed line EXCEPT task_id's (`[x]`→`[ ]`), keep yours checked, run
         `git -C "$wt" commit --amend --no-edit`, then retry `.git/zero.sh merge task_id "$wt"` ONCE.
         If it fails again for this cause, STOP THE LOOP IMMEDIATELY — report the offending lines, task_id,
-        and its worktree $wt (still on TASK_BRANCH), and ask the human to clear the unrelated checkboxes,
-        then merge by hand.
+        its worktree $wt and its branch (`git -C "$wt" symbolic-ref --short HEAD`), and ask the human to
+        clear the unrelated checkboxes, then merge by hand.
       - any other exit ≠ 0 → a merge conflict. Resolve it yourself, iterating until you merge or you see
-        no better merge option. If you cannot, MERGE FAILED: STOP THE LOOP IMMEDIATELY — report task_id 
-        and its worktree $wt (still on TASK_BRANCH), and ask the human to "resolve the conflict 
-        on that branch, then merge by hand".
+        no better merge option. If you cannot, MERGE FAILED: STOP THE LOOP IMMEDIATELY — report task_id,
+        its worktree $wt and its branch (`git -C "$wt" symbolic-ref --short HEAD`), and ask the human to
+        "resolve the conflict on that branch, then merge by hand".
 3. If every task in @@TODO@@ is now checked → announce "ALL TASKS DONE" and stop the loop: end this
    pass WITHOUT scheduling the next iteration. Otherwise end this pass and let the scheduled loop re-fire.
 PROMPT_EOF
-)
+    prompt=${prompt%$'\n'}          # read keeps the final newline; $(cat) stripped it
     prompt=${prompt//@@TODO@@/$todo}
     prompt=${prompt//@@BASE_BRANCH@@/$BASE_BRANCH}
     prompt=${prompt//@@LOOP_INTERVAL@@/$LOOP_INTERVAL}
