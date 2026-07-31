@@ -189,14 +189,15 @@ echo "zero.sh wrote counts: $(ls "$T"/repo/.git 2>/dev/null | grep -c '^todos-do
 
 ## Scenario B — startup-guard refusals   `[$TESTROOT/B]`   (no claude)
 
-Four pristine repos: one with a dirty working tree, one on a detached HEAD, one clean
-launched from a subdir, one clean launched from inside a leftover `../ts-*` task worktree.
+Five pristine repos: one with a dirty working tree, one on a detached HEAD, one clean
+launched from a subdir, one clean launched from inside a leftover `../ts-*` task worktree,
+and one clean whose todo is gitignored (so untracked on the base branch).
 Each must make claudezero refuse to start with the matching message and a non-zero exit.
 
 ### Setup
 ```bash
 TB="$TESTROOT/B"
-for name in dirty detached nested worktree; do
+for name in dirty detached nested worktree untracked; do
   mkdir -p "$TB/$name"
   ( cd "$TB/$name"; git init -q; git config user.email t@t.t; git config user.name test
     echo x > f; git add f; git commit -qm init
@@ -208,6 +209,9 @@ mkdir -p "$TB/nested/sub"                      # clean repo; we launch from this
 # leftover claim worktree, exactly what a crashed peer abandons: branch <base>-task-1 + ../ts-*
 ( cd "$TB/worktree"; base="$(git rev-parse --abbrev-ref HEAD)"
   git worktree add -q "$TB/ts-$base-task-1-dead" -b "$base-task-1" "$base" )
+# todo present on disk but gitignored → untracked on the base, yet the tree still reads clean
+( cd "$TB/untracked"; git rm -q --cached todo.md
+  echo todo.md > .gitignore; git add .gitignore; git commit -qm ignore-todo )
 ```
 
 ### Run + assert
@@ -228,13 +232,18 @@ cd "$TB/ts-$(git -C "$TB/worktree" rev-parse --abbrev-ref HEAD)-task-1-dead"   #
 if out=$(timeout 20 bash "$SCRIPT" todo.md -t x 2>&1); then rc=0; else rc=$?; fi
 { [ "$rc" != 0 ] && echo "$out" | grep -qi 'not at.*repo root'; } && echo "B4 worktree-guard PASS" || echo "B4 FAIL (rc=$rc): $out"
 git -C "$TB/worktree" branch --list '*-task-*-task-*' | grep -q . && echo "B4 FAIL: second-claim branch created"
+
+cd "$TB/untracked"                             # clean repo, but the todo is not in the base tree
+if out=$(timeout 20 bash "$SCRIPT" todo.md -t x 2>&1); then rc=0; else rc=$?; fi
+{ [ "$rc" != 0 ] && echo "$out" | grep -qi 'not tracked'; } && echo "B5 untracked-guard PASS" || echo "B5 FAIL (rc=$rc): $out"
 ```
-- **B PASS** — B1, B2, B3, and B4 all report PASS (non-zero exit + the expected message,
+- **B PASS** — B1, B2, B3, B4, and B5 all report PASS (non-zero exit + the expected message,
   before any claude launch), and no `*-task-*-task-*` branch exists. B3 proves the
   worktree-path assumption is enforced: a subdir launch refuses rather than misfiring
   `../ts-*` paths. B4 proves the same for a launch *inside* a leftover claim worktree, where
   the base branch would otherwise be poisoned to a peer's claim and both instances would take
-  the same todo (BUG-014).
+  the same todo (BUG-014). B5 proves a todo the base branch does not track refuses up front
+  instead of letting every merge be refused for checking zero boxes (BUG-026).
 
 ---
 
