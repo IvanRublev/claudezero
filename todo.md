@@ -10,5 +10,5 @@
 - [x] ISSUE-021 Give each instance's claude session a short unique nickname: `(<id>) <nick> · <activity>`
 - [x] BUG-022 Print the `TOTAL` block on solo runs too, singular heading — its absence today is indistinguishable from a fleet sum that matched nothing
 - [x] BUG-023 Reword the two dojo activities that say `one` checkbox (plus the merge-gate arrival) so a session name reads as a continuing series, not a one-todo run
-- [ ] BUG-026 Refuse a zero-mode launch when the todo is not tracked on the base branch — untracked today means every merge is refused and nothing can ever land
+- [x] BUG-026 Refuse a zero-mode launch when the todo is not tracked on the base branch — untracked today means every merge is refused and nothing can ever land
 - [ ] ISSUE-027 Print the instance nickname next to its id in the execution stats header

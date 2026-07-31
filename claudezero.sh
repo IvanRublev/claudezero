@@ -222,6 +222,10 @@ else
         "$PWD/"*) TODO_PATH="${ABS_PATH#"$PWD"/}" ;;
         *) echo "$PROG: path not under working dir $PWD: $TODO_PATH"; exit 1 ;;
     esac
+    # guardrail: the merge gate diffs the todo against the branch's fork point on the base, so a
+    # todo that is not tracked there (never added, or gitignored — the dirty-tree guard above misses
+    # a gitignored file) makes EVERY merge refuse "newly checks 0 boxes" and nothing can ever land.
+    git cat-file -e "$BASE_BRANCH:$TODO_PATH" 2>/dev/null || { echo "$PROG: '$TODO_PATH' is not tracked on '$BASE_BRANCH' — commit it there first, else every merge is refused and no task can land."; exit 1; }
     PROMPT="$(build_zero_prompt "$TODO_PATH" "$TASK_PROMPT")"
 fi
 
