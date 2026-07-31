@@ -10,7 +10,6 @@ jobs:
   bump:
     runs-on: ubuntu-latest
     steps:
-      # v3 predates upstream's `brew trust` call, so it hits Homebrew::UntrustedTapError; v8 fixed it.
       - uses: dawidd6/action-homebrew-bump-formula@v8
         with:
           # PAT with `repo` scope on the tap repo. Store as an Actions secret.
