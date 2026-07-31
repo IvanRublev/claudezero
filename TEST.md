@@ -527,7 +527,7 @@ grun() { rm -rf "$TG/tx"; mkdir -p "$TG/tx"
 cd "$TG/repo"
 grun ok "$TG/ok.log"
 GC="$(cd "$(git rev-parse --git-common-dir)" && pwd)"
-inst="$(sed -n 's/.*execution stats (instance \([A-Za-z0-9]*\)).*/\1/p' "$TG/ok.log" | head -1)"
+inst="$(sed -n 's/.*execution stats (instance \([A-Za-z0-9]*\) · .*/\1/p' "$TG/ok.log" | head -1)"
 echo "G1 heading       : $(grep -c 'execution stats' "$TG/ok.log")  (want 2 — renamed from 'execution time')"
 echo "G1 report 1      : $(grep -A1 'Tokens:' "$TG/ok.log" | sed -n '1,2p' | tr '\n' '|')"
 echo "G1 report 2      : $(grep -A1 'Tokens:' "$TG/ok.log" | sed -n '4,5p' | tr '\n' '|')"
@@ -668,12 +668,15 @@ echo "H1 want name     : $WANT"
 echo "H1 launches      : $(grep -c '^ARGV:' "$TH/run.log")  (want 3)"
 echo "H1 named+unsplit : $(grep -c -F -- "[--name] [$WANT]" "$TH/run.log")  (want 3)"
 echo "H1 nick in list  : $(printf '%s\n' "${NICKS[@]}" | grep -qxF "$NICK" && echo yes || echo NO)"
+echo "H1 header nick   : $(grep -qF "execution stats (instance $ID · $NICK)" "$TH/run.log" && echo yes || echo NO)"
 echo "H1 name released : $(ls "$GCH/instance" 2>/dev/null | wc -l | tr -d ' ')  (want 0 — marker gone on exit)"
 ```
 - **H1 PASS** — `launches = 3` and `named+unsplit = 3`: `--name` carries the parenthesised,
   space-containing name as a single argv element, the activity is the one the id selects by
   `16#<first two chars> % 10`, the nickname sits between id and activity, and all three restarts
-  used the same name. `nick in list = yes` (one of the fifteen, lowercase) and
+  used the same name. `nick in list = yes` (one of the fifteen, lowercase),
+  `header nick = yes` — the execution-stats header reads `(instance <id> · <nick>)` with the same
+  nickname the session name carries, so a report and a terminal title can be matched by word — and
   `name released = 0` — the exiting instance unlinked its marker, so its nickname is free again.
 
 ### H2 — loop mode named too; decimal (`$$`-shaped) id picks an activity, not an error

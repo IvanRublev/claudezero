@@ -33,6 +33,9 @@ All notable changes to ClaudeZero are documented here. Format follows
   peer steals it.
 - The report heading is "execution stats", not "execution time" — a token block
   is not a duration. The aggregate Claude-loops timing is gone.
+- The execution-stats header carries the instance nickname next to its id
+  (`instance a1b2c3d4 · moss`), so a report in a scrollback matches the terminal
+  title it came from without reading eight hex characters.
 
 ### Fixed
 
