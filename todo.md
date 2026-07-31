@@ -14,4 +14,4 @@
 - [x] BUG-025 Source fd 4 from a dup of stdin instead of `/dev/tty` — a descriptor opened from the clone device is not kqueue-registrable on macOS, so a piped run kills claude at startup with `EINVAL … kqueue`
 - [x] BUG-026 Refuse a zero-mode launch when the todo is not tracked on the base branch — untracked today means every merge is refused and nothing can ever land
 - [x] ISSUE-027 Print the instance nickname next to its id in the execution stats header
-- [ ] ISSUE-028 Show the script version on its own line below the usage heading in `--help`
+- [x] ISSUE-028 Show the script version on its own line below the usage heading in `--help`
