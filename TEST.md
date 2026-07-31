@@ -87,9 +87,10 @@ chmod +x "$1"; }
 
 ---
 
-## Scenario S — static check (shellcheck)   (no claude)
+## Scenario S — static checks (shellcheck + bash 3.2 syntax)   (no claude)
 
-Lints claudezero.sh (S1) **and the scripts it emits at runtime** (S2). The emitted
+Lints claudezero.sh (S1) **and the scripts it emits at runtime** (S2), then parses the
+script with stock macOS bash (S3). The emitted
 scripts live in single-quoted heredocs, invisible to a lint of claudezero.sh — that
 blind spot once shipped an unbalanced quote in `zero.sh`. `CLAUDEZERO_TEST_EMIT=1`
 runs init for real in a throwaway repo (writes the scripts, exits before claude), then
@@ -116,7 +117,20 @@ else
   echo "S SKIP — shellcheck not installed"
 fi
 ```
-- **S PASS** — S1 and S2 both PASS (claudezero.sh clean, all three emitted scripts clean).
+
+S3 — bash 3.2 syntax. macOS ships bash 3.2 as `/bin/bash` and that is what a Homebrew
+install runs, but bash 3.2 has parse-time limits bash 5 does not (a heredoc inside `$(…)`
+is one; it once made the whole script unparsable). Parse-only, no execution.
+
+```sh
+if /bin/bash --version 2>/dev/null | head -1 | grep -q 'version 3\.2'; then
+  /bin/bash -n "$SCRIPT" && echo "S3 PASS — parses under bash 3.2" || echo "S3 FAIL — errors above"
+else
+  echo "S3 SKIP — /bin/bash is not 3.2 (not macOS)"
+fi
+```
+- **S PASS** — S1 and S2 both PASS (claudezero.sh clean, all three emitted scripts clean),
+  and S3 PASS or SKIP.
 
 ---
 

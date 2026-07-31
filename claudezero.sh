@@ -978,7 +978,10 @@ DRIVER_EOF
 
     # single-quoted heredoc keeps $wt/backticks literal; inject params via bash replace (safe for
     # arbitrary @@LOOPPROMPT@@ text — no sed metachar/delimiter escaping).
-    local prompt; prompt=$(cat <<'PROMPT_EOF'
+    # `read -d ''` not `$(cat <<EOF)`: bash 3.2 (stock macOS) cannot parse a heredoc inside a
+    # command substitution. It exits 1 at EOF, hence `|| :`.
+    local prompt
+    IFS= read -r -d '' prompt <<'PROMPT_EOF' || :
 /loop @@LOOP_INTERVAL@@
 
 You are ONE of many independent Claude instances zeroing tasks from @@TODO@@ in PARALLEL.
@@ -1044,7 +1047,7 @@ Keep these facts in mind for every iteration:
 3. If every task in @@TODO@@ is now checked → announce "ALL TASKS DONE" and stop the loop: end this
    pass WITHOUT scheduling the next iteration. Otherwise end this pass and let the scheduled loop re-fire.
 PROMPT_EOF
-)
+    prompt=${prompt%$'\n'}          # read keeps the final newline; $(cat) stripped it
     prompt=${prompt//@@TODO@@/$todo}
     prompt=${prompt//@@BASE_BRANCH@@/$BASE_BRANCH}
     prompt=${prompt//@@LOOP_INTERVAL@@/$LOOP_INTERVAL}
