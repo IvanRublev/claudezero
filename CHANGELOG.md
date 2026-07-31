@@ -48,6 +48,9 @@ All notable changes to ClaudeZero are documented here. Format follows
   matched no files because the base slug was not what you thought.
 - Three dojo activities no longer claim a single unit of work, which read as a
   ceiling the instance does not have.
+- The script parses under bash 3.2, the `/bin/bash` macOS ships. The zero
+  prompt's heredoc sat inside a command substitution, which bash 3.2 cannot
+  parse, so every macOS run died before doing anything (BUG-024).
 
 ## [0.0.14] — 2026-07-26
 
