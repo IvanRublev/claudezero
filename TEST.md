@@ -862,12 +862,25 @@ echo "J1 no registry   : $(ls "$TJ/repo/.git" | grep -cE '^(fleet|total)-')  (wa
   (the `requestId` appeared on three lines and the nested `iterations[]`/`ephemeral_*` copies
   were ignored), and `no registry = 0`.
 
-### J2 — solo run prints no TOTAL; unreadable peer files degrade, never lie
+### J2 — solo run prints a singular TOTAL; unreadable peer files degrade, never lie
 ```bash
 cd "$TJ/repo"
-printf '#!/usr/bin/env bash\nexit 0\n' > "$TJ/bin/claude"       # no peers fabricated
+cat > "$TJ/bin/claude" <<'EOF'                                  # no peers: this run's own id only
+#!/usr/bin/env bash
+GC="$(cd "$(git rev-parse --git-common-dir)" && pwd)"; tr="$GC/tx-solo.jsonl"
+printf '{"requestId":"req_S","message":{"usage":{"input_tokens":70,"output_tokens":30,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}}}\n' > "$tr"
+printf '%s\n' "$tr" > "$CLAUDEZERO_TRANSCRIPTS"   # the hook's job, done by hand: one id on disk
+exit 0
+EOF
+chmod +x "$TJ/bin/claude"
 PATH="$TJ/bin:$PATH" timeout 40 env CLAUDEZERO_MAX_LOOPS=1 bash "$SCRIPT" todo.md -t x > "$TJ/solo.log" 2>&1 || true
-echo "J2 solo TOTAL    : $(grep -c '❄ TOTAL' "$TJ/solo.log")  (want 0 — one id, the total would restate the block above)"
+echo "J2 solo TOTAL    : $(grep -c '❄ TOTAL' "$TJ/solo.log")  (want 1 — one id still gets the block; the heading names the count)"
+echo "J2 solo heading  : $(grep -o '❄ TOTAL (1 instance)' "$TJ/solo.log")  (want '❄ TOTAL (1 instance)' — singular)"
+echo "J2 solo figures  : $(sed -n '/❄ TOTAL/,$p' "$TJ/solo.log" | grep -cE '0s  ·  0 completed|Tokens: 100 Total|in 70 · out 30 · cache write 0 · cache read 0')  (want 3 — each equals the per-instance block above)"
+echo "J2 solo run loop : $(sed -n '/❄ TOTAL/,$p' "$TJ/solo.log" | grep -c 'ClaudeZero run loop:')  (want 0 — summed wall times are not a duration)"
+printf '#!/usr/bin/env bash\nexit 0\n' > "$TJ/bin/claude"       # writes nothing: zero ids on disk
+PATH="$TJ/bin:$PATH" timeout 40 env CLAUDEZERO_MAX_LOOPS=1 bash "$SCRIPT" todo.md -t x > "$TJ/none.log" 2>&1 || true
+echo "J2 no-files TOTAL: $(grep -c '❄ TOTAL' "$TJ/none.log")  (want 0 — n=0 stays silent, the guard is -ge 1 not -ge 0)"
 cat > "$TJ/bin/claude" <<'EOF'
 #!/usr/bin/env bash
 GC="$(cd "$(git rev-parse --git-common-dir)" && pwd)"
@@ -881,7 +894,9 @@ echo "J2 degrade exit  : $?  (want 0)"
 echo "J2 degrade TOTAL : $(sed -n '/❄ TOTAL/,$p' "$TJ/degrade.log" | grep -cE '0s  ·  0 completed|Tokens: n/a')  (want 2 — zeroed todos row + n/a tokens)"
 echo "J2 loop mode     : $(PATH="$TJ/bin:$PATH" timeout 40 env CLAUDEZERO_MAX_LOOPS=1 bash "$SCRIPT" -l hi 2>&1 | sed -n '/❄ TOTAL/,$p' | grep -c 'Todos:')  (want 0 — token rows only)"
 ```
-- **J2 PASS** — `solo TOTAL = 0`, `degrade exit = 0` with `degrade TOTAL = 2` (a garbled counter
+- **J2 PASS** — `solo TOTAL = 1` with the singular heading, `solo figures = 3`,
+  `solo run loop = 0` and `no-files TOTAL = 0`,
+  `degrade exit = 0` with `degrade TOTAL = 2` (a garbled counter
   contributes 0 and a missing transcript degrades to `Tokens: n/a`), and `loop mode = 0` todo
   rows in the TOTAL block.
 
