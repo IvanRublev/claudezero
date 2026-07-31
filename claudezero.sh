@@ -43,7 +43,7 @@ usage: @@PROG@@ [todo-file-path] [-t|--taskprompt TEXT | -l|--loopprompt TEXT]
 
   Log a run (ClaudeZero's own output only; claude's TUI stays on the terminal):
 
-    @@PROG@@ issues/todo.md 2>&1 | { trap '' INT; tee run.log; }
+    @@PROG@@ issues/todo.md 2>&1 | { trap '' INT; tee ../run.log; }
 
   The `trap` keeps tee alive through Ctrl+C so the final report lands in the file.
 USAGE
@@ -105,11 +105,13 @@ run_loop() {
 # CLAUDEZERO_MAX_LOOPS: exit after N iterations instead of looping until Ctrl+C. 0/unset =
 # unlimited (normal). Set >0 for tests so the loop self-terminates without a SIGINT.
 MAX_LOOPS="${CLAUDEZERO_MAX_LOOPS:-0}"
-# fd 4 = where claude's own chatter goes. Redirected stdout + a terminal present → claude keeps
-# writing to the terminal, so piping claudezero.sh to a log file records the ❄ reports, not the TUI.
-# No redirect, or no controlling terminal (tests, CI, nohup) → fd 4 is plain stdout, as today.
-# Probe in a subshell: a failed `exec` redirection is shell-fatal, not testable.
-if [ ! -t 1 ] && (: >/dev/tty) 2>/dev/null; then exec 4>/dev/tty; else exec 4>&1; fi
+# fd 4 = where claude's own chatter goes. Redirected stdout + stdin still on the terminal → claude
+# keeps writing to the terminal, so piping claudezero.sh to a log file records the ❄ reports, not
+# the TUI. No redirect, or stdin not a terminal (tests, CI, nohup) → fd 4 is plain stdout, as today.
+# Dup stdin rather than open /dev/tty: on macOS a descriptor opened from the /dev/tty clone device
+# is not kqueue-registrable, and claude dies at startup with `EINVAL … kqueue`. The tty stdin the
+# shell was handed is a real terminal fd, opened read-write, so it takes writes and kqueue both.
+if [ ! -t 1 ] && [ -t 0 ]; then exec 4>&0; else exec 4>&1; fi
 LOOP_COUNT=0
 STOP=0                    # set by the INT trap; the loop breaks to the closer below
 TODOS_BASE=$(read_counter "${TODOS_TIME_FILE:-}")   # snapshot: report only THIS run's slice of the shared aggregates

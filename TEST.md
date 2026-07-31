@@ -574,9 +574,9 @@ echo "G2 timing kept  : $(grep -c 'ClaudeZero run loop:' "$TG/bad.log")  (want 2
 ## Scenario G — claude's output descriptor (fd 4)   `[$TESTROOT/G]`   (stub claude, deterministic)
 
 claude writes to fd 4 so `claudezero.sh … | tee run.log` logs the `❄` reports without the
-TUI. Only the *fallback* is deterministic here: with output captured to a file there is no
-controlling terminal, so fd 4 must fall back to plain stdout and the stub's bytes must still
-appear in the captured stream. The split itself needs a pty — manual check below.
+TUI. Only the *fallback* is deterministic here: with stdin off the terminal there is no tty to
+split to, so fd 4 must fall back to plain stdout and the stub's bytes must still appear in the
+captured stream. The split itself needs a pty — manual check below.
 
 ### Setup + assert
 ```bash
@@ -590,36 +590,29 @@ chmod +x "$TG/bin/claude"
 cd "$TG/repo"
 git init -q -b main; git config user.email t@t.t; git config user.name test
 printf -- '- [ ] G1 x\n' > todo.md; git add -A; git commit -qm init
-# run as a session leader so there is genuinely no controlling terminal (macOS has no setsid)
-detach() {
-  if command -v setsid >/dev/null 2>&1; then setsid "$@"
-  elif command -v python3 >/dev/null 2>&1; then
-    python3 -c 'import os,sys; os.setsid(); os.execvp(sys.argv[1], sys.argv[1:])' "$@"
-  else echo "G1 SKIP — neither setsid nor python3 available to drop the controlling terminal" >&2; fi
-}
-detach env PATH="$TG/bin:$PATH" CLAUDEZERO_MAX_LOOPS=1 \
-  timeout 30 bash "$SCRIPT" todo.md -t x > "$TG/run.log" 2>&1 || true
+# stdin off the terminal: fd 4 has no tty to split to and must fall back to stdout
+env PATH="$TG/bin:$PATH" CLAUDEZERO_MAX_LOOPS=1 \
+  timeout 30 bash "$SCRIPT" todo.md -t x > "$TG/run.log" 2>&1 < /dev/null || true
 echo "G1 stub output kept : $(grep -c 'STUB-CLAUDE-MARKER' "$TG/run.log")  (want 1 — fd 4 fell back to stdout)"
 echo "G1 own output kept  : $(grep -c '❄ ClaudeZero' "$TG/run.log")  (want >=1)"
 ```
-- **G1 PASS** — both counts as stated: with no controlling terminal the `(: >/dev/tty)` probe
-  fails, fd 4 is a dup of stdout, and no scenario that captures output loses stub-claude bytes.
-  Detaching explicitly matters — run from a terminal without `detach`, the probe succeeds and
-  the stub's bytes go to the terminal by design, which is the whole point of the split.
+- **G1 PASS** — both counts as stated: with stdin not a terminal the `[ -t 0 ]` probe fails,
+  fd 4 is a dup of stdout, and no scenario that captures output loses stub-claude bytes.
+  Redirecting stdin explicitly matters — run from a terminal without `< /dev/null`, the probe
+  succeeds and the stub's bytes go to the terminal by design, which is the whole point of the split.
 
-### G2 — the split itself (manual, needs a pty)
+### G2 — the split itself (manual, needs a terminal)
 
-Not scripted: it needs a real terminal, and the two `script(1)` implementations take
-opposite argument orders. Run one of these by hand in a scratch repo with a real `claude`:
+Not scripted: it needs a real terminal and a real `claude`. Since fd 4 is a dup of stdin, no
+`script(1)` wrapper is needed — run the documented pipe form by hand in a scratch repo:
 
 ```bash
-# macOS / BSD script — typescript to /dev/null; script's own stdout is the pipe
-script -q /dev/null ./claudezero.sh issues/todo.md 2>&1 | { trap '' INT; tee run.log; }
-# util-linux script — command via -c, typescript file last
-script -q -c "./claudezero.sh issues/todo.md 2>&1" /dev/null | { trap '' INT; tee run.log; }
+./claudezero.sh issues/todo.md 2>&1 | { trap '' INT; tee run.log; }
 ```
-`script` gives claudezero a pty (so `/dev/tty` opens) while its stdout is the pipe (so fd 1 is
-not a tty) — exactly the operator's situation.
+Stdin is the terminal (so `[ -t 0 ]` holds) and stdout is the pipe (so fd 1 is not a tty) —
+exactly the operator's situation. This is also the macOS regression check this descriptor choice
+exists for: a real `claude` must reach its prompt instead of dying with `EINVAL … kqueue`, which
+is what a fresh open of `/dev/tty` on fd 4 caused.
 - **G2 PASS** — `run.log` holds the `❄` banner, reports, and loop notices and no TUI frames
   (`grep -c $'\033' run.log` is `0`), the terminal shows both streams, and pressing Ctrl+C in
   the between-runs gap still lands the closing report in `run.log`.
@@ -653,14 +646,9 @@ ACT=('drilling the fork-implement-merge kata' 'hauling snow buckets uphill' \
      'starting over on fresh snow' 'carving checkbox after checkbox into ice' 'hunting the next box on the list' \
      'practicing one clean strike per task' "leaving a peer's branch untouched" \
      'walking back to the merge gate')
-# claude's own output goes to fd 4, which falls back to stdout only when there is no controlling
-# terminal — run detached so the stub's ARGV line lands in the capture file (see Scenario G).
-detachH() {
-  if command -v setsid >/dev/null 2>&1; then setsid "$@"
-  elif command -v python3 >/dev/null 2>&1; then
-    python3 -c 'import os,sys; os.setsid(); os.execvp(sys.argv[1], sys.argv[1:])' "$@"
-  else echo "H SKIP — neither setsid nor python3 available to drop the controlling terminal" >&2; fi
-}
+# claude's own output goes to fd 4, which falls back to stdout only when stdin is not a terminal
+# — run with stdin off the tty so the stub's ARGV line lands in the capture file (see Scenario G).
+notty() { "$@" < /dev/null; }
 # the fifteen nicknames, verbatim (claudezero.sh pick_nickname)
 NICKS=(ash bob cleo dax elk finn gus hana ivo jun kit lux moss nix opal)
 GCH="$(cd "$(git rev-parse --git-common-dir)" && pwd)"
@@ -673,7 +661,7 @@ nick_of() { sed -E 's/.*\) (.*) · .*/\1/'; }   # nickname out of a `[--name] [.
 ### H1 — name construction, unsplit argv, restart stability
 ```bash
 cd "$TH/repo"
-detachH env PATH="$TH/bin:$PATH" CLAUDEZERO_MAX_LOOPS=3 \
+notty env PATH="$TH/bin:$PATH" CLAUDEZERO_MAX_LOOPS=3 \
   timeout 90 bash "$SCRIPT" todo.md -t x > "$TH/run.log" 2>&1 || true
 ID=$(grep -m1 -oE 'instance [0-9A-Za-z]+' "$TH/run.log" | awk '{print $2}')
 NICK=$(grep -m1 -oE '\[--name\] \[[^]]*\]' "$TH/run.log" | nick_of)
@@ -696,7 +684,7 @@ echo "H1 name released : $(ls "$GCH/instance" 2>/dev/null | wc -l | tr -d ' ')  
 ### H2 — loop mode named too; decimal (`$$`-shaped) id picks an activity, not an error
 ```bash
 cd "$TH/repo"
-detachH env PATH="$TH/bin:$PATH" CLAUDEZERO_MAX_LOOPS=1 \
+notty env PATH="$TH/bin:$PATH" CLAUDEZERO_MAX_LOOPS=1 \
   timeout 60 bash "$SCRIPT" -l 'hi' > "$TH/loop.log" 2>&1 || true
 echo "H2 loop-mode name: $(grep -m1 -oE '\[--name\] \[[^]]*\]' "$TH/loop.log" || echo NONE)"
 # the $$ fallback id is decimal digits — valid hex, so the same derivation applies with no
@@ -713,8 +701,8 @@ echo "H2 a1 vs b2      : $([ "$(dojo_student a1b2c3d4)" != "$(dojo_student b2b2c
 ### H3 — two instances launched at the same moment draw different nicknames
 ```bash
 cd "$TH/repo"; rm -rf "$GCH/instance"
-detachH env PATH="$TH/bin:$PATH" CLAUDEZERO_MAX_LOOPS=1 timeout 90 bash "$SCRIPT" todo.md -t x > "$TH/a.log" 2>&1 &
-detachH env PATH="$TH/bin:$PATH" CLAUDEZERO_MAX_LOOPS=1 timeout 90 bash "$SCRIPT" todo.md -t x > "$TH/b.log" 2>&1 &
+notty env PATH="$TH/bin:$PATH" CLAUDEZERO_MAX_LOOPS=1 timeout 90 bash "$SCRIPT" todo.md -t x > "$TH/a.log" 2>&1 &
+notty env PATH="$TH/bin:$PATH" CLAUDEZERO_MAX_LOOPS=1 timeout 90 bash "$SCRIPT" todo.md -t x > "$TH/b.log" 2>&1 &
 wait
 NA=$(grep -m1 -oE '\[--name\] \[[^]]*\]' "$TH/a.log" | nick_of)
 NB=$(grep -m1 -oE '\[--name\] \[[^]]*\]' "$TH/b.log" | nick_of)
@@ -728,18 +716,18 @@ echo "H3 differ        : $([ -n "$NA" ] && [ "$NA" != "$NB" ] && echo yes || ech
 ```bash
 cd "$TH/repo"
 rm -rf "$GCH/instance"; i=0; for n in "${NICKS[@]}"; do [ "$n" = moss ] || mkpeer "$n" $((i++)); done
-detachH env PATH="$TH/bin:$PATH" CLAUDEZERO_MAX_LOOPS=1 timeout 90 bash "$SCRIPT" todo.md -t x > "$TH/c.log" 2>&1 || true
+notty env PATH="$TH/bin:$PATH" CLAUDEZERO_MAX_LOOPS=1 timeout 90 bash "$SCRIPT" todo.md -t x > "$TH/c.log" 2>&1 || true
 echo "H4 fourteen held : $(grep -m1 -oE '\[--name\] \[[^]]*\]' "$TH/c.log" | nick_of)  (want moss)"
 rm -rf "$GCH/instance"; i=0; for n in "${NICKS[@]}"; do mkpeer "$n" $((i++)); done
-detachH env PATH="$TH/bin:$PATH" CLAUDEZERO_MAX_LOOPS=1 timeout 90 bash "$SCRIPT" todo.md -t x > "$TH/d.log" 2>&1 || true
+notty env PATH="$TH/bin:$PATH" CLAUDEZERO_MAX_LOOPS=1 timeout 90 bash "$SCRIPT" todo.md -t x > "$TH/d.log" 2>&1 || true
 echo "H4 all fifteen   : $(grep -m1 -oE '\[--name\] \[[^]]*\]' "$TH/d.log" | nick_of)  (want '<name> 1')"
 rm -rf "$GCH/instance"; i=0; for n in "${NICKS[@]}"; do mkpeer "$n" $((i++)); mkpeer "$n 1" $((i++)); done
-detachH env PATH="$TH/bin:$PATH" CLAUDEZERO_MAX_LOOPS=1 timeout 90 bash "$SCRIPT" todo.md -t x > "$TH/e.log" 2>&1 || true
+notty env PATH="$TH/bin:$PATH" CLAUDEZERO_MAX_LOOPS=1 timeout 90 bash "$SCRIPT" todo.md -t x > "$TH/e.log" 2>&1 || true
 echo "H4 both levels   : $(grep -m1 -oE '\[--name\] \[[^]]*\]' "$TH/e.log" | nick_of)  (want '<name> 2')"
 # crashed peer: a marker whose pid is dead still names moss — the startup GC unlinks it first
 rm -rf "$GCH/instance"; mkdir -p "$GCH/instance"; printf '999999\ndead\nmoss\n' > "$GCH/instance/crashed"
 i=0; for n in "${NICKS[@]}"; do [ "$n" = moss ] || mkpeer "$n" $((i++)); done
-detachH env PATH="$TH/bin:$PATH" CLAUDEZERO_MAX_LOOPS=1 timeout 90 bash "$SCRIPT" todo.md -t x > "$TH/f.log" 2>&1 || true
+notty env PATH="$TH/bin:$PATH" CLAUDEZERO_MAX_LOOPS=1 timeout 90 bash "$SCRIPT" todo.md -t x > "$TH/f.log" 2>&1 || true
 echo "H4 crashed freed : $(grep -m1 -oE '\[--name\] \[[^]]*\]' "$TH/f.log" | nick_of)  (want moss)"
 rm -rf "$GCH/instance"
 ```
