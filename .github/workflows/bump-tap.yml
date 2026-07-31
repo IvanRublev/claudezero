@@ -10,14 +10,16 @@ jobs:
   bump:
     runs-on: ubuntu-latest
     steps:
-      - uses: dawidd6/action-homebrew-bump-formula@v3
+      # v3 predates upstream's `brew trust` call, so it hits Homebrew::UntrustedTapError; v8 fixed it.
+      - uses: dawidd6/action-homebrew-bump-formula@v8
         with:
           # PAT with `repo` scope on the tap repo. Store as an Actions secret.
           token: ${{ secrets.TAP_TOKEN }}
           tap: IvanRublev/homebrew-tap
           formula: claudezero
+          # Push branch directly to the tap repo instead of forking (token needs write access there).
+          no_fork: true
           # No release payload on a tag push — name the tag and commit explicitly.
           tag: ${{ github.ref_name }}
           revision: ${{ github.sha }}
-          # Opens a PR on the tap by default. Add `push: true` to commit direct.
-          push: true
+          # Opens a PR on the tap (no direct-push mode exists for this action).
