@@ -409,11 +409,14 @@ print_report() {
 # the new one, never a torn line. No baseline: per-instance files are created fresh under a new
 # INSTANCE_ID each launch and dead runs' files are GC'd at startup, so what is on disk IS this run;
 # subtracting a startup snapshot would under-report peers that started earlier. A crashed peer's
-# files are summed too — its merged todos did land. Solo run prints nothing: with one id the total
-# just restates the block above it. `ClaudeZero run loop:` is omitted — instances' wall times
-# overlap, so their sum is not a duration anything took.
+# files are summed too — its merged todos did land. A solo run prints the block as well: its figures
+# restate the block above, but the heading carries the instance count, which nothing else prints and
+# which is worth most when it reads 1 — that is the case an absent block cannot be told apart from a
+# sum that matched no files (BUG-022). Zero ids stays silent, so absence keeps one meaning.
+# `ClaudeZero run loop:` is omitted — instances' wall times overlap, so their sum is not a duration
+# anything took.
 print_fleet_total() {
-  local gc slug pre f id ids="" n=0 secs=0 done_n=0 t any=0 ti=0 to=0 tcc=0 tcr=0 tt=0
+  local gc slug pre f id ids="" n=0 secs=0 done_n=0 t any=0 ti=0 to=0 tcc=0 tcr=0 tt=0 plural=s
   gc="$(cd "$(git rev-parse --git-common-dir)" 2>/dev/null && pwd)" || return 0
   [ -n "$gc" ] || return 0
   slug="${BASE_BRANCH//\//-}"
@@ -426,7 +429,8 @@ print_fleet_total() {
       ids="$ids $id"; n=$((n+1))
     done
   done
-  [ "$n" -gt 1 ] || return 0
+  [ "$n" -ge 1 ] || return 0    # n=0: no files for this slug — stay silent, absence means only that
+  if [ "$n" -eq 1 ]; then plural=""; fi
   for id in $ids; do
     secs=$((   secs   + $(read_counter "$gc/todos-seconds-$slug-$id") ))
     done_n=$(( done_n + $(read_counter "$gc/todos-done-$slug-$id") ))
@@ -436,7 +440,7 @@ print_fleet_total() {
     if [ "$#" -eq 5 ]; then any=1; ti=$((ti+$1)); to=$((to+$2)); tcc=$((tcc+$3)); tcr=$((tcr+$4)); tt=$((tt+$5)); fi
   done
   printf '\n-----------------------------------------------\n'
-  printf '❄ TOTAL (%s instances)\n' "$n"
+  printf '❄ TOTAL (%s instance%s)\n' "$n" "$plural"
   if [ "${MODE:-}" = zero ]; then
     printf '  %-20s %s  ·  %s completed\n' 'Todos:' "$(fmt_dur "$secs")" "$done_n"
   fi
