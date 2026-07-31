@@ -55,6 +55,10 @@ All notable changes to ClaudeZero are documented here. Format follows
   with `EINVAL … kqueue`. fd 4 is a dup of stdin, not a fresh open of `/dev/tty`
   — a descriptor from the clone device cannot be registered with kqueue
   (BUG-025).
+- A zero-mode launch whose todo file is not tracked on the base branch is
+  refused at startup. Untracked — never added, or gitignored — means every merge
+  is refused, so the run would burn tokens on work that can never land
+  (BUG-026).
 
 ## [0.0.14] — 2026-07-26
 

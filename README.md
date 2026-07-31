@@ -35,11 +35,12 @@ Runs [`claude`](https://claude.com/product/claude-code) on a predefined prompt i
 - **Parallel by default** — run many instances at once; they coordinate via git worktrees, each claiming todos the others haven't taken.
 - **Safe merges** — cross-instance merge-back serialized through `flock`; no races, no corrupted base.
 - **Crash resilient** — if a `claude` crashes or is killed mid-task, its half-done work isn't lost. The next instance to come by — a peer switching to its next task, or the same loop restarted — reclaims the branch, finishes it, and merges it back. Work only counts as done once it lands on the base branch and its box is checked there.
+- **Named sessions** — every `claude` session is named `(<instance id>) <nick> · <activity>`, shown in the prompt box, the `/resume` picker and the terminal title. The nickname is a short word no live peer holds, so you can say "kill moss" instead of reading eight hex characters. Both id and nick head the instance's report, and survive context restarts.
 - **Ctrl+C window** — 5s pause between runs to stop cleanly.
 
 ## Quickstart
 
-Change to your repo root with a todo-list file, and make sure the working tree is in a clean state (commit or stash any changes). Then run `claudezero` pointing to your todo-list:
+Change to your repo root with a todo-list file, and make sure the working tree is in a clean state (commit or stash any changes) and the todo file itself is committed on that branch. Then run `claudezero` pointing to your todo-list:
 
 ```
 claudezero todo.md
@@ -56,7 +57,7 @@ Representative zero-mode run (agent output between the markers elided):
 ```console
 $ claudezero todo.md
 
-❄ ClaudeZero 0.0.14
+❄ ClaudeZero 0.0.15
   zero mode · base master · fork → implement → commit → merge
 
 … claude works a task: forks a worktree, implements, commits, merges, ticks its box …
@@ -72,8 +73,17 @@ $ claudezero todo.md
   Tokens: 5.8M Total
   in 2.1k · out 84.3k · cache write 312k · cache read 5.4M
 
+-----------------------------------------------
+❄ TOTAL (3 instances)
+  Todos:               41m 12s  ·  14 completed
+
+  Tokens: 17.4M Total
+  in 6.3k · out 251.9k · cache write 903k · cache read 16.2M
+
 ❄ ClaudeZero surveys the frozen field, and is proud.
 ```
+
+The `TOTAL` block sums every instance of the run on this base branch — a crashed peer counts too, its merged work did land. It prints on solo runs as well, with a singular heading. `ClaudeZero run loop` stays per-instance: parallel wall times overlap, so their sum is not a duration anything took.
 
 ## Install (for the Claude coding agent)
 
@@ -197,6 +207,16 @@ claudezero -h
 ```sh
 CLAUDEZERO_MAX_LOOPS=3 claudezero todo.md
 ```
+
+### Logging a run
+
+`claude`'s TUI is written to fd 4, which stays on the terminal, so a pipe captures only ClaudeZero's own `❄` reports instead of every TUI redraw:
+
+```sh
+claudezero todo.md 2>&1 | { trap '' INT; tee ../run.log; }
+```
+
+The `trap` keeps `tee` alive through Ctrl+C, so the final report and the `TOTAL` block land in the file. Without a redirect — or when stdin is not a terminal — the TUI falls back to stdout as before.
 
 ## Cleanup
 
