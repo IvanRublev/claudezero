@@ -1028,7 +1028,10 @@ Keep these facts in mind for every iteration:
         → skip to the next task_id. The reason is printed on stderr.
       - exit 0   → you OWN task_id; its git worktree is at $wt. Continue to step c.
         Do NOT trust the box in `$wt/@@TODO@@` — the claim already re-checked @@BASE_BRANCH@@.
-   c. IMPLEMENT task_id. Scope every edit to THIS task only before you skip to the next one; never touch
+   c. IMPLEMENT task_id. If task_id's line names an issue/spec file, its acceptance criteria define
+      done for this task — they may span files the task title never mentions: satisfy each and tick
+      it there (`[ ]`→`[x]`) as you land it, never ahead of verifying it.
+      Scope every edit to task_id only before you skip to the next one; never touch
       another task, even one you will process later this same pass (you reach the next task_id
       at step e — this is per-task, not per-session).
       @@LOOPPROMPT@@
