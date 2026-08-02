@@ -33,6 +33,7 @@ Runs [`claude`](https://claude.com/product/claude-code) on a predefined prompt i
 
 - **Guides Claude to zero a todo list unattended** — one task at a time until all are completed, committed, and checkmarked.
 - **Beats context rot** — session Stop hook SIGTERMs `claude` at ~80% of the context window and restarts clean. Fresh context, no quality decay.
+- **One task per session** — `claude` exits once it has zeroed a single todo and the script restarts it, so every task runs on a context isolated from the task before it, which cuts token spend (~20% on a working instance). An instance that has nothing to claim waits in the shell without launching `claude` at all, spending nothing.
 - **Parallel by default** — run many instances at once; they coordinate via git worktrees, each claiming todos the others haven't taken.
 - **Safe merges** — cross-instance merge-back serialized through `flock`; no races, no corrupted base.
 - **Crash resilient** — if `claude` crashes or is killed mid-task, its half-done work isn't lost. The next instance to come by — a peer switching to its next task, or the same loop restarted — reclaims the branch, finishes it, and merges it back. Work only counts as done once it lands on the base branch and its box is checked there.
@@ -164,14 +165,14 @@ Loop engineering has two halves:
 
 ClaudeZero owns the mechanics and leaves the learning to you. It drills the *form* precisely — how to claim, zero, commit, and check off a todo without collision or rot. You bring the *material* — what this codebase's tasks should teach. Sensei drills the kata; you bring the fight.
 
-The kata is a strict per-iteration algorithm every instance runs:
+The kata is a strict algorithm every instance runs, one task per `claude` session:
 
 1. Find & validate — collect tasks; a missing or duplicate id stops the loop.
 2. Judge independence by evidence — blocked only if the body quotably consumes an *unchecked* task's output; adjacency is not a dependency.
 3. Claim & re-check — one task per git worktree (branch = claim), then guard against a peer who already landed it.
 4. Implement & check off — scoped to that task, tick only its box, commit.
 5. Merge serially — on a conflict or over-check, self-heal once, else stop and hand off to the user rather than corrupt the base.
-6. Repeat — next id; when every box is checked, announce done and stop.
+6. End the session — the shell starts a fresh one for the next task, or waits without spending a token while peers hold the rest; when every box is checked, announce done and stop.
 
 ### Closing the loop
 
