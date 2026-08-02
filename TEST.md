@@ -265,7 +265,7 @@ echo "restarts (A/B/C): $(grep -c restarting "$T/log_AGENT_A.txt") $(grep -c res
 echo "instance ids    : $(grep -h -oE 'instance [^)]+' "$T"/log_AGENT_*.txt | sort -u | wc -l | tr -d ' ')"
 echo "report labels   : $(grep -h -cE '  (Todos|ClaudeZero run loop):' "$T"/log_AGENT_A.txt | tr -d ' ')"
 echo "stale loop line : $(grep -h -c 'Claude loops:' "$T"/log_AGENT_A.txt | tr -d ' ')  (want 0)"
-echo "todos counted   : $(awk '/❄ TOTAL/{exit} /Todos:.*· [0-9]+ completed/{l=$0} END{print l}' "$T"/log_AGENT_A.txt)"
+echo "todos counted   : $(awk '/❄ TOTAL/{exit} /Todos:.*·[[:space:]]+[0-9]+ completed/{l=$0} END{print l}' "$T"/log_AGENT_A.txt)"
 echo "TOTAL blocks    : $(grep -h -c '❄ TOTAL' "$T"/log_AGENT_*.txt | paste -sd' ' -)  (want 1 each — exit path)"
 echo "zero.sh wrote files: $(ls "$T"/repo/.git 2>/dev/null | grep -c '^todos-seconds-')"
 echo "zero.sh wrote counts: $(ls "$T"/repo/.git 2>/dev/null | grep -c '^todos-done-')"
@@ -626,12 +626,12 @@ cd "$TG/repo"
 grun ok "$TG/ok.log"
 GC="$(cd "$(git rev-parse --git-common-dir)" && pwd)"
 inst="$(sed -n 's/.*execution stats (instance \([A-Za-z0-9]*\) · .*/\1/p' "$TG/ok.log" | head -1)"
-echo "G1 heading       : $(grep -c 'execution stats' "$TG/ok.log")  (want 2 — renamed from 'execution time')"
+echo "G1 heading       : $(grep -c 'execution stats' "$TG/ok.log")  (want 3 — a report between runs 1|2 and 2|3, plus the closing one)"
 echo "G1 report 1      : $(grep -A1 'Tokens:' "$TG/ok.log" | sed -n '1,2p' | tr '\n' '|')"
 echo "G1 report 2      : $(grep -A1 'Tokens:' "$TG/ok.log" | sed -n '4,5p' | tr '\n' '|')"
 echo "G1 per-instance  : $([ -f "$GC/transcripts-main-$inst" ] && echo yes || echo NO)  (instance $inst)"
 ```
-- **G1 PASS** — `heading = 2`, and the two reports read exactly:
+- **G1 PASS** — `heading = 3`, and the first two reports read exactly:
   - report 1: `  Tokens: 1.7k Total|  in 15 · out 27 · cache write 248 · cache read 1.5k|`
     — `req_A`'s three identical lines counted **once** (10+5 in, 20+7 out), `iterations[]`
     not added on top, and the cache write is `248`, not `496` (leaves not added to parent).
@@ -645,13 +645,13 @@ echo "G1 per-instance  : $([ -f "$GC/transcripts-main-$inst" ] && echo yes || ec
 ```bash
 cd "$TG/repo"
 grun missing "$TG/missing.log"; grun bad "$TG/bad.log"
-echo "G2 missing file : $(grep -c 'Tokens: n/a' "$TG/missing.log")  (want 2)"
-echo "G2 invalid json : $(grep -c 'Tokens: n/a' "$TG/bad.log")  (want 2)"
-echo "G2 timing kept  : $(grep -c 'ClaudeZero run loop:' "$TG/bad.log")  (want 2)"
+echo "G2 missing file : $(grep -c 'Tokens: n/a' "$TG/missing.log")  (want 4 — one per report, plus the fleet TOTAL)"
+echo "G2 invalid json : $(grep -c 'Tokens: n/a' "$TG/bad.log")  (want 4 — one per report, plus the fleet TOTAL)"
+echo "G2 timing kept  : $(grep -c 'ClaudeZero run loop:' "$TG/bad.log")  (want 3 — one per report; TOTAL omits the row, summed wall times are not a duration)"
 ```
-- **G2 PASS** — both runs print `Tokens: n/a` in every report and still print the timing
-  rows: a deleted transcript or a truncated/invalid line degrades to `n/a` and the run
-  completes normally instead of printing a wrong number.
+- **G2 PASS** — both runs print `Tokens: n/a` in every report and in the fleet TOTAL, and
+  still print the timing rows: a deleted transcript or a truncated/invalid line degrades to
+  `n/a` and the run completes normally instead of printing a wrong number.
 
 ---
 
@@ -1136,7 +1136,7 @@ echo "L1 clean code    : $(grep -c 'claude exited with code 0 after 1 runs' "$TL
 ```bash
 cd "$TL/repo"
 echo "L2 argv default  : $(grep -c -- '--debug-file' "$TL/zero.log")  (want 0 — unset is the default and changes nothing)"
-echo "L2 argv shape    : $(grep -c 'ARGV: --settings .* --permission-mode auto --name .* /loop ' "$TL/zero.log")  (want 1 — the pre-existing argv: flags, then the prompt, nothing added)"
+echo "L2 argv shape    : $(grep -c 'ARGV: --settings .* --permission-mode auto --name .* You are ONE of ' "$TL/zero.log")  (want 1 — the pre-existing argv: flags, then the prompt, nothing added)"
 PATH="$TL/bin:$PATH" CLAUDEZERO_DEBUG=1 timeout 60 env CLAUDEZERO_MAX_LOOPS=2 bash "$SCRIPT" todo.md -t x > "$TL/debug.log" 2>&1
 echo "L2 debug exit    : $?  (want 0)"
 echo "L2 argv debug    : $(grep -c -- '--debug-file .*/\.git/debug-main-[0-9A-F]*-[12]\.log' "$TL/debug.log")  (want 2 — <kind>-<base>-<instance>-<loop>, one per invocation)"
@@ -1144,6 +1144,92 @@ echo "L2 distinct paths: $(grep -o -- '--debug-file [^ ]*' "$TL/debug.log" | sor
 ```
 - **L2 PASS** — `argv default = 0` with `argv shape = 1`, and
   `debug exit = 0`, `argv debug = 2`, `distinct paths = 2`.
+
+---
+
+## Scenario M — one task per session, the shell waits   `[$TESTROOT/M]`   (stub claude, deterministic)
+
+The claimable probe moved out of claude and into the shell: nothing left → the closer;
+everything unchecked held by a *live* peer → wait, launching no claude at all; anything free
+(including a crashed peer's branch, which only claude can rescue) → launch. The Stop hook is
+the other half — in zero mode it ends the session at every turn end, so one session zeroes one
+task; in `-l` loop mode only the context-bucket file still ends it.
+
+### Setup
+```bash
+TM="$TESTROOT/M"; mkdir -p "$TM/repo" "$TM/bin"
+cat > "$TM/bin/claude" <<'EOF'
+#!/usr/bin/env bash
+echo launched >> "$STUB_LAUNCHED"
+exit 0
+EOF
+chmod +x "$TM/bin/claude"
+mkdir -p "$TM/owner"; cp "$(command -v bash)" "$TM/owner/claude"   # M4 needs a process `ps -o comm=` reports as 'claude'
+cd "$TM/repo"
+git init -q -b main; git config user.email t@t.t; git config user.name test
+printf -- '- [ ] M1 x\n' > todo.md; git add -A; git commit -qm init
+# a LIVE peer holding M1: claim branch + worktree `.owner` + session marker, exactly what
+# zero.sh's acquire writes and what held_todos reads back.
+sleep 600 & PEER=$!
+git worktree add -q -b main-task-M1 "$TM/wt1" main
+printf '%s\n%s\n%s\n%s\n' "$PEER" "$(ps -o lstart= -p "$PEER" | awk '{$1=$1;print}')" "$(date +%s)" "PEERINST" > "$TM/wt1/.owner"
+mkdir -p "$TM/repo/.git/session"
+printf '%s\n%s\n' "$(ps -o lstart= -p "$PEER" | awk '{$1=$1;print}')" "M1" > "$TM/repo/.git/session/$PEER"
+```
+
+### M1 — every unchecked task peer-held: no claude, plain waiting lines when stdout is not a tty
+```bash
+cd "$TM/repo"
+export STUB_LAUNCHED="$TM/launched"; : > "$STUB_LAUNCHED"
+sleep 600 & DECOY=$!   # stands in for the caller's own session: Claude Code exports CLAUDE_PID
+PATH="$TM/bin:$PATH" CLAUDE_PID=$DECOY timeout 13 env CLAUDEZERO_MAX_LOOPS=1 bash "$SCRIPT" todo.md -t x > "$TM/wait.log" 2>&1
+echo "M1 exit          : $?  (want 124 — still waiting when the timeout fired, never launched)"
+echo "M1 decoy alive   : $(kill -0 $DECOY 2>/dev/null && echo yes || echo no)  (want yes — the TERM trap must never kill an INHERITED CLAUDE_PID; nothing was launched yet)"
+kill "$DECOY" 2>/dev/null; wait "$DECOY" 2>/dev/null || true
+echo "M1 launches      : $(wc -l < "$STUB_LAUNCHED" | tr -d ' ')  (want 0 — no claude process, no transcript, no tokens)"
+echo "M1 waiting line  : $(grep -c 'waiting for a claimable task · 1 held by peers' "$TM/wait.log")  (want >=2 — one plain line per probe)"
+echo "M1 no escapes    : $(LC_ALL=C grep -c $'\r\|\033\[' "$TM/wait.log")  (want 0 — a pipe gets no \r and no cursor moves)"
+```
+- **M1 PASS** — `exit = 124`, `decoy alive = yes`, `launches = 0`, `waiting line >= 2`, `no escapes = 0`.
+
+### M2 — a dead peer's branch is claimable: claude IS launched to rescue it
+```bash
+cd "$TM/repo"
+kill "$PEER" 2>/dev/null; wait "$PEER" 2>/dev/null || true
+: > "$STUB_LAUNCHED"
+PATH="$TM/bin:$PATH" timeout 40 env CLAUDEZERO_MAX_LOOPS=1 bash "$SCRIPT" todo.md -t x > "$TM/rescue.log" 2>&1
+echo "M2 exit          : $?  (want 0)"
+echo "M2 launches      : $(wc -l < "$STUB_LAUNCHED" | tr -d ' ')  (want 1 — held_todos counts only LIVE owners, else a crash parks the fleet forever)"
+echo "M2 no wait line  : $(grep -c 'waiting for a claimable task' "$TM/rescue.log")  (want 0)"
+```
+- **M2 PASS** — `exit = 0`, `launches = 1`, `no wait line = 0`.
+
+### M3 — every box checked: the closer runs, claude never starts
+```bash
+cd "$TM/repo"
+git worktree remove --force "$TM/wt1"; git branch -qD main-task-M1
+printf -- '- [x] M1 x\n' > todo.md; git add -A; git commit -qm done
+: > "$STUB_LAUNCHED"
+PATH="$TM/bin:$PATH" timeout 40 env CLAUDEZERO_MAX_LOOPS=1 bash "$SCRIPT" todo.md -t x > "$TM/done.log" 2>&1
+echo "M3 exit          : $?  (want 0)"
+echo "M3 launches      : $(wc -l < "$STUB_LAUNCHED" | tr -d ' ')  (want 0 — nothing to zero, so nothing to launch)"
+echo "M3 closing report: $(grep -c 'execution stats' "$TM/done.log")  (want >=1 — broke straight to the closer)"
+```
+- **M3 PASS** — `exit = 0`, `launches = 0`, `closing report >= 1`.
+
+### M4 — the Stop hook: ends every zero-mode turn, only context-full in loop mode
+```bash
+cd "$TM/repo"
+CLAUDEZERO_TEST_EMIT=1 bash "$SCRIPT" todo.md -t x > /dev/null 2>&1
+HOOK="$TM/repo/.git/compact-exit-hook.sh"
+run_as_claude(){ CLAUDEZERO_MODE="$1" "$TM/owner/claude" -c 'printf "%s" "$2" | bash "$1" >/dev/null 2>&1; sleep 3' _ "$HOOK" "$2"; echo $?; }
+echo "M4 zero mode     : $(run_as_claude zero '{}')  (want 143 — ordinary turn end SIGTERMs the owning claude)"
+echo "M4 loop mode     : $(run_as_claude loop '{}')  (want 0 — -l has no task boundary, so it is left running)"
+B="${TMPDIR:-/tmp}"; B="${B%/}/claude-context-bucket-czM4"; : > "$B"
+echo "M4 bucket branch : $(run_as_claude loop '{"session_id":"czM4"}')  (want 143 — the context-rot guard is unchanged and still first)"
+rm -f "$B"
+```
+- **M4 PASS** — `zero mode = 143`, `loop mode = 0`, `bucket branch = 143`.
 
 ---
 
