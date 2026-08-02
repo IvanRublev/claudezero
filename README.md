@@ -69,7 +69,7 @@ $ claudezero todo.md
 
 … claude works a task: forks a worktree, implements, commits, merges, ticks its box …
 
-❄ claude exited after 1 runs · restarting in 5s · press Ctrl+C to stop
+❄ claude exited with code 0 after 1 runs · restarting in 5s · press Ctrl+C to stop
 
 … fresh context, next task …
 

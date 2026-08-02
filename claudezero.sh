@@ -140,13 +140,24 @@ reap_dead_sessions   # startup: clear markers left by crashed prior runs before 
 while true; do
     # first prompt submitted straight from the CLI arg. The session Stop hook SIGTERMs claude
     # when context fills; exit 143 is the normal restart path, so swallow it.
+    CLAUDE_ARGS=(--settings "$STOP_SETTINGS" --permission-mode auto --name "$SESSION_NAME")
+    # diagnostic opt-in: a --debug-file on every real run is a standing cost for nobody. One file
+    # per claude invocation, so a restart leaves the hung run's trace intact.
+    if [ -n "${CLAUDEZERO_DEBUG:-}" ]; then
+        CLAUDE_ARGS+=(--debug-file "$DEBUG_FILE_BASE-$((LOOP_COUNT+1)).log")
+    fi
     CLAUDEZERO_INSTANCE="$INSTANCE_ID" CLAUDEZERO_TRANSCRIPTS="$TRANSCRIPTS_FILE" \
-        claude --settings "$STOP_SETTINGS" --permission-mode auto --name "$SESSION_NAME" "$PROMPT" >&4 2>&4 &
+        claude "${CLAUDE_ARGS[@]}" "$PROMPT" >&4 2>&4 &
     CLAUDE_PID=$!
     # backgrounded on purpose: bash defers every trap until a FOREGROUND child exits, so a TERM
     # arriving while claude hangs could never be handled. `wait` IS interruptible — it returns
     # 128+N when a trapped signal fires — so re-enter it until claude is actually gone.
-    until wait "$CLAUDE_PID"; do kill -0 "$CLAUDE_PID" 2>/dev/null || break; done
+    # `$?` after the loop is `break`'s own 0, so claude's status is captured inside the body.
+    CLAUDE_EXIT=0
+    until wait "$CLAUDE_PID"; do
+        CLAUDE_EXIT=$?
+        kill -0 "$CLAUDE_PID" 2>/dev/null || break
+    done
     # claude killed mid-run (Ctrl+C/SIGTERM) can leave the tty in raw mode with ISIG off; then every
     # later Ctrl+C arrives as a 0x03 byte, not a SIGINT, so the INT trap never fires and the loop
     # spins forever restarting claude on a wedged terminal. Restore cooked mode so Ctrl+C signals again.
@@ -158,12 +169,12 @@ while true; do
     # restart sleep — the closer below still prints the report and the fleet TOTAL.
     if [ "$STOP" = 1 ]; then printf '\n❄ run loop stopped\n'; break; fi
     if [ "$MAX_LOOPS" -gt 0 ] && [ "$LOOP_COUNT" -ge "$MAX_LOOPS" ]; then
-        printf '\n❄ claude exited after %s runs · reached CLAUDEZERO_MAX_LOOPS=%s · stopping\n' "$LOOP_COUNT" "$MAX_LOOPS"
+        printf '\n❄ claude exited with code %s after %s runs · reached CLAUDEZERO_MAX_LOOPS=%s · stopping\n' "$CLAUDE_EXIT" "$LOOP_COUNT" "$MAX_LOOPS"
         break
     fi
     print_report "$NOW"
     dojo_wisdom
-    printf '\n❄ claude exited after %s runs · restarting in %ss · press Ctrl+C to stop\n' "$LOOP_COUNT" "$RESTART_WAIT"
+    printf '\n❄ claude exited with code %s after %s runs · restarting in %ss · press Ctrl+C to stop\n' "$CLAUDE_EXIT" "$LOOP_COUNT" "$RESTART_WAIT"
     sleep "$RESTART_WAIT" || true          # SIGINT interrupts sleep and fires the INT trap
     if [ "$STOP" = 1 ]; then printf '\n❄ run loop stopped\n'; break; fi
 done
@@ -267,6 +278,9 @@ TODOS_DONE_FILE="$(cd "$(git rev-parse --git-common-dir)" && pwd)/todos-done-${B
 # this instance's list of claude session transcripts (one path per line, appended by the Stop hook).
 # Namespaced like the time-file so parallel instances never read each other's token figures.
 TRANSCRIPTS_FILE="$(cd "$(git rev-parse --git-common-dir)" && pwd)/transcripts-${BASE_BRANCH//\//-}-$INSTANCE_ID"
+# stem for the opt-in `claude --debug-file` capture (CLAUDEZERO_DEBUG). Same <kind>-<base>-<instance>
+# naming as the files above; run_loop appends the loop number so a restart keeps the earlier trace.
+DEBUG_FILE_BASE="$(cd "$(git rev-parse --git-common-dir)" && pwd)/debug-${BASE_BRANCH//\//-}-$INSTANCE_ID"
 ZERO_SH="$GITDIR_ABS/zero.sh"   # where build_zero_prompt wrote the helper (zero mode only)
 INSTANCE_DIR="$(cd "$(git rev-parse --git-common-dir)" && pwd)/instance"
 

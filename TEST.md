@@ -1074,7 +1074,7 @@ echo "K1 stats         : $(grep -c 'execution stats' "$TK/hang.log")  (want 1 �
 echo "K1 stopped       : $(grep -c 'run loop stopped' "$TK/hang.log")  (want 1)"
 echo "K1 orphans       : $(pgrep -f "$TK/bin/claude" | wc -l | tr -d ' ')  (want 0 — the TERM was forwarded to claude)"
 echo "K1 one TERM trap : $(grep -c '^trap .*TERM$' "$SCRIPT")  (want 1 — a second handler would silently replace this one)"
-echo "K1 backgrounded  : $(grep -c 'name "\$SESSION_NAME" "\$PROMPT" >&4 2>&4 &$' "$SCRIPT")  (want 1 — no foreground launch, no \`|| true\` swallow)"
+echo "K1 backgrounded  : $(grep -c 'claude "\${CLAUDE_ARGS\[@\]}" "\$PROMPT" >&4 2>&4 &$' "$SCRIPT")  (want 1 — no foreground launch, no \`|| true\` swallow)"
 ```
 - **K1 PASS** — `exit = 143`, `stats = 1`, `stopped = 1`, `orphans = 0`,
   `one TERM trap = 1`, `backgrounded = 1`.
@@ -1094,6 +1094,56 @@ echo "K2 restart line  : $(grep -c 'restarting in' "$TK/restart.log")  (want 1)"
 ```
 - **K2 PASS** — `normal exit = 0` with `normal stats = 1`, and
   `restart exit = 0` with `restart runs = 2`, `restart line = 1`.
+
+---
+
+## Scenario L — claude's exit code + `--debug-file`   `[$TESTROOT/L]`   (stub claude, deterministic)
+
+The restart / `MAX_LOOPS`-stop lines carry claude's real exit status, so a hang and a clean
+exit are told apart without re-deriving them from timing. `CLAUDEZERO_DEBUG` is the opt-in:
+set, every claude invocation gets its own `--debug-file`; unset, the argv is byte-identical
+to before. The stub echoes its own argv, which is how the argv claim is checked.
+
+### Setup
+```bash
+TL="$TESTROOT/L"; mkdir -p "$TL/repo" "$TL/bin"
+cat > "$TL/bin/claude" <<'EOF'
+#!/usr/bin/env bash
+printf 'ARGV: %s\n' "$*"
+exit "${STUB_EXIT:-0}"
+EOF
+chmod +x "$TL/bin/claude"
+cd "$TL/repo"
+git init -q -b main; git config user.email t@t.t; git config user.name test
+printf -- '- [ ] L1 x\n' > todo.md; git add -A; git commit -qm init
+```
+
+### L1 — the code is on both lines, and it is claude's own
+```bash
+cd "$TL/repo"
+PATH="$TL/bin:$PATH" STUB_EXIT=7 timeout 60 env CLAUDEZERO_MAX_LOOPS=2 bash "$SCRIPT" todo.md -t x > "$TL/code.log" 2>&1
+echo "L1 exit          : $?  (want 0 — claude's status is reported, not adopted)"
+echo "L1 restart line  : $(grep -c 'claude exited with code 7 after 1 runs · restarting in' "$TL/code.log")  (want 1)"
+echo "L1 stop line     : $(grep -c 'claude exited with code 7 after 2 runs · reached CLAUDEZERO_MAX_LOOPS' "$TL/code.log")  (want 1)"
+echo "L1 no old line   : $(grep -c 'claude exited after' "$TL/code.log")  (want 0 — merged into the same line, not a second one)"
+PATH="$TL/bin:$PATH" timeout 40 env CLAUDEZERO_MAX_LOOPS=1 bash "$SCRIPT" todo.md -t x > "$TL/zero.log" 2>&1
+echo "L1 clean code    : $(grep -c 'claude exited with code 0 after 1 runs' "$TL/zero.log")  (want 1 — an exit-0 stub reads 0, not a stale status)"
+```
+- **L1 PASS** — `exit = 0`, `restart line = 1`, `stop line = 1`, `no old line = 0`,
+  `clean code = 1`.
+
+### L2 — `--debug-file` is opt-in, one file per invocation
+```bash
+cd "$TL/repo"
+echo "L2 argv default  : $(grep -c -- '--debug-file' "$TL/zero.log")  (want 0 — unset is the default and changes nothing)"
+echo "L2 argv shape    : $(grep -c 'ARGV: --settings .* --permission-mode auto --name .* /loop ' "$TL/zero.log")  (want 1 — the pre-existing argv: flags, then the prompt, nothing added)"
+PATH="$TL/bin:$PATH" CLAUDEZERO_DEBUG=1 timeout 60 env CLAUDEZERO_MAX_LOOPS=2 bash "$SCRIPT" todo.md -t x > "$TL/debug.log" 2>&1
+echo "L2 debug exit    : $?  (want 0)"
+echo "L2 argv debug    : $(grep -c -- '--debug-file .*/\.git/debug-main-[0-9A-F]*-[12]\.log' "$TL/debug.log")  (want 2 — <kind>-<base>-<instance>-<loop>, one per invocation)"
+echo "L2 distinct paths: $(grep -o -- '--debug-file [^ ]*' "$TL/debug.log" | sort -u | wc -l | tr -d ' ')  (want 2 — the loop number keeps a restart from truncating run 1's trace)"
+```
+- **L2 PASS** — `argv default = 0` with `argv shape = 1`, and
+  `debug exit = 0`, `argv debug = 2`, `distinct paths = 2`.
 
 ---
 
