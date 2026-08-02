@@ -18,6 +18,8 @@ PROG="$(basename "$0")"   # name shown in usage/errors, from how the script was 
 
 RESTART_WAIT=5       # seconds between claude restarts — the window to press Ctrl+C
 WAIT_TICK=5          # seconds between claimable-task probes while every unchecked task is peer-held
+WATCHDOG_DEFAULT=15m # CLAUDEZERO_WATCHDOG default: how long ONE claude may run before it is killed
+WATCHDOG_GRACE=10    # seconds the watchdog waits after its SIGTERM before escalating to SIGKILL
 
 # The braces around the pipe reader in the logging example are load-bearing — do NOT tidy them
 # into a bare pipe. Ctrl+C signals the whole foreground group; the reader's default SIGINT action
@@ -140,6 +142,14 @@ on_term() {
 }
 trap on_term TERM
 
+WATCHDOG_SECS="$(parse_dur "${CLAUDEZERO_WATCHDOG:-$WATCHDOG_DEFAULT}" || true)"
+WATCHDOG_RAW="${CLAUDEZERO_WATCHDOG:-$WATCHDOG_DEFAULT}"
+if [ -z "$WATCHDOG_SECS" ]; then
+    echo "$PROG: ignoring CLAUDEZERO_WATCHDOG=$WATCHDOG_RAW (want 900, 90s, 15m, 1h, or 0 to disable) — using $WATCHDOG_DEFAULT" >&2
+    WATCHDOG_RAW="$WATCHDOG_DEFAULT"; WATCHDOG_SECS="$(parse_dur "$WATCHDOG_DEFAULT")"
+fi
+WATCHDOG_PID=""      # set per launch by arm_watchdog, cleared by disarm_watchdog
+
 reap_dead_sessions   # startup: clear markers left by crashed prior runs before the first claude
 while true; do
     # zero mode: the SHELL decides whether a claude session is worth starting. Nothing left → the
@@ -160,6 +170,7 @@ while true; do
     CLAUDEZERO_INSTANCE="$INSTANCE_ID" CLAUDEZERO_TRANSCRIPTS="$TRANSCRIPTS_FILE" CLAUDEZERO_MODE="$MODE" \
         claude "${CLAUDE_ARGS[@]}" "$PROMPT" >&4 2>&4 &
     CLAUDE_PID=$!
+    arm_watchdog "$CLAUDE_PID"
     # backgrounded on purpose: bash defers every trap until a FOREGROUND child exits, so a TERM
     # arriving while claude hangs could never be handled. `wait` IS interruptible — it returns
     # 128+N when a trapped signal fires — so re-enter it until claude is actually gone.
@@ -169,6 +180,7 @@ while true; do
         CLAUDE_EXIT=$?
         kill -0 "$CLAUDE_PID" 2>/dev/null || break
     done
+    disarm_watchdog   # claude is gone: retire its timer before the pid can be recycled
     # claude killed mid-run (Ctrl+C/SIGTERM) can leave the tty in raw mode with ISIG off; then every
     # later Ctrl+C arrives as a 0x03 byte, not a SIGINT, so the INT trap never fires and the loop
     # spins forever restarting claude on a wedged terminal. Restore cooked mode so Ctrl+C signals again.
@@ -371,6 +383,56 @@ fmt_dur() {
   if   [ "$s" -ge 3600 ]; then printf '%dh%02dm%02ds' $((s/3600)) $((s%3600/60)) $((s%60))
   elif [ "$s" -ge 60 ];   then printf '%dm%02ds' $((s/60)) $((s%60))
   else                         printf '%ds' "$s"; fi
+}
+
+# parse a CLAUDEZERO_WATCHDOG duration — `900`, `90s`, `15m`, `1h`, or `0` to disable — into
+# seconds on stdout. Garbage prints nothing and returns 1: a mistyped timer must fall back to the
+# default, never silently mean "no watchdog" (0) or "kill at once".
+parse_dur() {
+  local v=$1 n mult=1
+  case "$v" in
+    *s) n=${v%s} ;;
+    *m) n=${v%m}; mult=60 ;;
+    *h) n=${v%h}; mult=3600 ;;
+    *)  n=$v ;;
+  esac
+  case "$n" in ''|*[!0-9]*) return 1;; esac
+  printf '%s' $((n * mult))
+}
+
+# start the timer for the claude at $1 (no-op when the watchdog is disabled). A claude that stops
+# making progress never exits, so the loop would park on it forever — no restart, no report, and
+# nothing to Ctrl+C but the whole run. SIGTERM is what the Stop hook already uses, so the kill lands
+# on the tested restart path; SIGKILL follows for a claude that ignores it. The watchdog names
+# itself on its own console line, so the exit-code line under it is not read as claude's own choice.
+# It counts down in WAIT_TICK naps instead of one long sleep so a claude that exits on its own
+# retires its timer within a tick — an armed sleeper outliving its claude would eventually fire at
+# a pid the OS has since handed to somebody else.
+arm_watchdog() {
+  WATCHDOG_PID=""
+  [ "$WATCHDOG_SECS" -gt 0 ] || return 0
+  local pid=$1
+  {
+    local left=$WATCHDOG_SECS
+    while [ "$left" -gt 0 ] && kill -0 "$pid" 2>/dev/null; do
+      sleep "$WAIT_TICK"; left=$((left - WAIT_TICK))
+    done
+    if kill -0 "$pid" 2>/dev/null; then
+      printf '\n❄ watchdog · claude ran %s without exiting · killing it (CLAUDEZERO_WATCHDOG=%s)\n' \
+        "$(fmt_dur "$WATCHDOG_SECS")" "$WATCHDOG_RAW"
+      kill -TERM "$pid" 2>/dev/null || true
+      sleep "$WATCHDOG_GRACE"
+      kill -KILL "$pid" 2>/dev/null || true
+    fi
+  } &
+  WATCHDOG_PID=$!
+}
+
+# retire the timer the moment claude is reaped, so nothing is left counting down against a dead pid.
+disarm_watchdog() {
+  [ -n "$WATCHDOG_PID" ] || return 0
+  kill "$WATCHDOG_PID" 2>/dev/null || true
+  WATCHDOG_PID=""
 }
 
 # format a token count as 5.8M / 84.3k / 312 — integer arithmetic only (bash 3.2 has no floats).
