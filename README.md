@@ -7,7 +7,7 @@
 Loops Claude until every todo is done, committed, and checked off.<br>
 Restarts the coding session on a fresh context before rot.<br>
 You can spawn multiple instances to parallelize.<br><br>
-It's for Specification-Driven Development and practical <a href="#loop-engineering">Loop engineering</a>.<br>
+It's for practical <a href="#loop-engineering">Loop engineering</a>.<br>
 </h4>
 
 <p align="center">
@@ -149,7 +149,15 @@ GitHub-style Markdown checkboxes, one task per line. Each line carries a **uniqu
 
 ## Loop engineering
 
-[Loop engineering](https://claude.com/blog/getting-started-with-loops) shapes an agent's iteration cycle so it gets *better* across turns, not just runs once. Two halves:
+[Loop engineering](https://claude.com/blog/getting-started-with-loops) shapes an agent's iteration cycle so it gets *better* across turns, not just runs once. It is the outermost of three nested levels — each one only works because the one under it holds:
+
+1. **Spec** — what to build. Expected outputs, constraints, acceptance criteria, done-conditions. The contract everything downstream enforces. Without it the layers above have nothing to check against. Here: the todo file, one task per line, each referencing a separate issue file with the details of the specification.
+2. **Harness** — how to keep the agent on the spec, in two directions. *Feedforward* guides steer before it acts (`CLAUDE.md`, conventions, templates); *feedback* sensors catch after (tests, linters, type checks, review). Feedback alone repeats the same mistakes; feedforward alone never proves it worked. Here: the per-iteration algorithm below, plus whatever guides and checks your repo already has.
+3. **Loop** — who does the prompting. The harness on a timer: self-triggering runs, isolated worktrees, subagents that verify and feed back. You stop prompting turn by turn and start designing the thing that prompts itself. Here: ClaudeZero with `--taskprompt` instruction on how to learn by prompting itself.
+
+Levels 1 and 2 are yours; ClaudeZero supports level 3. Together they steer: when a mistake recurs, you don't only fix the code, you sharpen the spec and/or the harness, and the loop needs you less each pass due to the learning instruction.
+
+Loop engineering has two halves:
 
 1. Mechanics — a durable loop over external state; disposable runs that restart before context rots.
 2. Learning — each turn carries a lesson forward, so the agent stops repeating mistakes.
@@ -174,10 +182,11 @@ ClaudeZero never writes `CLAUDE.md` — the harness stays learning-agnostic, so 
 Bake a reflection step into the task prompt; the lesson lands in a committed `CLAUDE.md`, survives the restart, and reaches peers after their next merge:
 
 ```sh
-claudezero todo.md -t 'Implement the task following your setup.
+claudezero todo.md --taskprompt 'Implement the task following your setup.
 When done, if you learned something that will help future tasks — a gotcha, a
 project convention, a command that worked — append one concise bullet under a
-"## Learnings" heading in CLAUDE.md, and include that edit in the task commit.'
+"## Learnings" heading in the project CLAUDE.md, and include that edit 
+in the task commit.'
 ```
 
 Now "the leopard remembers what the last winter taught him."
