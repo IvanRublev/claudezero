@@ -5,9 +5,9 @@
 <h2 align="center">Todo-list sensei for Claude Code. Zeros your list.</h2>
 <h4 align="center">
 Loops Claude until every todo is done, committed, and checked off.<br>
-Restarts each one on a fresh context before rot.<br>
-You can spawn multiple instances to parallelize.<br>
-It's for practical <a href="#loop-engineering">Loop engineering</a>.<br>
+Restarts the coding session on a fresh context before rot.<br>
+You can spawn multiple instances to parallelize.<br><br>
+It's for Specification-Driven Development and practical <a href="#loop-engineering">Loop engineering</a>.<br>
 </h4>
 
 <p align="center">
