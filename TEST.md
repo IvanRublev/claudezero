@@ -1233,6 +1233,65 @@ rm -f "$B"
 
 ---
 
+## Scenario N — the `CLAUDEZERO_WATCHDOG` timer   `[$TESTROOT/N]`   (stub claude, deterministic)
+
+A claude that stops making progress never exits, so the loop parks on it forever. The watchdog
+is the cutoff: it names itself on its own console line, SIGTERMs claude onto the ordinary
+restart path, and escalates to SIGKILL for a claude that ignores TERM. A claude that exits on
+its own must never see it, and `0` must switch it off.
+
+### Setup
+```bash
+TN="$TESTROOT/N"; mkdir -p "$TN/repo" "$TN/bin"
+cd "$TN/repo"
+git init -q -b main; git config user.email t@t.t; git config user.name test
+printf -- '- [ ] N1 x\n' > todo.md; git add -A; git commit -qm init
+```
+
+### N1 — a hung claude is killed, named, and restarted
+```bash
+cd "$TN/repo"
+printf '#!/usr/bin/env bash\necho "stub hung"\nsleep 1000\n' > "$TN/bin/claude"; chmod +x "$TN/bin/claude"
+PATH="$TN/bin:$PATH" CLAUDEZERO_WATCHDOG=5 timeout 90 env CLAUDEZERO_MAX_LOOPS=2 bash "$SCRIPT" todo.md -t x > "$TN/hang.log" 2>&1
+echo "N1 exit          : $?  (want 0 — the watchdog's kill is a restart, not a failure of the run)"
+echo "N1 watchdog line : $(grep -c '❄ watchdog · claude ran 5s without exiting · killing it (CLAUDEZERO_WATCHDOG=5)' "$TN/hang.log")  (want 2 — its own line, once per hung launch)"
+echo "N1 restart code  : $(grep -c 'claude exited with code 143 after 1 runs · restarting in' "$TN/hang.log")  (want 1 — SIGTERM, so the tested restart path)"
+echo "N1 runs          : $(grep -c 'stub hung' "$TN/hang.log")  (want 2 — the loop went on instead of parking on run 1)"
+echo "N1 orphans       : $(pgrep -f "$TN/bin/claude" | wc -l | tr -d ' ')  (want 0)"
+```
+- **N1 PASS** — `exit = 0`, `watchdog line = 2`, `restart code = 1`, `runs = 2`, `orphans = 0`.
+
+### N2 — a claude that ignores SIGTERM is SIGKILLed
+```bash
+cd "$TN/repo"
+printf '#!/usr/bin/env bash\ntrap "" TERM\necho "stub deaf"\nsleep 1000\n' > "$TN/bin/claude"; chmod +x "$TN/bin/claude"
+PATH="$TN/bin:$PATH" CLAUDEZERO_WATCHDOG=5 timeout 90 env CLAUDEZERO_MAX_LOOPS=1 bash "$SCRIPT" todo.md -t x > "$TN/deaf.log" 2>&1
+echo "N2 exit          : $?  (want 0 — not 124: the timer, not the harness, ended it)"
+echo "N2 kill code     : $(grep -c 'claude exited with code 137 after 1 runs' "$TN/deaf.log")  (want 1 — 128+9, the escalation ~10s after the ignored TERM)"
+echo "N2 orphans       : $(pgrep -f "$TN/bin/claude" | wc -l | tr -d ' ')  (want 0)"
+```
+- **N2 PASS** — `exit = 0`, `kill code = 1`, `orphans = 0`.
+
+### N3 — off by request, silent on a healthy claude, default on a mistyped value
+```bash
+cd "$TN/repo"
+printf '#!/usr/bin/env bash\necho "stub hung"\nsleep 1000\n' > "$TN/bin/claude"; chmod +x "$TN/bin/claude"
+PATH="$TN/bin:$PATH" CLAUDEZERO_WATCHDOG=0 timeout 20 env CLAUDEZERO_MAX_LOOPS=1 bash "$SCRIPT" todo.md -t x > "$TN/off.log" 2>&1
+echo "N3 off exit      : $?  (want 124 — 0 disables the timer, so the hang is left alone)"
+echo "N3 off line      : $(grep -c '❄ watchdog' "$TN/off.log")  (want 0)"
+printf '#!/usr/bin/env bash\necho "stub ran"\nexit 0\n' > "$TN/bin/claude"; chmod +x "$TN/bin/claude"
+PATH="$TN/bin:$PATH" CLAUDEZERO_WATCHDOG=5 timeout 40 env CLAUDEZERO_MAX_LOOPS=1 bash "$SCRIPT" todo.md -t x > "$TN/ok.log" 2>&1
+echo "N3 healthy exit  : $?  (want 0)"
+echo "N3 healthy line  : $(grep -c '❄ watchdog' "$TN/ok.log")  (want 0 — a claude that exits on its own retires its own timer)"
+PATH="$TN/bin:$PATH" CLAUDEZERO_WATCHDOG=15min timeout 40 env CLAUDEZERO_MAX_LOOPS=1 bash "$SCRIPT" todo.md -t x > "$TN/bad.log" 2>&1
+echo "N3 bad exit      : $?  (want 0)"
+echo "N3 bad warning   : $(grep -c 'ignoring CLAUDEZERO_WATCHDOG=15min' "$TN/bad.log")  (want 1 — a typo falls back to the default, never to no watchdog)"
+```
+- **N3 PASS** — `off exit = 124` with `off line = 0`, `healthy exit = 0` with `healthy line = 0`,
+  and `bad exit = 0` with `bad warning = 1`.
+
+---
+
 ## Run all in parallel (optional)
 
 After Section 0 and each Setup, launch the Run blocks together: put A's and C's run
