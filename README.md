@@ -4,9 +4,10 @@
 
 <h2 align="center">Todo-list sensei for Claude Code. Zeros your list.</h2>
 <h4 align="center">
-Loops claude until every todo is done, committed, and checked off.<br>
-Restarts it on a fresh context before rot.<br>
-Spawn many instances to parallelize.
+Loops Claude until every todo is done, committed, and checked off.<br>
+Restarts each one on a fresh context before rot.<br>
+You can spawn multiple instances to parallelize.<br>
+It's for practical <a href="#loop-engineering">Loop engineering</a>.<br>
 </h4>
 
 <p align="center">
@@ -40,13 +41,19 @@ Runs [`claude`](https://claude.com/product/claude-code) on a predefined prompt i
 
 ## Quickstart
 
-Change to your repo root with a todo-list file, and make sure the working tree is in a clean state (commit or stash any changes) and the todo file itself is committed on that branch. Then run `claudezero` pointing to your todo-list:
+```
+brew install IvanRublev/tap/claudezero
+```
+
+Change to your repo root with a todo-list file, and make sure the working tree is in a clean state (commit or stash any changes) and the todo file itself is committed on that branch. 
+
+Then run `claudezero` pointing to your todo-list:
 
 ```
 claudezero todo.md
 ```
 
-Run that command in multiple parallel terminals to work through the todos faster.
+You can run that command in multiple parallel terminals to work through the todos faster.
 
 > ⚠️ ClaudeZero runs `claude` **unattended with permissions auto-approved** and **commits on its own** to the branch you launch it on. Only ever point it at a todo file you wrote or reviewed, on a branch with a clean, committed tree — git is your only undo.
 
