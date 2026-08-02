@@ -1048,6 +1048,55 @@ echo "J2 loop mode     : $(PATH="$TJ/bin:$PATH" timeout 40 env CLAUDEZERO_MAX_LO
 
 ---
 
+## Scenario K — SIGTERM while claude hangs   `[$TESTROOT/K]`   (stub claude, deterministic)
+
+A supervisor / `timeout` / `kill` stopping the run must still land at the closer. The stub
+hangs forever, so the wrapper only survives the TERM if claude is backgrounded and reaped by
+an interruptible `wait` — a foreground child would defer the trap until the KILL. The same
+stub set proves the two paths this must not change: a clean exit still ends 0, and a stub
+exiting 143 (the Stop hook's restart signal) still restarts with `TERMED` unset.
+
+### Setup
+```bash
+TK="$TESTROOT/K"; mkdir -p "$TK/repo" "$TK/bin"
+cd "$TK/repo"
+git init -q -b main; git config user.email t@t.t; git config user.name test
+printf -- '- [ ] K1 x\n' > todo.md; git add -A; git commit -qm init
+```
+
+### K1 — the hang: closer still runs, exit 143, no orphan child
+```bash
+cd "$TK/repo"
+printf '#!/usr/bin/env bash\necho "Execution error"\nsleep 1000\n' > "$TK/bin/claude"; chmod +x "$TK/bin/claude"
+PATH="$TK/bin:$PATH" timeout --preserve-status -k 20 8 env CLAUDEZERO_MAX_LOOPS=1 bash "$SCRIPT" todo.md -t x > "$TK/hang.log" 2>&1
+echo "K1 exit          : $?  (want 143 = 128+15; plain \`timeout\` would report its own 124)"
+echo "K1 stats         : $(grep -c 'execution stats' "$TK/hang.log")  (want 1 — the report the TERM used to eat)"
+echo "K1 stopped       : $(grep -c 'run loop stopped' "$TK/hang.log")  (want 1)"
+echo "K1 orphans       : $(pgrep -f "$TK/bin/claude" | wc -l | tr -d ' ')  (want 0 — the TERM was forwarded to claude)"
+echo "K1 one TERM trap : $(grep -c '^trap .*TERM$' "$SCRIPT")  (want 1 — a second handler would silently replace this one)"
+echo "K1 backgrounded  : $(grep -c 'name "\$SESSION_NAME" "\$PROMPT" >&4 2>&4 &$' "$SCRIPT")  (want 1 — no foreground launch, no \`|| true\` swallow)"
+```
+- **K1 PASS** — `exit = 143`, `stats = 1`, `stopped = 1`, `orphans = 0`,
+  `one TERM trap = 1`, `backgrounded = 1`.
+
+### K2 — the two paths that must not change
+```bash
+cd "$TK/repo"
+printf '#!/usr/bin/env bash\necho "stub ran"\nexit 0\n' > "$TK/bin/claude"; chmod +x "$TK/bin/claude"
+PATH="$TK/bin:$PATH" timeout 40 env CLAUDEZERO_MAX_LOOPS=1 bash "$SCRIPT" todo.md -t x > "$TK/ok.log" 2>&1
+echo "K2 normal exit   : $?  (want 0 — TERMED=0 must not leak a status through set -e)"
+echo "K2 normal stats  : $(grep -c 'execution stats' "$TK/ok.log")  (want 1)"
+printf '#!/usr/bin/env bash\necho "stub run"\nexit 143\n' > "$TK/bin/claude"; chmod +x "$TK/bin/claude"
+PATH="$TK/bin:$PATH" timeout 60 env CLAUDEZERO_MAX_LOOPS=2 bash "$SCRIPT" todo.md -t x > "$TK/restart.log" 2>&1
+echo "K2 restart exit  : $?  (want 0 — claude's own 143 is the Stop hook path, not ours)"
+echo "K2 restart runs  : $(grep -c 'stub run' "$TK/restart.log")  (want 2 — the wait's re-check found it dead and looped)"
+echo "K2 restart line  : $(grep -c 'restarting in' "$TK/restart.log")  (want 1)"
+```
+- **K2 PASS** — `normal exit = 0` with `normal stats = 1`, and
+  `restart exit = 0` with `restart runs = 2`, `restart line = 1`.
+
+---
+
 ## Run all in parallel (optional)
 
 After Section 0 and each Setup, launch the Run blocks together: put A's and C's run

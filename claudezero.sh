@@ -114,7 +114,8 @@ MAX_LOOPS="${CLAUDEZERO_MAX_LOOPS:-0}"
 # shell was handed is a real terminal fd, opened read-write, so it takes writes and kqueue both.
 if [ ! -t 1 ] && [ -t 0 ]; then exec 4>&0; else exec 4>&1; fi
 LOOP_COUNT=0
-STOP=0                    # set by the INT trap; the loop breaks to the closer below
+STOP=0                    # set by the INT/TERM traps; the loop breaks to the closer below
+TERMED=0                  # set by the TERM trap; makes the closer exit 143 instead of 0
 TODOS_BASE=$(read_counter "${TODOS_TIME_FILE:-}")   # snapshot: report only THIS run's slice of the shared aggregates
 TODOS_DONE_BASE=$(read_counter "${TODOS_DONE_FILE:-}")
 LOOP_START=$(date +%s)   # script loop (outer while loop) starts here
@@ -124,12 +125,28 @@ LOOP_START=$(date +%s)   # script loop (outer while loop) starts here
 # the timing vars so the report can read them.
 trap 'STOP=1' INT
 
+# SIGTERM (supervisor shutdown, `timeout`, `kill`) requests the same clean stop, and additionally
+# forwards the signal to claude — a hung child must not outlive us — and records TERMED so the
+# closer can exit 143. Bash keeps one handler per signal, so further TERM work chains into here.
+on_term() {
+    STOP=1
+    TERMED=1
+    [ -n "${CLAUDE_PID:-}" ] && kill -TERM "$CLAUDE_PID" 2>/dev/null
+    return 0
+}
+trap on_term TERM
+
 reap_dead_sessions   # startup: clear markers left by crashed prior runs before the first claude
 while true; do
     # first prompt submitted straight from the CLI arg. The session Stop hook SIGTERMs claude
     # when context fills; exit 143 is the normal restart path, so swallow it.
     CLAUDEZERO_INSTANCE="$INSTANCE_ID" CLAUDEZERO_TRANSCRIPTS="$TRANSCRIPTS_FILE" \
-        claude --settings "$STOP_SETTINGS" --permission-mode auto --name "$SESSION_NAME" "$PROMPT" >&4 2>&4 || true
+        claude --settings "$STOP_SETTINGS" --permission-mode auto --name "$SESSION_NAME" "$PROMPT" >&4 2>&4 &
+    CLAUDE_PID=$!
+    # backgrounded on purpose: bash defers every trap until a FOREGROUND child exits, so a TERM
+    # arriving while claude hangs could never be handled. `wait` IS interruptible — it returns
+    # 128+N when a trapped signal fires — so re-enter it until claude is actually gone.
+    until wait "$CLAUDE_PID"; do kill -0 "$CLAUDE_PID" 2>/dev/null || break; done
     # claude killed mid-run (Ctrl+C/SIGTERM) can leave the tty in raw mode with ISIG off; then every
     # later Ctrl+C arrives as a 0x03 byte, not a SIGINT, so the INT trap never fires and the loop
     # spins forever restarting claude on a wedged terminal. Restore cooked mode so Ctrl+C signals again.
@@ -137,6 +154,9 @@ while true; do
     NOW=$(date +%s)
     LOOP_COUNT=$((LOOP_COUNT+1))
     printf '\n\n'
+    # a stop requested WHILE claude ran (TERM, or INT that reached us) breaks here, not after the
+    # restart sleep — the closer below still prints the report and the fleet TOTAL.
+    if [ "$STOP" = 1 ]; then printf '\n❄ run loop stopped\n'; break; fi
     if [ "$MAX_LOOPS" -gt 0 ] && [ "$LOOP_COUNT" -ge "$MAX_LOOPS" ]; then
         printf '\n❄ claude exited after %s runs · reached CLAUDEZERO_MAX_LOOPS=%s · stopping\n' "$LOOP_COUNT" "$MAX_LOOPS"
         break
@@ -157,6 +177,9 @@ print_report "$(date +%s)"
 print_fleet_total
 if all_todos_done; then dojo_proud; fi
 reap_dead_sessions   # no future acquire will reap this session's marker
+# 128+15: a supervisor can tell "terminated" from "finished". As an `if` — `[ … ] && exit 143`
+# would leak the test's own status 1 through `set -e` on every normal run.
+if [ "$TERMED" = 1 ]; then exit 143; fi
 }
 
 # entrypoint. Resolves the prompt (zero or loop mode), installs the session Stop hook,
