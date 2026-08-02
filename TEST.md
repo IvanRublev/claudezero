@@ -89,8 +89,9 @@ chmod +x "$1"; }
 
 ## Scenario S — static checks (shellcheck + bash 3.2 syntax)   (no claude)
 
-Lints claudezero.sh (S1) **and the scripts it emits at runtime** (S2), then parses the
-script with stock macOS bash (S3). The emitted
+Lints claudezero.sh (S1) **and the scripts it emits at runtime** (S2), then checks the
+bash 3.2 constraint — structurally on any host (S3a) and by a real bash 3.x parse where one
+exists (S3b). The emitted
 scripts live in single-quoted heredocs, invisible to a lint of claudezero.sh — that
 blind spot once shipped an unbalanced quote in `zero.sh`. `CLAUDEZERO_TEST_EMIT=1`
 runs init for real in a throwaway repo (writes the scripts, exits before claude), then
@@ -120,17 +121,100 @@ fi
 
 S3 — bash 3.2 syntax. macOS ships bash 3.2 as `/bin/bash` and that is what a Homebrew
 install runs, but bash 3.2 has parse-time limits bash 5 does not (a heredoc inside `$(…)`
-is one; it once made the whole script unparsable). Parse-only, no execution.
+is one; it once made the whole script unparsable). Parse-only, no execution. Two steps:
+S3a catches the construct on **any** host, S3b runs a real bash 3.x parse where one exists.
+
+S3a — the construct, structurally. A Linux-only CI leg has no bash 3.2 to parse with, so a
+`/bin/bash -n` gate alone goes silent exactly where the bug is easiest to reintroduce. This
+scan is pure text: it tracks quote state, skips comments and here-doc bodies, ignores `$(( ))`
+and `<<<`, and reports any here-doc opened inside a command substitution, by line and
+delimiter. It never SKIPs.
 
 ```sh
-if /bin/bash --version 2>/dev/null | head -1 | grep -q 'version 3\.2'; then
-  /bin/bash -n "$SCRIPT" && echo "S3 PASS — parses under bash 3.2" || echo "S3 FAIL — errors above"
+mkdir -p "$TESTROOT/S"
+cat > "$TESTROOT/S/heredoc-scan.awk" <<'SCAN_EOF'
+{
+  if (await != "") {                       # inside a here-doc body: only the delimiter ends it
+    t = $0; sub(/^[ \t]+/, "", t)
+    if ($0 == await || t == await) await = ""
+    next
+  }
+  n = length($0)
+  for (i = 1; i <= n; i++) {
+    c = substr($0, i, 1)
+    if (sq) { if (c == "'") sq = 0; continue }
+    if (c == "\\") { i++; continue }
+    if (substr($0, i, 3) == "$((") { arith++; i += 2; continue }
+    if (substr($0, i, 2) == "$(")  { stack[++subst] = dq; dq = 0; i += 1; continue }
+    if (c == ")") {
+      if (arith > 0 && substr($0, i+1, 1) == ")") { arith--; i++ }
+      else if (subst > 0) { dq = stack[subst--] }
+      continue
+    }
+    if (dq) { if (c == "\"") dq = 0; continue }
+    if (c == "'") { sq = 1; continue }
+    if (c == "\"") { dq = 1; continue }
+    if (c == "#" && (i == 1 || substr($0, i-1, 1) ~ /[ \t;&|(]/)) break
+    if (substr($0, i, 3) == "<<<") { i += 2; continue }
+    if (substr($0, i, 2) == "<<") {
+      j = i + 2
+      if (substr($0, j, 1) == "-") j++
+      while (substr($0, j, 1) == " ") j++
+      d = ""; q = substr($0, j, 1)
+      if (q == "'" || q == "\"") { j++; while (j <= n && substr($0, j, 1) != q) { d = d substr($0, j, 1); j++ } }
+      else { while (j <= n && substr($0, j, 1) ~ /[A-Za-z0-9_]/) { d = d substr($0, j, 1); j++ } }
+      if (subst > 0) { printf "%s:%d: here-doc <<%s opened inside $( … )\n", FILENAME, FNR, d; bad = 1 }
+      if (d != "") await = d
+      i = j - 1
+      continue
+    }
+  }
+}
+END { exit (bad ? 1 : 0) }
+SCAN_EOF
+SCAN="awk -f $TESTROOT/S/heredoc-scan.awk"
+$SCAN "$SCRIPT" && echo "S3a PASS — no here-doc inside \$( … )" || echo "S3a FAIL — findings above"
+
+# self-test: the scan must FAIL on the pre-fix form, or it is only passing beside the bug.
+# The fix predates this repo's history, so `git show HEAD~1:claudezero.sh` has nothing to
+# catch — rebuild the offending construct from the current script instead.
+sed "s#^    IFS= read -r -d '' prompt <<'PROMPT_EOF' || :#    local prompt=\"\$(cat <<'PROMPT_EOF'#" \
+  "$SCRIPT" > "$TESTROOT/S/unfixed.sh"
+$SCAN "$TESTROOT/S/unfixed.sh" >/dev/null \
+  && echo "S3a SELFTEST FAIL — scan passed the unfixed script" \
+  || echo "S3a SELFTEST PASS — $($SCAN "$TESTROOT/S/unfixed.sh" | head -1)"
+```
+
+S3b — a real bash 3.x parse, where the host has one. Covers the emitted scripts too: they
+are written at runtime, so a bash-3.2 parse error inside `zero.sh` never shows up in a parse
+of `claudezero.sh`. Needs S2 to have emitted them; a no-op if it did not.
+
+```sh
+B3=""
+for c in /bin/bash /usr/local/bin/bash-3.2 /opt/homebrew/bin/bash-3.2; do
+  [ -x "$c" ] && "$c" --version 2>/dev/null | head -1 | grep -q 'version 3\.' && { B3="$c"; break; }
+done
+if [ -z "$B3" ]; then
+  echo "S3b SKIP — no bash 3.x on this host (S3a already covered the construct)"
 else
-  echo "S3 SKIP — /bin/bash is not 3.2 (not macOS)"
+  ver="$("$B3" --version | head -1 | sed -n 's/.*version \([0-9.]*\).*/\1/p')"
+  rc=0; files="$SCRIPT"
+  TS="$TESTROOT/S/repo"
+  if [ -d "$TS/.git" ]; then
+    for f in compact-exit-hook.sh zero.sh checkbox-merge.sh; do
+      [ -f "$TS/.git/$f" ] && files="$files $TS/.git/$f"
+    done
+  else
+    echo "S3b NOTE — S2 did not emit (no shellcheck); parsing claudezero.sh only"
+  fi
+  for f in $files; do "$B3" -n "$f" || rc=1; done
+  n=$(echo $files | wc -w | tr -d ' ')
+  [ "$rc" = 0 ] && echo "S3b PASS — parses under bash $ver ($n file$([ "$n" = 1 ] || echo s))" \
+                || echo "S3b FAIL — errors above (bash $ver)"
 fi
 ```
 - **S PASS** — S1 and S2 both PASS (claudezero.sh clean, all three emitted scripts clean),
-  and S3 PASS or SKIP.
+  S3a PASS with its SELFTEST PASS, and S3b PASS or SKIP.
 
 ---
 
@@ -601,21 +685,69 @@ echo "G1 own output kept  : $(grep -c '❄ ClaudeZero' "$TG/run.log")  (want >=1
   Redirecting stdin explicitly matters — run from a terminal without `< /dev/null`, the probe
   succeeds and the stub's bytes go to the terminal by design, which is the whole point of the split.
 
-### G2 — the split itself (manual, needs a terminal)
+### G2 — the split itself (automated, `script(1)` supplies the pty)
 
-Not scripted: it needs a real terminal and a real `claude`. Since fd 4 is a dup of stdin, no
-`script(1)` wrapper is needed — run the documented pipe form by hand in a scratch repo:
+The operator's situation is stdin on a terminal, stdout on a pipe. `script(1)` allocates a pty
+and logs everything crossing it, so running the documented pipe form under it captures **both**
+sides at once: fd 4 lands in the typescript, ClaudeZero's own stdout in the pipe capture. The
+two `script` argument orders (BSD positional, util-linux `-c`) are picked by a helper, so no
+one has to choose.
+
+```bash
+TG="$TESTROOT/G2"; mkdir -p "$TG/repo" "$TG/bin"
+cat > "$TG/bin/claude" <<'EOF'
+#!/usr/bin/env bash
+if [ -t 0 ]; then a=yes; else a=no; fi
+if [ -t 1 ]; then b=yes; else b=no; fi
+echo "STUB TTY0=$a TTY1=$b"
+printf 'TUI-FRAME \033[1mbold\033[0m\n'
+exit 0
+EOF
+chmod +x "$TG/bin/claude"
+cd "$TG/repo"
+git init -q -b main; git config user.email t@t.t; git config user.name test
+printf -- '- [ ] G2 x\n' > todo.md; git add -A; git commit -qm init
+# BSD `script -q FILE CMD...` vs util-linux `script -q -c CMD FILE` — detect, don't choose.
+pty() { if script --version 2>&1 | grep -qi util-linux
+        then script -qec "$1" "$2"; else script -q "$2" bash -c "$1"; fi; }
+export PATH="$TG/bin:$PATH"     # inherited by the pty child — keeps the command string quote-free
+pty "CLAUDEZERO_MAX_LOOPS=1 bash '$SCRIPT' todo.md -t x 2>&1 | { trap '' INT; tee '$TG/pipe.log'; }" \
+    "$TG/typescript" >/dev/null 2>&1
+tr -d '\r' < "$TG/typescript" > "$TG/tty.log"       # pty writes CRLF; strip before matching
+echo "G2 stub sees ttys : $(grep -o 'STUB TTY0=[a-z]* TTY1=[a-z]*' "$TG/tty.log" | head -1)  (want both yes)"
+echo "G2 TUI on tty     : $(grep -c 'TUI-FRAME' "$TG/tty.log")  (want >=1)"
+echo "G2 TUI not in pipe: $(grep -c 'TUI-FRAME' "$TG/pipe.log")  (want 0)"
+echo "G2 report in pipe : $(grep -c 'execution stats' "$TG/pipe.log")  (want >=1)"
+echo "G2 no escapes     : $(grep -c $'\033' "$TG/pipe.log")  (want 0)"
+
+# The other direction. Under `tee` the report reaches BOTH the file and the terminal — that is
+# what tee is for — so "own output stays off the tty" can only be asserted on the redirect form,
+# where stdout is the file alone. fd 4 still splits the TUI to the terminal.
+pty "CLAUDEZERO_MAX_LOOPS=1 bash '$SCRIPT' todo.md -t x > '$TG/redir.log' 2>&1" \
+    "$TG/typescript2" >/dev/null 2>&1
+tr -d '\r' < "$TG/typescript2" > "$TG/tty2.log"
+echo "G2 report in file : $(grep -c 'execution stats' "$TG/redir.log")  (want >=1)"
+echo "G2 report off tty : $(grep -c 'execution stats' "$TG/tty2.log")  (want 0)"
+echo "G2 TUI still tty  : $(grep -c 'TUI-FRAME' "$TG/tty2.log")  (want >=1)"
+```
+- **G2 PASS** — all eight as stated. `stub sees ttys = yes yes` proves fd 4 is a real terminal
+  descriptor (a dup of stdin), not a pipe. The split is asserted in both directions: claude's
+  `TUI-FRAME` reaches the terminal and never the capture file, and ClaudeZero's own `❄` report
+  reaches the capture file and — on the redirect form, where `tee` is not echoing it back —
+  never the terminal. No escape byte reaches the file.
+
+### G3 — the kqueue regression (manual, needs a real `claude`)
+
+G2 proves the descriptor is a tty and the split holds, but a stub cannot reproduce what this
+descriptor choice exists for: claude's Node runtime rejecting a `/dev/tty`-derived fd with
+`EINVAL … kqueue`. Only the real binary can. Run the documented form by hand in a scratch repo:
 
 ```bash
 ./claudezero.sh issues/todo.md 2>&1 | { trap '' INT; tee run.log; }
 ```
-Stdin is the terminal (so `[ -t 0 ]` holds) and stdout is the pipe (so fd 1 is not a tty) —
-exactly the operator's situation. This is also the macOS regression check this descriptor choice
-exists for: a real `claude` must reach its prompt instead of dying with `EINVAL … kqueue`, which
-is what a fresh open of `/dev/tty` on fd 4 caused.
-- **G2 PASS** — `run.log` holds the `❄` banner, reports, and loop notices and no TUI frames
-  (`grep -c $'\033' run.log` is `0`), the terminal shows both streams, and pressing Ctrl+C in
-  the between-runs gap still lands the closing report in `run.log`.
+- **G3 PASS** — a real `claude` reaches its prompt instead of dying at startup, the terminal
+  shows the TUI, and pressing Ctrl+C in the between-runs gap lands the closing report in
+  `run.log`.
 
 ---
 
