@@ -15,5 +15,5 @@
 - [x] BUG-026 Refuse a zero-mode launch when the todo is not tracked on the base branch — untracked today means every merge is refused and nothing can ever land
 - [x] ISSUE-027 Print the instance nickname next to its id in the execution stats header
 - [x] ISSUE-028 Show the script version on its own line below the usage heading in `--help`
-- [ ] BUG-029 Background claude and trap TERM so a SIGTERM while claude hangs still lands at the closing report and exits 143
+- [x] BUG-029 Background claude and trap TERM so a SIGTERM while claude hangs still lands at the closing report and exits 143
 - [ ] ISSUE-030 Surface claude's own exit code on the restart/stop lines and add an opt-in `CLAUDEZERO_DEBUG` `--debug-file` capture
