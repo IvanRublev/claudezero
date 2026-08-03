@@ -18,6 +18,9 @@ PROG="$(basename "$0")"   # name shown in usage/errors, from how the script was 
 
 RESTART_WAIT=5       # seconds between claude restarts — the window to press Ctrl+C
 WAIT_TICK=5          # seconds between claimable-task probes while every unchecked task is peer-held
+WAIT_FRAME=1         # seconds per spinner frame on a terminal — one |/-\ revolution every 4
+WAIT_STEP=5          # seconds the terminal's elapsed clock advances in — at 1Hz a live clock is noise
+LOG_TICK=20          # seconds between waiting lines when stdout is a log or a pipe, not a terminal
 WATCHDOG_DEFAULT=15m # CLAUDEZERO_WATCHDOG default: how long ONE claude may run before it is killed
 WATCHDOG_GRACE=10    # seconds the watchdog waits after its SIGTERM before escalating to SIGKILL
 
@@ -168,6 +171,7 @@ while true; do
         CLAUDE_ARGS+=(--debug-file "$DEBUG_FILE_BASE-$((LOOP_COUNT+1)).log")
     fi
     CLAUDEZERO_INSTANCE="$INSTANCE_ID" CLAUDEZERO_TRANSCRIPTS="$TRANSCRIPTS_FILE" CLAUDEZERO_MODE="$MODE" \
+        CLAUDEZERO_LINK="${CLAUDEZERO_LINK:-}" \
         claude "${CLAUDE_ARGS[@]}" "$PROMPT" >&4 2>&4 &
     CLAUDE_PID=$!
     arm_watchdog "$CLAUDE_PID"
@@ -270,6 +274,20 @@ else
     REPO_ROOT="$(git worktree list --porcelain | sed -n '1s/^worktree //p')"
     [ "$PWD" = "$REPO_ROOT" ] || { echo "$PROG: not at the main repo root — cd to '$REPO_ROOT' first. (ClaudeZero's own ../ts-* task worktrees are never valid launch dirs.)"; exit 1; }
     [ -z "$(git status --porcelain)" ] || { echo "$PROG: working tree on '$BASE_BRANCH' is dirty — commit or stash first."; git status --short; exit 1; }
+    # CLAUDEZERO_LINK: validate the whole list once, here, and refuse the run. Skipping a bad entry
+    # per claim would be silent: sessions would keep starting, each unable to open the spec its todo
+    # line points at, each working from the one-line title and reporting done. A typo must cost the
+    # launch, not the tasks. Checked in zero mode only — `-l` forks no worktree to link into.
+    if [ -n "${CLAUDEZERO_LINK:-}" ]; then
+        ( IFS=,
+          for p in $CLAUDEZERO_LINK; do
+              case "$p" in
+                  '')  echo "$PROG: empty entry in CLAUDEZERO_LINK='$CLAUDEZERO_LINK'" >&2; exit 1 ;;
+                  */*) echo "$PROG: CLAUDEZERO_LINK entry '$p' is not a top-level name — only entries directly under $REPO_ROOT can be linked" >&2; exit 1 ;;
+              esac
+              [ -e "$REPO_ROOT/$p" ] || { echo "$PROG: CLAUDEZERO_LINK entry '$p' does not exist at $REPO_ROOT" >&2; exit 1; }
+          done ) || exit 1
+    fi
     printf '  zero mode · base %s · fork → implement → commit → merge\n\n' "$BASE_BRANCH"
     # todo path: from the positional arg, else ask interactively.
     if [ -n "$TODO_ARG" ]; then TODO_PATH="$TODO_ARG"; else read -r -p "Path to todo.md file: " TODO_PATH; fi
@@ -547,7 +565,7 @@ held_todos() {
 # block until at least one unchecked task is free to claim. 0 = launch claude; 1 = break to the
 # closer (Ctrl+C/SIGTERM, or nothing unchecked left). No claude runs while we wait.
 wait_for_claimable() {
-  local start=0 spin=0 u h frames="|/-\\"
+  local start=0 last=0 spin=0 i u h frames="|/-\\"
   while true; do
     if [ "$STOP" = 1 ]; then return 1; fi
     u=$(unchecked_todos); h=$(held_todos)
@@ -557,16 +575,31 @@ wait_for_claimable() {
       return 0
     fi
     if [ "$start" = 0 ]; then start=$(date +%s); fi
-    # repaint in place on a terminal; one plain line per probe when stdout is a log or a pipe.
+    # repaint in place on a terminal; plain heartbeat lines when stdout is a log or a pipe. Neither
+    # surface is paced by the probe — see WAIT_FRAME / WAIT_STEP / LOG_TICK.
     if [ -t 1 ]; then
-      printf '\r❄ %s waiting for a claimable task · %s held by peers · %s\033[K' \
-        "${frames:$((spin%4)):1}" "$h" "$(fmt_dur $(( $(date +%s) - start )))"
+      # animate across the whole nap, not once per probe: a line that only moves every WAIT_TICK
+      # reads as a hang. Only the frame and the clock move — the counts stay the probe's. The clock
+      # is floored to WAIT_STEP because at one frame a second a live seconds count is just noise.
+      i=0
+      while [ "$i" -lt $((WAIT_TICK / WAIT_FRAME)) ]; do
+        printf '\r❄ %s waiting for a claimable task · %s held by peers · %s\033[K' \
+          "${frames:$((spin%4)):1}" "$h" \
+          "$(fmt_dur $(( ( ( $(date +%s) - start ) / WAIT_STEP ) * WAIT_STEP )))"
+        spin=$((spin+1)); i=$((i+1))
+        sleep "$WAIT_FRAME" || true  # SIGINT interrupts sleep and fires the INT trap
+        if [ "$STOP" = 1 ]; then return 1; fi
+      done
     else
-      printf '❄ waiting for a claimable task · %s held by peers · %s\n' \
-        "$h" "$(fmt_dur $(( $(date +%s) - start )))"
+      # a log wants a heartbeat, not the probe cadence: one line per LOG_TICK, so a wait that runs
+      # overnight leaves a readable trail instead of burying the run's own reports under itself.
+      if [ $(( $(date +%s) - last )) -ge "$LOG_TICK" ]; then
+        last=$(date +%s)
+        printf '❄ waiting for a claimable task · %s held by peers · %s\n' \
+          "$h" "$(fmt_dur $(( last - start )))"
+      fi
+      sleep "$WAIT_TICK" || true     # SIGINT interrupts sleep and fires the INT trap
     fi
-    spin=$((spin+1))
-    sleep "$WAIT_TICK" || true     # SIGINT interrupts sleep and fires the INT trap
   done
 }
 
@@ -905,6 +938,28 @@ setup_exclude() {                                # keep zero mode's .owner out o
   grep -qxF '/.owner' "$ex" 2>/dev/null || echo '/.owner' >> "$ex"
 }
 
+# CLAUDEZERO_LINK: comma-separated top-level names symlinked from the repo root into a fresh task
+# worktree. A worktree checks out TRACKED files only, so gitignored spec material a task's todo
+# line points at is absent there and the agent works from the one-line title alone. Linked, not
+# copied: an edit lands in the real file, not in a copy the worktree removal deletes. Added to
+# info/exclude (the common dir's, like setup_exclude's) because a `name/` .gitignore pattern matches
+# a DIRECTORY, not a symlink to one — unexcluded, the link rides along in the agent's `git add -A`.
+link_ignored() {
+  local wt=$1 root p ex IFS=,
+  [ -n "${CLAUDEZERO_LINK:-}" ] || return 0
+  root=$(git rev-parse --show-toplevel)
+  ex="$(git -C "$wt" rev-parse --git-path info/exclude)"; mkdir -p "$(dirname "$ex")"
+  for p in $CLAUDEZERO_LINK; do                 # entries were validated at startup, not re-checked here
+    # -e AND -L: `-e` follows the link, so a DANGLING link at that name reads as absent and the
+    # `ln -s` below would die `File exists`. Plain two-argument POSIX form — BSD and GNU agree on
+    # it, and diverge on the `-r`/`-f`/`-n` flags this deliberately avoids.
+    if [ ! -e "$wt/$p" ] && [ ! -L "$wt/$p" ]; then
+      ln -s "$root/$p" "$wt/$p"
+      grep -qxF "/$p" "$ex" 2>/dev/null || echo "/$p" >> "$ex"
+    fi
+  done
+}
+
 # acquire: print worktree path + exit 0 if claimed; exit 1 = could not acquire (skip). Holds a
 # per-task lock for the WHOLE decision so two peers never race the same task_id (distinct ids use
 # distinct locks, so tasks still run in parallel). fd 9 = bash-3.2-safe; auto-released on exit.
@@ -946,7 +1001,7 @@ acquire_task() {
   else
     flock "$WT_LOCK" git worktree add "$wt" -b "$branch" "$BASE_BRANCH" >/dev/null 2>&1 || return 1  # fresh fork
   fi
-  setup_exclude "$wt"; claim_owner "$wt"; set_current "$n"; printf '%s' "$wt"; return 0
+  setup_exclude "$wt"; link_ignored "$wt"; claim_owner "$wt"; set_current "$n"; printf '%s' "$wt"; return 0
 }
 
 # claim: the WHOLE "is this task mine to work?" decision in one call — acquire, validate the

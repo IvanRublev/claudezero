@@ -231,6 +231,12 @@ CLAUDEZERO_MAX_LOOPS=3 claudezero todo.md
 CLAUDEZERO_WATCHDOG=45m claudezero todo.md
 ```
 
+**`CLAUDEZERO_LINK`** — comma-separated top-level names symlinked from the repo root into every task worktree. Unset by default. A worktree is a checkout of tracked files only, so anything gitignored is absent there: if your todo lines point at spec files you keep in another git repository — `issues/ISSUE-031.md` holding the acceptance criteria for `- [ ] ISSUE-031 …` — the session never sees them and works from the one-line title alone. Listing the directory here links it in, so the criteria are readable and a tick lands in the real file rather than in a copy the worktree removal deletes. Each linked name is added to `.git/info/exclude`, so it stays out of the session's `git add -A` and out of this repository.
+
+```sh
+CLAUDEZERO_LINK=issues claudezero todo.md
+```
+
 ### Logging a run
 
 `claude`'s TUI is written to fd 4, which stays on the terminal, so a pipe captures only ClaudeZero's own `❄` reports instead of every TUI redraw:

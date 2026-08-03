@@ -927,7 +927,7 @@ echo "I3 branch gone     : $(git branch --list 'main-task-I3' | wc -l | tr -d ' 
 
 # I4 — validation failure, FAULT-INJECTED: acquire hands back a detached worktree. Unreachable in
 # normal operation (acquire always lands on the task branch), so inject rather than fabricate.
-sed 's|^  setup_exclude "$wt"; claim_owner "$wt"; set_current "$n"; printf|  setup_exclude "$wt"; claim_owner "$wt"; set_current "$n"; git -C "$wt" checkout -q --detach; printf|' \
+sed 's|^  setup_exclude "$wt"; link_ignored "$wt"; claim_owner "$wt"; set_current "$n"; printf|  setup_exclude "$wt"; link_ignored "$wt"; claim_owner "$wt"; set_current "$n"; git -C "$wt" checkout -q --detach; printf|' \
   "$ZERO" > "$TI/zero-bad.sh"; chmod +x "$TI/zero-bad.sh"
 out=$("$TI/zero-bad.sh" claim I4 2>&1 >/dev/null); rc=$?
 echo "I4 exit            : $rc  (want 3)"
@@ -1182,15 +1182,17 @@ printf '%s\n%s\n' "$(ps -o lstart= -p "$PEER" | awk '{$1=$1;print}')" "M1" > "$T
 cd "$TM/repo"
 export STUB_LAUNCHED="$TM/launched"; : > "$STUB_LAUNCHED"
 sleep 600 & DECOY=$!   # stands in for the caller's own session: Claude Code exports CLAUDE_PID
-PATH="$TM/bin:$PATH" CLAUDE_PID=$DECOY timeout 13 env CLAUDEZERO_MAX_LOOPS=1 bash "$SCRIPT" todo.md -t x > "$TM/wait.log" 2>&1
+PATH="$TM/bin:$PATH" CLAUDE_PID=$DECOY timeout 45 env CLAUDEZERO_MAX_LOOPS=1 bash "$SCRIPT" todo.md -t x > "$TM/wait.log" 2>&1
 echo "M1 exit          : $?  (want 124 — still waiting when the timeout fired, never launched)"
 echo "M1 decoy alive   : $(kill -0 $DECOY 2>/dev/null && echo yes || echo no)  (want yes — the TERM trap must never kill an INHERITED CLAUDE_PID; nothing was launched yet)"
 kill "$DECOY" 2>/dev/null; wait "$DECOY" 2>/dev/null || true
 echo "M1 launches      : $(wc -l < "$STUB_LAUNCHED" | tr -d ' ')  (want 0 — no claude process, no transcript, no tokens)"
-echo "M1 waiting line  : $(grep -c 'waiting for a claimable task · 1 held by peers' "$TM/wait.log")  (want >=2 — one plain line per probe)"
-echo "M1 no escapes    : $(LC_ALL=C grep -c $'\r\|\033\[' "$TM/wait.log")  (want 0 — a pipe gets no \r and no cursor moves)"
+echo "M1 waiting line  : $(grep -c 'waiting for a claimable task · 1 held by peers' "$TM/wait.log")  (want 3 — LOG_TICK=20 over a 45s wait, NOT one per WAIT_TICK probe)"
+# -F, two -e patterns: `\|` alternation is a GNU BRE extension and `\033[` leaves an unbalanced
+# bracket, so the single-pattern form dies "brackets not balanced" on the macOS leg's BSD grep
+echo "M1 no escapes    : $(LC_ALL=C grep -cF -e $'\r' -e $'\033[' "$TM/wait.log")  (want 0 — a pipe gets no \r and no cursor moves)"
 ```
-- **M1 PASS** — `exit = 124`, `decoy alive = yes`, `launches = 0`, `waiting line >= 2`, `no escapes = 0`.
+- **M1 PASS** — `exit = 124`, `decoy alive = yes`, `launches = 0`, `waiting line = 3`, `no escapes = 0`.
 
 ### M2 — a dead peer's branch is claimable: claude IS launched to rescue it
 ```bash
@@ -1230,6 +1232,34 @@ echo "M4 bucket branch : $(run_as_claude loop '{"session_id":"czM4"}')  (want 14
 rm -f "$B"
 ```
 - **M4 PASS** — `zero mode = 143`, `loop mode = 0`, `bucket branch = 143`.
+
+### M5 — terminal pacing: one frame a second, clock in 5s steps, independent of `WAIT_TICK`
+```bash
+cd "$TM/repo"
+# M2/M3 landed M1, so restore an unchecked, peer-held task for the wait to sit on
+printf -- '- [ ] M5 x\n' > todo.md; git add -A; git commit -qm m5
+sleep 600 & PEER5=$!
+git worktree add -q -b main-task-M5 "$TM/wt5" main
+printf '%s\n%s\n%s\n%s\n' "$PEER5" "$(ps -o lstart= -p "$PEER5" | awk '{$1=$1;print}')" "$(date +%s)" "PEERINST" > "$TM/wt5/.owner"
+printf '%s\n%s\n' "$(ps -o lstart= -p "$PEER5" | awk '{$1=$1;print}')" "M5" > "$TM/repo/.git/session/$PEER5"
+# a pty is required: the repainting branch is behind `[ -t 1 ]`
+/usr/bin/script -q "$TM/tty.txt" env PATH="$TM/bin:$PATH" timeout 21 env CLAUDEZERO_MAX_LOOPS=1 \
+  bash "$SCRIPT" todo.md -t x >/dev/null 2>&1
+kill "$PEER5" 2>/dev/null; wait "$PEER5" 2>/dev/null || true
+tr '\r' '\n' < "$TM/tty.txt" | grep 'waiting for a claimable task' > "$TM/frames.txt"
+N=$(grep -c . "$TM/frames.txt")
+echo "M5 repaints      : $N  ($( [ "$N" -ge 19 ] && [ "$N" -le 22 ] && echo yes || echo NO) — want yes: ~1/s over the 21s window. A probe-paced line would give 4)"
+# the exact invariant, immune to a second of startup slop: the frames run |/-\ in order, forever.
+# The sequence goes through a PIPE, never `awk -v` — awk expands backslash escapes in a -v value,
+# which silently eats the `\` frame and shifts every comparison after it.
+SEQ=$(grep -o '❄ .' "$TM/frames.txt" | sed 's/^❄ //' | tr -d '\n')
+echo "M5 cycle         : $(printf '%s\n' "$SEQ" | awk '{c="|/-\\"; for(i=1;i<=length($0);i++) if (substr($0,i,1) != substr(c,(i-1)%4+1,1)) {print "NO at "i; exit} print "yes"}')  (want yes)"
+echo "M5 clock steps   : $(grep -oE '· [0-9]+m?[0-9]*s' "$TM/frames.txt" | sort -u | tr '\n' ' ')  (want only 0s/5s/10s/15s/20s — WAIT_STEP=5)"
+echo "M5 no odd clock  : $(grep -cE '· [0-9]*[1-46-9]s' "$TM/frames.txt")  (want 0 — no 1s/2s/3s ever printed)"
+```
+- **M5 PASS** — `repaints = yes`, `cycle = yes`, `clock steps` only multiples of 5, `no odd clock = 0`.
+  Together they pin the frame rate and the clock step to `WAIT_FRAME`/`WAIT_STEP` rather than to
+  `WAIT_TICK`: the probe fires 4 times in this window, the line repaints ~21.
 
 ---
 
@@ -1289,6 +1319,111 @@ echo "N3 bad warning   : $(grep -c 'ignoring CLAUDEZERO_WATCHDOG=15min' "$TN/bad
 ```
 - **N3 PASS** — `off exit = 124` with `off line = 0`, `healthy exit = 0` with `healthy line = 0`,
   and `bad exit = 0` with `bad warning = 1`.
+
+---
+
+## Scenario O — `CLAUDEZERO_LINK` into task worktrees   `[$TESTROOT/O]`   (stub claude, deterministic)
+
+A worktree checks out tracked files only, so a gitignored spec directory a todo line points at is
+absent there and the session works from the title alone. `CLAUDEZERO_LINK` symlinks it in. The link
+must be readable, must write through to the real file, and must stay invisible to git — a `name/`
+ignore pattern matches a directory, not a symlink to one, so without an `info/exclude` entry the
+link rides along in the session's `git add -A`. Like Scenario I, `claim` needs a `claude` **ancestor
+process**, so the driver is executed by a copy of `bash` named `claude`.
+
+### Setup
+```bash
+TO="$TESTROOT/O"; mkdir -p "$TO/repo" "$TO/bin"
+printf '#!/usr/bin/env bash\nexit 0\n' > "$TO/bin/claude"; chmod +x "$TO/bin/claude"
+cd "$TO/repo"
+git init -q -b main; git config user.email t@t.t; git config user.name test
+printf 'issues/\nsources/\n' > .gitignore
+printf -- '- [ ] O1 a\n- [ ] O2 b\n- [ ] O3 c\n- [ ] O4 d\n' > todo.md
+git add -A; git commit -qm init
+mkdir issues sources
+printf -- '- [ ] criterion one\n' > issues/ISSUE-O.md      # the spec the todo line points at
+printf 'private\n' > sources/s.txt                         # gitignored, NOT listed in CLAUDEZERO_LINK
+PATH="$TO/bin:$PATH" timeout 30 env CLAUDEZERO_MAX_LOOPS=1 bash "$SCRIPT" todo.md -t x > "$TO/boot.log" 2>&1 || true
+cp "$(command -v bash)" "$TO/bin/claude"   # ensure_owner walks `ps -o comm=` for an ancestor named claude
+cat > "$TO/drive.sh" <<'DRIVE'
+set -uo pipefail
+cd "$TO/repo"
+ZERO="$(cd "$(git rev-parse --git-dir)" && pwd)/zero.sh"
+
+# O1 — listed name is linked, readable, and write-through; unlisted name is not linked
+wt=$(CLAUDEZERO_LINK=issues "$ZERO" claim O1)
+echo "O1 is symlink      : $([ -L "$wt/issues" ] && echo yes || echo NO)  (want yes — linked, not copied)"
+echo "O1 readable        : $(cat "$wt/issues/ISSUE-O.md" 2>/dev/null)  (want '- [ ] criterion one')"
+sed -i'' -e 's/- \[ \]/- [x]/' "$wt/issues/ISSUE-O.md"
+echo "O1 write-through   : $(cat "$TO/repo/issues/ISSUE-O.md")  (want '- [x] criterion one' — no commit, no merge)"
+echo "O1 status empty    : $([ -z "$(git -C "$wt" status --short)" ] && echo yes || echo NO)  (want yes — the exclude covers the symlink)"
+git -C "$wt" add -A
+echo "O1 add -A stages   : $(git -C "$wt" status --short | grep -c 'issues')  (want 0 — the link never reaches a commit)"
+echo "O1 unlisted absent : $([ -e "$wt/sources" ] && echo NO || echo yes)  (want yes — only listed names are linked)"
+echo "O1 exclude entry   : $(grep -c '^/issues$' "$(git -C "$wt" rev-parse --git-path info/exclude)")  (want 1 — info/exclude is the COMMON dir's, shared by every worktree)"
+
+# O2 — unset variable links nothing at all
+wt2=$("$ZERO" claim O2)
+echo "O2 no link         : $([ -e "$wt2/issues" ] && echo NO || echo yes)  (want yes — default is off)"
+
+# O3 — link_ignored itself no longer re-checks the list: a bad entry cannot reach it, because
+# startup refused the run (see O6). Its only remaining guard is the occupied-name test.
+echo "O3 guards          : $(sed -n '/^link_ignored() {/,/^}/p' "$ZERO" | grep -c '\-e "\$root/\$p"\|case "\$p" in')  (want 0 — validation lives at startup, once)"
+
+# O4 — a second claim appends no duplicate exclude entry and leaves the link alone
+wt4=$(CLAUDEZERO_LINK=issues "$ZERO" claim O4)
+EX4="$(git -C "$wt4" rev-parse --git-path info/exclude)"
+CLAUDEZERO_LINK=issues "$ZERO" claim O4 >/dev/null 2>&1 || true
+echo "O4 exclude dupes   : $(grep -c '^/issues$' "$EX4")  (want 1 — claiming twice appends once)"
+echo "O4 link intact     : $([ -L "$wt4/issues" ] && echo yes || echo NO)  (want yes)"
+# the -L half of the guard, called directly — a second `claim` of a task this session already holds
+# returns 1 before ever reaching link_ignored (see I2), so it cannot exercise this. A DANGLING link
+# is `-L` true but `-e` false: without the -L test the `ln -s` dies "File exists" on BSD and GNU
+# alike, and `set -e` inside acquire_task takes the whole claim down with it.
+sed -n '/^link_ignored() {/,/^}/p' "$ZERO" > "$TO/li.sh"
+rm -f "$wt4/issues"; ln -s "$TO/gone" "$wt4/issues"
+( set -euo pipefail; . "$TO/li.sh"; CLAUDEZERO_LINK=issues link_ignored "$wt4" ); rc=$?
+echo "O4 dangling exit   : $rc  (want 0 — the -L guard skips the name instead of failing on ln -s)"
+echo "O4 dangling kept   : $([ -L "$wt4/issues" ] && [ ! -e "$wt4/issues" ] && echo yes || echo NO)  (want yes)"
+
+# O5 — the merge gate is unchanged: ticks in a linked file are not counted as checked boxes
+sed -i'' -e 's/^- \[ \] O1 /- [x] O1 /' "$wt/todo.md"
+git -C "$wt" add todo.md; git -C "$wt" commit -qm 'O1 done'
+"$ZERO" merge O1 "$wt" > "$TO/merge.log" 2>&1
+echo "O5 merge exit      : $?  (want 0 — the gate scans only the todo file)"
+echo "O5 refusal         : $(grep -c 'checkbox-merge: refused' "$TO/merge.log")  (want 0)"
+DRIVE
+```
+
+### Run + assert
+```bash
+TO="$TO" "$TO/bin/claude" "$TO/drive.sh"
+```
+
+### O6 — a bad `CLAUDEZERO_LINK` refuses the run at startup, before any claude
+```bash
+cd "$TO/repo"
+git checkout -q -- todo.md 2>/dev/null; git stash -q 2>/dev/null || true   # O5 left the todo merged
+export STUB_LAUNCHED="$TO/launched"; : > "$STUB_LAUNCHED"
+printf '#!/usr/bin/env bash\necho launched >> "$STUB_LAUNCHED"\nexit 0\n' > "$TO/bin/cz-stub"; chmod +x "$TO/bin/cz-stub"
+mkdir -p "$TO/stub"; cp "$TO/bin/cz-stub" "$TO/stub/claude"
+run_bad(){ PATH="$TO/stub:$PATH" CLAUDEZERO_LINK="$1" timeout 30 env CLAUDEZERO_MAX_LOOPS=1 \
+  bash "$SCRIPT" todo.md -t x > "$TO/bad-$2.log" 2>&1; echo $?; }
+echo "O6 missing exit    : $(run_bad 'nosuchdir' missing)  (want 1)"
+echo "O6 missing names it: $(grep -c "CLAUDEZERO_LINK entry 'nosuchdir' does not exist at" "$TO/bad-missing.log")  (want 1)"
+echo "O6 nested exit     : $(run_bad 'issues/nested' nested)  (want 1)"
+echo "O6 nested names it : $(grep -c "CLAUDEZERO_LINK entry 'issues/nested' is not a top-level name" "$TO/bad-nested.log")  (want 1)"
+echo "O6 one bad kills   : $(run_bad 'issues,nosuchdir' mixed)  (want 1 — a good entry does not excuse a bad one)"
+echo "O6 no launches     : $(wc -l < "$STUB_LAUNCHED" | tr -d ' ')  (want 0 — refused before the first session, so no tokens)"
+```
+- **O6 PASS** — `missing exit = 1`, `nested exit = 1`, `one bad kills = 1`, each with its naming
+  line = 1, and `no launches = 0`.
+
+- **O PASS** — every line reports its `want` value. Together they cover the link and its
+  readability (O1), write-through with no commit and an empty `git add -A` (O1), the unlisted and
+  unset cases (O1/O2), `link_ignored` carrying no validation of its own (O3), a second claim
+  appending no duplicate `info/exclude` entry and a dangling link surviving the `-L` guard (O4),
+  the untouched merge gate (O5), and the startup refusals (O6).
 
 ---
 

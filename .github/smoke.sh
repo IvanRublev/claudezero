@@ -104,4 +104,17 @@ sums="$(awk '
 [ "$sums" = "10 20 248 1000 1278" ] || fail "usage awk got '$sums' (want '10 20 248 1000 1278')"
 ok "sed transcript_path / awk usage dedupe"
 
+# 9. CLAUDEZERO_LINK symlink — plain POSIX `ln -s target link` (claudezero.sh link_ignored).
+#    BSD and GNU ln agree on the two-argument form and diverge on -r/-f/-n, which is why none are
+#    used. The guard is `[ ! -e ] && [ ! -L ]`: -e FOLLOWS the link, so a dangling link reads as
+#    absent and an unguarded ln would die "File exists".
+ldir="$tmp/linksrc"; mkdir -p "$ldir"; echo "criterion" > "$ldir/spec.md"
+ln -s "$ldir" "$tmp/link"                       || fail "ln -s <dir> <name> failed"
+[ -L "$tmp/link" ]                              || fail "-L did not see the symlink"
+[ "$(cat "$tmp/link/spec.md")" = criterion ]    || fail "read through symlink failed"
+ln -s "$tmp/nowhere" "$tmp/dangling"            || fail "ln -s to a missing target failed"
+[ -L "$tmp/dangling" ]                          || fail "-L did not see the dangling link"
+if [ -e "$tmp/dangling" ]; then fail "-e followed a dangling link (guard would misfire)"; fi
+ok "ln -s / -L / -e guard"
+
 echo "SMOKE PASS ($(uname -s), bash $BASH_VERSION)"
