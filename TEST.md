@@ -29,9 +29,17 @@ their `../ts-*` worktrees, and all state live under `$TESTROOT` (outside the rep
 The only thing read from the repo is `claudezero.sh` itself (`$SCRIPT`). The final
 residue check (Cleanup) proves the project repo was untouched.
 
-**Run every step from the repo root** (the dir holding this file). `$(pwd)` there is
-the repo; the tests themselves execute against `$TESTROOT`, never `$(pwd)`. An agent
-reading this file can run it autonomously and report the results.
+`REPO` (Section 0) is resolved via `git worktree list`, never `$(pwd)` — deterministic
+regardless of which worktree an agent happens to be sitting in when it starts, so a cwd
+drift can no longer point `$SCRIPT` at a real task worktree of the project instead of the
+main checkout (that worktree shares the project's actual `.git`; running claudezero.sh
+there is a real run — real claude, real Stop hook — against real repo state, not a test).
+`in_testroot` (Section 0) is the matching per-invocation check: every scenario's own `cd`
+into its `$T*/repo` is what makes an individual run land under `$TESTROOT`, and this asserts
+it did, refusing instead of silently proceeding on a miss.
+
+**Run every step from anywhere inside the repo** (any worktree). An agent reading this file
+can run it autonomously and report the results.
 
 **Prerequisites:** `flock`, `uuidgen`, `timeout`, `git`, `date`, `find`, `stat`, `mv`
 on PATH. A and C need real `claude` on PATH and the `suggest-compact` hook installed in
@@ -50,19 +58,30 @@ of passes, fails, and causes.
 
 ## 0. Shared setup
 
-Run once, from the repo root. Defines `REPO`/`SCRIPT` (the code under test) and a fresh
-`TESTROOT` **outside** the repo, plus `write_gate` (A, C) and `ago` (E) helpers.
+Run once, from anywhere inside the repo (any worktree). Defines `REPO`/`SCRIPT` (the code
+under test) and a fresh `TESTROOT` **outside** the repo, plus `write_gate` (A, C) and `ago`
+(E) helpers.
 
 ```bash
 set -euo pipefail
-REPO="$(pwd)"                                   # repo holding claudezero.sh (never written to)
+# main worktree, deterministically — never $(pwd): a cwd sitting inside a task worktree of
+# this same project would otherwise point SCRIPT at the wrong .git (shared, real, live).
+# `git worktree list` always lists the main working tree first, regardless of invocation cwd.
+REPO="$(git worktree list | head -1 | awk '{print $1}')"
 SCRIPT="$REPO/claudezero.sh"
+[ -f "$SCRIPT" ] || { echo "FATAL: $SCRIPT not found — not inside the claudezero.sh repo" >&2; exit 1; }
 TESTROOT="$(mktemp -d "${TMPDIR:-/tmp}/claudezero-tests.XXXXXX")"   # isolated, outside the repo
 TESTROOT="$(cd "$TESTROOT" && pwd -P)"          # canonical path: on macOS $TMPDIR is /var→/private/var; the root-guard compares $PWD to git's physical path, so an uncanonicalized /var path misfires "not at repo root" at the real root
 echo "TESTROOT=$TESTROOT"
 
 # touch-timestamp for N seconds ago, BSD (-v) or GNU (-d). Used by E.
 ago(){ date -v-"$1"S +%Y%m%d%H%M.%S 2>/dev/null || date -d "-$1 sec" +%Y%m%d%H%M.%S; }
+
+# refuse to run claudezero.sh anywhere but under TESTROOT — call this right before every
+# invocation of $SCRIPT. A real project worktree shares the project's .git, so a cwd mistake
+# here would run a REAL claudezero session (real claude, real Stop hook) against real repo state.
+in_testroot(){ case "$PWD" in "$TESTROOT"/*) return 0;; *)
+  echo "REFUSING: cwd $PWD is not under TESTROOT=$TESTROOT — not invoking claudezero.sh" >&2; return 1;; esac; }
 
 write_gate(){ cat > "$1" <<'EOF'
 #!/usr/bin/env bash
@@ -1467,8 +1486,15 @@ failing log tails.
 
 ## Cleanup
 ```bash
-pkill -f claudezero.sh 2>/dev/null || true
-pkill -f 'claude .*--settings' 2>/dev/null || true
+# scoped to THIS run only: a nested real claude's --settings value is a JSON blob whose
+# `command` field is $STOP_HOOK, always under $TESTROOT for every scenario — so this pattern
+# never matches a claude/claudezero.sh process outside this run. Deliberately NOT a bare
+# `claudezero.sh`/`claude .*--settings` pattern: that matches every such process on the
+# machine, including this project's own real dogfood loop (if one happens to be running) and
+# possibly the real agent itself, if its launch command line ever carries --settings too. Bare
+# claudezero.sh loops need no separate catch here — every Run block already wraps its own
+# invocation in `timeout`, which self-terminates them on schedule regardless of Cleanup.
+pkill -f "$TESTROOT" 2>/dev/null || true
 rm -rf "$TESTROOT"
 ```
 Then verify the tests left **no residue in the project repo itself** — the whole point of
