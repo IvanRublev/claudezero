@@ -225,7 +225,7 @@ claudezero -h
 CLAUDEZERO_MAX_LOOPS=3 claudezero todo.md
 ```
 
-**`CLAUDEZERO_WATCHDOG`** — how long one `claude` may run before it is killed. Default `15m`; accepts plain seconds or an `s`/`m`/`h` suffix (`900`, `90s`, `15m`, `1h`), and `0` disables it. A `claude` that stops making progress never exits, so without the timer the loop parks on it forever — no restart, no report, and nothing left to stop but the whole run. When the timer fires it says so on its own console line, then `SIGTERM`s `claude` (the same signal the Stop hook uses, so the restart path is the usual one) and escalates to `SIGKILL` 10s later. The task worktree survives the kill: the next session reclaims it through the crash-recovery path.
+**`CLAUDEZERO_WATCHDOG`** — how long one `claude` may make no progress before it is killed. Default `15m`; accepts plain seconds or an `s`/`m`/`h` suffix (`900`, `90s`, `15m`, `1h`), and `0` disables it. A `claude` that stops making progress never exits, so without the timer the loop parks on it forever — no restart, no report, and nothing left to stop but the whole run. Progress is measured as `claude`'s own cumulative CPU time, not wall clock: one that is thinking, streaming, or running tools burns CPU and keeps resetting the window however long the task takes, while one blocked on a dead socket burns none. When the timer fires it says so on its own console line, then `SIGTERM`s `claude` (the same signal the Stop hook uses, so the restart path is the usual one) and escalates to `SIGKILL` 10s later. The task worktree survives the kill: the next session reclaims it through the crash-recovery path.
 
 ```sh
 CLAUDEZERO_WATCHDOG=45m claudezero todo.md
