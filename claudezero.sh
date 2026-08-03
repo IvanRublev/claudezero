@@ -13,11 +13,16 @@
 # Run -h for usage.
 set -euo pipefail
 
-VERSION="0.0.15"
+VERSION="0.0.16"
 PROG="$(basename "$0")"   # name shown in usage/errors, from how the script was invoked
 
-LOOP_INTERVAL="3m"   # cadence claude reschedules its zeroing pass at (baked into the /loop prompt)
 RESTART_WAIT=5       # seconds between claude restarts — the window to press Ctrl+C
+WAIT_TICK=5          # seconds between claimable-task probes while every unchecked task is peer-held
+WAIT_FRAME=1         # seconds per spinner frame on a terminal — one |/-\ revolution every 4
+WAIT_STEP=5          # seconds the terminal's elapsed clock advances in — at 1Hz a live clock is noise
+LOG_TICK=20          # seconds between waiting lines when stdout is a log or a pipe, not a terminal
+WATCHDOG_DEFAULT=15m # CLAUDEZERO_WATCHDOG default: how long claude may burn no CPU before it is killed
+WATCHDOG_GRACE=10    # seconds the watchdog waits after its SIGTERM before escalating to SIGKILL
 
 # The braces around the pipe reader in the logging example are load-bearing — do NOT tidy them
 # into a bare pipe. Ctrl+C signals the whole foreground group; the reader's default SIGINT action
@@ -26,7 +31,8 @@ RESTART_WAIT=5       # seconds between claude restarts — the window to press C
 # inherits it and drains the pipe until ClaudeZero exits.
 usage() {
   # single-quoted heredoc keeps backticks literal; sed injects the RESTART_WAIT constant.
-  sed -e "s/@@RESTART_WAIT@@/$RESTART_WAIT/g" -e "s/@@PROG@@/$PROG/g" -e "s/@@VERSION@@/$VERSION/g" <<'USAGE'
+  sed -e "s/@@RESTART_WAIT@@/$RESTART_WAIT/g" -e "s/@@PROG@@/$PROG/g" -e "s/@@VERSION@@/$VERSION/g" \
+      -e "s/@@WATCHDOG_DEFAULT@@/$WATCHDOG_DEFAULT/g" <<'USAGE'
 usage: @@PROG@@ [todo-file-path] [-t|--taskprompt TEXT | -l|--loopprompt TEXT]
 version @@VERSION@@
 
@@ -41,6 +47,21 @@ version @@VERSION@@
   -h, --help             Show this help.
 
   -t and -l are mutually exclusive.
+
+  Environment:
+
+    CLAUDEZERO_WATCHDOG=duration   How long claude may make no progress before the watchdog
+                                   kills it, in seconds or with an s/m/h suffix (900, 90s,
+                                   15m, 1h). Default @@WATCHDOG_DEFAULT@@; 0 disables the watchdog.
+                                   Progress is claude's own CPU time, so a long honest run
+                                   is never killed — only one that has stopped working.
+
+    CLAUDEZERO_LINK=name[,name…]   Top-level directories symlinked from the repo root
+                                   into every task worktree. Unset by default. A worktree
+                                   checks out tracked files only, so gitignored spec
+                                   directories a todo line points at are absent there;
+                                   listing them here lets a session read the acceptance
+                                   criteria and tick them in the real file.
 
   Log a run (ClaudeZero's own output only; claude's TUI stays on the terminal):
 
@@ -114,7 +135,12 @@ MAX_LOOPS="${CLAUDEZERO_MAX_LOOPS:-0}"
 # shell was handed is a real terminal fd, opened read-write, so it takes writes and kqueue both.
 if [ ! -t 1 ] && [ -t 0 ]; then exec 4>&0; else exec 4>&1; fi
 LOOP_COUNT=0
-STOP=0                    # set by the INT trap; the loop breaks to the closer below
+# claude's pid, set per launch below. Initialized here because Claude Code exports CLAUDE_PID (its
+# own pid) into every Bash-tool env: without this, a TERM arriving BEFORE the first launch — the
+# zero-mode wait, or a Ctrl+C at startup — makes on_term SIGTERM the session that ran us.
+CLAUDE_PID=""
+STOP=0                    # set by the INT/TERM traps; the loop breaks to the closer below
+TERMED=0                  # set by the TERM trap; makes the closer exit 143 instead of 0
 TODOS_BASE=$(read_counter "${TODOS_TIME_FILE:-}")   # snapshot: report only THIS run's slice of the shared aggregates
 TODOS_DONE_BASE=$(read_counter "${TODOS_DONE_FILE:-}")
 LOOP_START=$(date +%s)   # script loop (outer while loop) starts here
@@ -124,12 +150,57 @@ LOOP_START=$(date +%s)   # script loop (outer while loop) starts here
 # the timing vars so the report can read them.
 trap 'STOP=1' INT
 
+# SIGTERM (supervisor shutdown, `timeout`, `kill`) requests the same clean stop, and additionally
+# forwards the signal to claude — a hung child must not outlive us — and records TERMED so the
+# closer can exit 143. Bash keeps one handler per signal, so further TERM work chains into here.
+on_term() {
+    STOP=1
+    TERMED=1
+    [ -n "${CLAUDE_PID:-}" ] && kill -TERM "$CLAUDE_PID" 2>/dev/null
+    return 0
+}
+trap on_term TERM
+
+WATCHDOG_SECS="$(parse_dur "${CLAUDEZERO_WATCHDOG:-$WATCHDOG_DEFAULT}" || true)"
+WATCHDOG_RAW="${CLAUDEZERO_WATCHDOG:-$WATCHDOG_DEFAULT}"
+if [ -z "$WATCHDOG_SECS" ]; then
+    echo "$PROG: ignoring CLAUDEZERO_WATCHDOG=$WATCHDOG_RAW (want 900, 90s, 15m, 1h, or 0 to disable) — using $WATCHDOG_DEFAULT" >&2
+    WATCHDOG_RAW="$WATCHDOG_DEFAULT"; WATCHDOG_SECS="$(parse_dur "$WATCHDOG_DEFAULT")"
+fi
+WATCHDOG_PID=""      # set per launch by arm_watchdog, cleared by disarm_watchdog
+
 reap_dead_sessions   # startup: clear markers left by crashed prior runs before the first claude
 while true; do
+    # zero mode: the SHELL decides whether a claude session is worth starting. Nothing left → the
+    # closer; everything unchecked already held by a live peer → wait here, spending no tokens
+    # (a claude parked at the prompt re-reads its whole context just to say "still peer-owned").
+    if [ "${MODE:-}" = zero ]; then
+        if all_todos_done; then break; fi
+        if ! wait_for_claimable; then break; fi
+    fi
     # first prompt submitted straight from the CLI arg. The session Stop hook SIGTERMs claude
     # when context fills; exit 143 is the normal restart path, so swallow it.
-    CLAUDEZERO_INSTANCE="$INSTANCE_ID" CLAUDEZERO_TRANSCRIPTS="$TRANSCRIPTS_FILE" \
-        claude --settings "$STOP_SETTINGS" --permission-mode auto --name "$SESSION_NAME" "$PROMPT" >&4 2>&4 || true
+    CLAUDE_ARGS=(--settings "$STOP_SETTINGS" --permission-mode auto --name "$SESSION_NAME")
+    # diagnostic opt-in: a --debug-file on every real run is a standing cost for nobody. One file
+    # per claude invocation, so a restart leaves the hung run's trace intact.
+    if [ -n "${CLAUDEZERO_DEBUG:-}" ]; then
+        CLAUDE_ARGS+=(--debug-file "$DEBUG_FILE_BASE-$((LOOP_COUNT+1)).log")
+    fi
+    CLAUDEZERO_INSTANCE="$INSTANCE_ID" CLAUDEZERO_TRANSCRIPTS="$TRANSCRIPTS_FILE" CLAUDEZERO_MODE="$MODE" \
+        CLAUDEZERO_LINK="${CLAUDEZERO_LINK:-}" \
+        claude "${CLAUDE_ARGS[@]}" "$PROMPT" >&4 2>&4 &
+    CLAUDE_PID=$!
+    arm_watchdog "$CLAUDE_PID"
+    # backgrounded on purpose: bash defers every trap until a FOREGROUND child exits, so a TERM
+    # arriving while claude hangs could never be handled. `wait` IS interruptible — it returns
+    # 128+N when a trapped signal fires — so re-enter it until claude is actually gone.
+    # `$?` after the loop is `break`'s own 0, so claude's status is captured inside the body.
+    CLAUDE_EXIT=0
+    until wait "$CLAUDE_PID"; do
+        CLAUDE_EXIT=$?
+        kill -0 "$CLAUDE_PID" 2>/dev/null || break
+    done
+    disarm_watchdog   # claude is gone: retire its timer before the pid can be recycled
     # claude killed mid-run (Ctrl+C/SIGTERM) can leave the tty in raw mode with ISIG off; then every
     # later Ctrl+C arrives as a 0x03 byte, not a SIGINT, so the INT trap never fires and the loop
     # spins forever restarting claude on a wedged terminal. Restore cooked mode so Ctrl+C signals again.
@@ -137,13 +208,16 @@ while true; do
     NOW=$(date +%s)
     LOOP_COUNT=$((LOOP_COUNT+1))
     printf '\n\n'
+    # a stop requested WHILE claude ran (TERM, or INT that reached us) breaks here, not after the
+    # restart sleep — the closer below still prints the report and the fleet TOTAL.
+    if [ "$STOP" = 1 ]; then printf '\n❄ run loop stopped\n'; break; fi
     if [ "$MAX_LOOPS" -gt 0 ] && [ "$LOOP_COUNT" -ge "$MAX_LOOPS" ]; then
-        printf '\n❄ claude exited after %s runs · reached CLAUDEZERO_MAX_LOOPS=%s · stopping\n' "$LOOP_COUNT" "$MAX_LOOPS"
+        printf '\n❄ claude exited with code %s after %s runs · reached CLAUDEZERO_MAX_LOOPS=%s · stopping\n' "$CLAUDE_EXIT" "$LOOP_COUNT" "$MAX_LOOPS"
         break
     fi
     print_report "$NOW"
     dojo_wisdom
-    printf '\n❄ claude exited after %s runs · restarting in %ss · press Ctrl+C to stop\n' "$LOOP_COUNT" "$RESTART_WAIT"
+    printf '\n❄ claude exited with code %s after %s runs · restarting in %ss · press Ctrl+C to stop\n' "$CLAUDE_EXIT" "$LOOP_COUNT" "$RESTART_WAIT"
     sleep "$RESTART_WAIT" || true          # SIGINT interrupts sleep and fires the INT trap
     if [ "$STOP" = 1 ]; then printf '\n❄ run loop stopped\n'; break; fi
 done
@@ -157,6 +231,9 @@ print_report "$(date +%s)"
 print_fleet_total
 if all_todos_done; then dojo_proud; fi
 reap_dead_sessions   # no future acquire will reap this session's marker
+# 128+15: a supervisor can tell "terminated" from "finished". As an `if` — `[ … ] && exit 143`
+# would leak the test's own status 1 through `set -e` on every normal run.
+if [ "$TERMED" = 1 ]; then exit 143; fi
 }
 
 # entrypoint. Resolves the prompt (zero or loop mode), installs the session Stop hook,
@@ -213,6 +290,20 @@ else
     REPO_ROOT="$(git worktree list --porcelain | sed -n '1s/^worktree //p')"
     [ "$PWD" = "$REPO_ROOT" ] || { echo "$PROG: not at the main repo root — cd to '$REPO_ROOT' first. (ClaudeZero's own ../ts-* task worktrees are never valid launch dirs.)"; exit 1; }
     [ -z "$(git status --porcelain)" ] || { echo "$PROG: working tree on '$BASE_BRANCH' is dirty — commit or stash first."; git status --short; exit 1; }
+    # CLAUDEZERO_LINK: validate the whole list once, here, and refuse the run. Skipping a bad entry
+    # per claim would be silent: sessions would keep starting, each unable to open the spec its todo
+    # line points at, each working from the one-line title and reporting done. A typo must cost the
+    # launch, not the tasks. Checked in zero mode only — `-l` forks no worktree to link into.
+    if [ -n "${CLAUDEZERO_LINK:-}" ]; then
+        ( IFS=,
+          for p in $CLAUDEZERO_LINK; do
+              case "$p" in
+                  '')  echo "$PROG: empty entry in CLAUDEZERO_LINK='$CLAUDEZERO_LINK'" >&2; exit 1 ;;
+                  */*) echo "$PROG: CLAUDEZERO_LINK entry '$p' is not a top-level name — only entries directly under $REPO_ROOT can be linked" >&2; exit 1 ;;
+              esac
+              [ -e "$REPO_ROOT/$p" ] || { echo "$PROG: CLAUDEZERO_LINK entry '$p' does not exist at $REPO_ROOT" >&2; exit 1; }
+          done ) || exit 1
+    fi
     printf '  zero mode · base %s · fork → implement → commit → merge\n\n' "$BASE_BRANCH"
     # todo path: from the positional arg, else ask interactively.
     if [ -n "$TODO_ARG" ]; then TODO_PATH="$TODO_ARG"; else read -r -p "Path to todo.md file: " TODO_PATH; fi
@@ -244,6 +335,9 @@ TODOS_DONE_FILE="$(cd "$(git rev-parse --git-common-dir)" && pwd)/todos-done-${B
 # this instance's list of claude session transcripts (one path per line, appended by the Stop hook).
 # Namespaced like the time-file so parallel instances never read each other's token figures.
 TRANSCRIPTS_FILE="$(cd "$(git rev-parse --git-common-dir)" && pwd)/transcripts-${BASE_BRANCH//\//-}-$INSTANCE_ID"
+# stem for the opt-in `claude --debug-file` capture (CLAUDEZERO_DEBUG). Same <kind>-<base>-<instance>
+# naming as the files above; run_loop appends the loop number so a restart keeps the earlier trace.
+DEBUG_FILE_BASE="$(cd "$(git rev-parse --git-common-dir)" && pwd)/debug-${BASE_BRANCH//\//-}-$INSTANCE_ID"
 ZERO_SH="$GITDIR_ABS/zero.sh"   # where build_zero_prompt wrote the helper (zero mode only)
 INSTANCE_DIR="$(cd "$(git rev-parse --git-common-dir)" && pwd)/instance"
 
@@ -277,19 +371,39 @@ if [ -n "$tf" ]; then
   tp="$(printf '%s' "$input" | sed -n 's/.*"transcript_path"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')"
   [ -n "$tp" ] && ! grep -qxF "$tp" "$tf" 2>/dev/null && printf '%s\n' "$tp" >> "$tf"
 fi
-sid="$(printf '%s' "$input" | sed -n 's/.*"session_id"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | tr -cd 'A-Za-z0-9_-')"
-[ -n "$sid" ] || exit 0
-dir="${TMPDIR:-${TMP:-${TEMP:-/tmp}}}"; dir="${dir%/}"      # match node os.tmpdir()
-[ -f "$dir/claude-context-bucket-$sid" ] || exit 0          # threshold not crossed → keep going
 # nearest ancestor named 'claude' → SIGTERM (graceful: reaps bash tree, runs SessionEnd hooks,
 # exits 143). Turn already saved, so the kill loses nothing.
-pid=$PPID; depth=0
-while [ -n "$pid" ] && [ "$pid" -gt 1 ] && [ "$depth" -lt 8 ]; do
-  comm="$(ps -o comm= -p "$pid" 2>/dev/null)" || exit 0
-  [ "${comm##*/}" = claude ] && { kill -TERM "$pid"; exit 0; }
-  pid="$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d '[:space:]')"
-  depth=$((depth+1))
-done
+# Claude Code exports CLAUDE_PID (its own pid) into this hook's env same as any Bash-tool child —
+# that IS the owning session, no walk needed. Verified alive + still named claude before trusting
+# it (a stale inherited value must never fire): this hook's own comment above the outer loop notes
+# the same var can carry a STALE pid across an unrelated invocation boundary. Only when it is
+# absent or fails that check do we fall back to the name-walk, which has no such guarantee — every
+# ancestor up to 8 hops is bare-name-matched, and a live real `claude` sitting there for any other
+# reason (e.g. this hook under test, nested inside a real claude session) gets SIGTERMed instead.
+term_owner() {
+  if [ -n "${CLAUDE_PID:-}" ] && kill -0 "$CLAUDE_PID" 2>/dev/null; then
+    comm="$(ps -o comm= -p "$CLAUDE_PID" 2>/dev/null)"
+    [ "${comm##*/}" = claude ] && { kill -TERM "$CLAUDE_PID"; return 0; }
+  fi
+  pid=$PPID; depth=0
+  while [ -n "$pid" ] && [ "$pid" -gt 1 ] && [ "$depth" -lt 8 ]; do
+    comm="$(ps -o comm= -p "$pid" 2>/dev/null)" || return 0
+    [ "${comm##*/}" = claude ] && { kill -TERM "$pid"; return 0; }
+    pid="$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d '[:space:]')"
+    depth=$((depth+1))
+  done
+}
+sid="$(printf '%s' "$input" | sed -n 's/.*"session_id"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | tr -cd 'A-Za-z0-9_-')"
+dir="${TMPDIR:-${TMP:-${TEMP:-/tmp}}}"; dir="${dir%/}"      # match node os.tmpdir()
+# context-rot guard: suggest-compact's bucket file = threshold crossed, restart on fresh context.
+[ -n "$sid" ] && [ -f "$dir/claude-context-bucket-$sid" ] && { term_owner; exit 0; }
+# ordinary turn end (task merged, or nothing claimable): end the session too, so the next task
+# starts on a context isolated from this one and an idle instance costs nothing. A turn end is
+# claude sitting idle at the prompt — the transcript is already recorded above, and any half-done
+# worktree is reclaimed by the next instance through the existing rescue path.
+# Zero mode only: -l/--loopprompt has no task boundary, so context-full stays its only cycle.
+[ "${CLAUDEZERO_MODE:-}" = zero ] || exit 0
+term_owner
 exit 0
 HOOK_EOF
 chmod +x "$STOP_HOOK"
@@ -314,6 +428,69 @@ fmt_dur() {
   if   [ "$s" -ge 3600 ]; then printf '%dh%02dm%02ds' $((s/3600)) $((s%3600/60)) $((s%60))
   elif [ "$s" -ge 60 ];   then printf '%dm%02ds' $((s/60)) $((s%60))
   else                         printf '%ds' "$s"; fi
+}
+
+# parse a CLAUDEZERO_WATCHDOG duration — `900`, `90s`, `15m`, `1h`, or `0` to disable — into
+# seconds on stdout. Garbage prints nothing and returns 1: a mistyped timer must fall back to the
+# default, never silently mean "no watchdog" (0) or "kill at once".
+parse_dur() {
+  local v=$1 n mult=1
+  case "$v" in
+    *s) n=${v%s} ;;
+    *m) n=${v%m}; mult=60 ;;
+    *h) n=${v%h}; mult=3600 ;;
+    *)  n=$v ;;
+  esac
+  case "$n" in ''|*[!0-9]*) return 1;; esac
+  printf '%s' $((n * mult))
+}
+
+# cumulative CPU time of pid $1 as `ps` prints it, spaces squeezed out; empty once the process is
+# gone. The watchdog's liveness sample: only equality between two readings matters, so the differing
+# BSD (`0:00.03`) and GNU (`00:00:00`) spellings both work and neither needs parsing.
+cpu_time() { ps -o time= -p "$1" 2>/dev/null | tr -d '[:space:]'; }
+
+# start the timer for the claude at $1 (no-op when the watchdog is disabled). A claude that stops
+# making progress never exits, so the loop would park on it forever — no restart, no report, and
+# nothing to Ctrl+C but the whole run. SIGTERM is what the Stop hook already uses, so the kill lands
+# on the tested restart path; SIGKILL follows for a claude that ignores it. The watchdog names
+# itself on its own console line, so the exit-code line under it is not read as claude's own choice.
+# It samples in WAIT_TICK naps instead of sleeping the whole window so a claude that exits on its own
+# retires its timer within a tick — an armed sleeper outliving its claude would eventually fire at
+# a pid the OS has since handed to somebody else.
+# The sample is CPU time, not wall clock: a flat cap would kill the honest long runs this loop is
+# built to leave unattended, while a claude that thinks, streams, or runs tools always burns CPU and
+# one blocked on a dead socket burns none. Any advance restarts the full window.
+arm_watchdog() {
+  WATCHDOG_PID=""
+  [ "$WATCHDOG_SECS" -gt 0 ] || return 0
+  local pid=$1
+  {
+    local left=$WATCHDOG_SECS cpu last
+    last="$(cpu_time "$pid")"
+    while [ "$left" -gt 0 ] && kill -0 "$pid" 2>/dev/null; do
+      sleep "$WAIT_TICK"; left=$((left - WAIT_TICK))
+      cpu="$(cpu_time "$pid")"
+      [ "$cpu" = "$last" ] || { last="$cpu"; left=$WATCHDOG_SECS; }
+    done
+    if kill -0 "$pid" 2>/dev/null; then
+      printf '\n❄ watchdog · no progress from claude for %s · killing it (CLAUDEZERO_WATCHDOG=%s)\n' \
+        "$(fmt_dur "$WATCHDOG_SECS")" "$WATCHDOG_RAW"
+      kill -TERM "$pid" 2>/dev/null || true
+      sleep "$WATCHDOG_GRACE"
+      # recheck: if the TERM already reaped it, the pid may be recycled by now — a blind
+      # KILL here would hit whatever unrelated process the OS handed that number to next.
+      if kill -0 "$pid" 2>/dev/null; then kill -KILL "$pid" 2>/dev/null || true; fi
+    fi
+  } &
+  WATCHDOG_PID=$!
+}
+
+# retire the timer the moment claude is reaped, so nothing is left counting down against a dead pid.
+disarm_watchdog() {
+  [ -n "$WATCHDOG_PID" ] || return 0
+  kill "$WATCHDOG_PID" 2>/dev/null || true
+  WATCHDOG_PID=""
 }
 
 # format a token count as 5.8M / 84.3k / 312 — integer arithmetic only (bash 3.2 has no floats).
@@ -391,6 +568,79 @@ all_todos_done() {
     /^[ \t]*- \[ \]/    { unchecked=1 }
     /^[ \t]*- \[[ x]\]/ { any=1 }
     END { exit (any && !unchecked) ? 0 : 1 }'
+}
+
+# count unchecked tasks on the base branch's todo (fenced example boxes excluded, as everywhere).
+unchecked_todos() {
+  git show "$BASE_BRANCH:$TODO_PATH" 2>/dev/null | awk '
+    /^[ \t]*```/       { fence = !fence; next }
+    fence              { next }
+    /^[ \t]*- \[ \]/    { n++ }
+    END { print n+0 }'
+}
+
+# how many tasks live peers are holding right now — a read-only mirror of zero.sh's acquire test:
+# a claim is a `$BASE_BRANCH-task-<id>` branch whose worktree `.owner` names a session that is both
+# alive and still on that task. Pure filesystem + git, so it costs no tokens and needs no claude
+# ancestor (zero.sh's ensure_owner cannot run from the shell). A branch whose owner DIED is not
+# counted: acquire_task steals such a worktree, so claude must be launched to do the rescue —
+# counting it as held would park the whole fleet forever on a crashed peer's leftovers.
+held_todos() {
+  local path branch id pid st cur n=0
+  while IFS=$'\t' read -r path branch; do
+    case "$branch" in "$BASE_BRANCH-task-"*) id=${branch#"$BASE_BRANCH"-task-} ;; *) continue ;; esac
+    [ -f "$path/.owner" ] || continue
+    { read -r pid; read -r st; } < "$path/.owner" 2>/dev/null || continue
+    kill -0 "$pid" 2>/dev/null || continue
+    [ "$(proc_start "$pid")" = "$st" ] || continue
+    cur=""
+    if [ -f "$SESSION_DIR/$pid" ]; then { read -r _; read -r cur; } < "$SESSION_DIR/$pid" 2>/dev/null || cur=""; fi
+    if [ "$cur" = "$id" ]; then n=$((n+1)); fi
+  done < <(git worktree list --porcelain | awk '
+    /^worktree /            { p = substr($0, 10) }
+    /^branch refs\/heads\// { printf "%s\t%s\n", p, substr($0, 19) }')
+  printf '%s' "$n"
+}
+
+# block until at least one unchecked task is free to claim. 0 = launch claude; 1 = break to the
+# closer (Ctrl+C/SIGTERM, or nothing unchecked left). No claude runs while we wait.
+wait_for_claimable() {
+  local start=0 last=0 spin=0 i u h frames="|/-\\"
+  while true; do
+    if [ "$STOP" = 1 ]; then return 1; fi
+    u=$(unchecked_todos); h=$(held_todos)
+    if [ "$u" -le 0 ]; then return 1; fi
+    if [ "$u" -gt "$h" ]; then
+      if [ "$start" != 0 ] && [ -t 1 ]; then printf '\r\033[K'; fi   # clear the repainting line
+      return 0
+    fi
+    if [ "$start" = 0 ]; then start=$(date +%s); fi
+    # repaint in place on a terminal; plain heartbeat lines when stdout is a log or a pipe. Neither
+    # surface is paced by the probe — see WAIT_FRAME / WAIT_STEP / LOG_TICK.
+    if [ -t 1 ]; then
+      # animate across the whole nap, not once per probe: a line that only moves every WAIT_TICK
+      # reads as a hang. Only the frame and the clock move — the counts stay the probe's. The clock
+      # is floored to WAIT_STEP because at one frame a second a live seconds count is just noise.
+      i=0
+      while [ "$i" -lt $((WAIT_TICK / WAIT_FRAME)) ]; do
+        printf '\r❄ %s waiting for a claimable task · %s held by peers · %s\033[K' \
+          "${frames:$((spin%4)):1}" "$h" \
+          "$(fmt_dur $(( ( ( $(date +%s) - start ) / WAIT_STEP ) * WAIT_STEP )))"
+        spin=$((spin+1)); i=$((i+1))
+        sleep "$WAIT_FRAME" || true  # SIGINT interrupts sleep and fires the INT trap
+        if [ "$STOP" = 1 ]; then return 1; fi
+      done
+    else
+      # a log wants a heartbeat, not the probe cadence: one line per LOG_TICK, so a wait that runs
+      # overnight leaves a readable trail instead of burying the run's own reports under itself.
+      if [ $(( $(date +%s) - last )) -ge "$LOG_TICK" ]; then
+        last=$(date +%s)
+        printf '❄ waiting for a claimable task · %s held by peers · %s\n' \
+          "$h" "$(fmt_dur $(( last - start )))"
+      fi
+      sleep "$WAIT_TICK" || true     # SIGINT interrupts sleep and fires the INT trap
+    fi
+  done
 }
 
 # multiline execution-stats report. $1 = now epoch.
@@ -661,7 +911,15 @@ BR_SLUG="${BASE_BRANCH//\//-}"
 task_branch() { printf '%s-task-%s' "$BASE_BRANCH" "$1"; }
 
 # Owner = nearest ancestor process named 'claude' (the Bash tool may nest a shell in between).
+# Claude Code exports CLAUDE_PID (its own pid) into this Bash-tool child same as the hook's — try
+# it first (verified alive + still named claude) so a nested Task agent's zero.sh never has to
+# guess which of several real 'claude' ancestors is its own; only fall back to the walk, whose
+# bare-name match has no such guarantee, when that var is absent or fails the check.
 find_owner() {
+  if [ -n "${CLAUDE_PID:-}" ] && kill -0 "$CLAUDE_PID" 2>/dev/null; then
+    local c; c=$(ps -o comm= -p "$CLAUDE_PID" 2>/dev/null)
+    [ "${c##*/}" = claude ] && { echo "$CLAUDE_PID"; return 0; }
+  fi
   local pid=$PPID comm depth=0
   while [ -n "$pid" ] && [ "$pid" -gt 1 ] && [ "$depth" -lt 8 ]; do
     comm=$(ps -o comm= -p "$pid" 2>/dev/null) || return 1
@@ -684,8 +942,9 @@ ensure_owner() {
 }
 
 # --- ownership as a per-session LEASE, not a per-worktree pid probe -----------------------
-# A claude SESSION outlives any single task (zeros many, idles between /loop fires), so "is the pid
-# alive?" is too coarse — it says the session is up, not that it still holds THIS task. Record, per
+# A claude SESSION can hold a task, release it, and reclaim another (a merge failure, a rescued
+# worktree), so "is the pid alive?" is too coarse — it says the session is up, not that it still
+# holds THIS task. Record, per
 # session, the ONE task it is currently on:
 #     $GITDIR/session/<pid>   line1=<process start-time>   line2=<current task id | none>
 # zero.sh is the sole writer: set on acquire, cleared to `none` on merge/release. A task is owned
@@ -725,6 +984,28 @@ claim_owner() { printf '%s\n%s\n%s\n%s\n' "$OWNER_PID" "$OWN_START" "$(date +%s)
 setup_exclude() {                                # keep zero mode's .owner out of the agent's `git add -A`
   local ex; ex="$(git -C "$1" rev-parse --git-path info/exclude)"; mkdir -p "$(dirname "$ex")"
   grep -qxF '/.owner' "$ex" 2>/dev/null || echo '/.owner' >> "$ex"
+}
+
+# CLAUDEZERO_LINK: comma-separated top-level names symlinked from the repo root into a fresh task
+# worktree. A worktree checks out TRACKED files only, so gitignored spec material a task's todo
+# line points at is absent there and the agent works from the one-line title alone. Linked, not
+# copied: an edit lands in the real file, not in a copy the worktree removal deletes. Added to
+# info/exclude (the common dir's, like setup_exclude's) because a `name/` .gitignore pattern matches
+# a DIRECTORY, not a symlink to one — unexcluded, the link rides along in the agent's `git add -A`.
+link_ignored() {
+  local wt=$1 root p ex IFS=,
+  [ -n "${CLAUDEZERO_LINK:-}" ] || return 0
+  root=$(git rev-parse --show-toplevel)
+  ex="$(git -C "$wt" rev-parse --git-path info/exclude)"; mkdir -p "$(dirname "$ex")"
+  for p in $CLAUDEZERO_LINK; do                 # entries were validated at startup, not re-checked here
+    # -e AND -L: `-e` follows the link, so a DANGLING link at that name reads as absent and the
+    # `ln -s` below would die `File exists`. Plain two-argument POSIX form — BSD and GNU agree on
+    # it, and diverge on the `-r`/`-f`/`-n` flags this deliberately avoids.
+    if [ ! -e "$wt/$p" ] && [ ! -L "$wt/$p" ]; then
+      ln -s "$root/$p" "$wt/$p"
+      grep -qxF "/$p" "$ex" 2>/dev/null || echo "/$p" >> "$ex"
+    fi
+  done
 }
 
 # acquire: print worktree path + exit 0 if claimed; exit 1 = could not acquire (skip). Holds a
@@ -768,7 +1049,7 @@ acquire_task() {
   else
     flock "$WT_LOCK" git worktree add "$wt" -b "$branch" "$BASE_BRANCH" >/dev/null 2>&1 || return 1  # fresh fork
   fi
-  setup_exclude "$wt"; claim_owner "$wt"; set_current "$n"; printf '%s' "$wt"; return 0
+  setup_exclude "$wt"; link_ignored "$wt"; claim_owner "$wt"; set_current "$n"; printf '%s' "$wt"; return 0
 }
 
 # claim: the WHOLE "is this task mine to work?" decision in one call — acquire, validate the
@@ -985,10 +1266,9 @@ DRIVER_EOF
     # command substitution. It exits 1 at EOF, hence `|| :`.
     local prompt
     IFS= read -r -d '' prompt <<'PROMPT_EOF' || :
-/loop @@LOOP_INTERVAL@@
-
 You are ONE of many independent Claude instances zeroing tasks from @@TODO@@ in PARALLEL.
-Keep these facts in mind for every iteration:
+This session zeroes at most ONE task and then ends; the shell starts the next session.
+Keep these facts in mind:
 
   • Coordination is via git alone: a branch = a claim, an flock = the rescue mutex.
   • Peers may hold other tasks at the same time — that is expected. Never assume you are alone.
@@ -996,7 +1276,7 @@ Keep these facts in mind for every iteration:
     path `.git/zero.sh` always resolves — call it exactly that, and do all worktree work as
     `cd "$wt" && …` in a SINGLE command.
 
-=== PER-ITERATION ALGORITHM ===
+=== ALGORITHM (one task, then end your turn) ===
 1. FIND candidate tasks yourself in @@TODO@@. Tasks are GitHub-style Markdown checkboxes, one per
    line, each carrying an id as the FIRST whitespace-delimited token after the checkbox:
        - [ ] SMTH-855 some task not done yet     ← UNCHECKED = still to do
@@ -1005,7 +1285,7 @@ Keep these facts in mind for every iteration:
 
    VALIDATION GUARDRAIL (once, before zeroing): collect the ids of ALL tasks in @@TODO@@ (checked
    and unchecked). If any task is missing an id, or the same id appears on more than one line,
-   STOP THE LOOP IMMEDIATELY — report the offending ids and do not schedule the next iteration.
+   STOP IMMEDIATELY — report the offending ids and end your turn without claiming anything.
 2. For each candidate task_id, in order:
    a. INDEPENDENCE — decide by EVIDENCE from the task body, never from its title,
       id, or position in the list:
@@ -1028,14 +1308,16 @@ Keep these facts in mind for every iteration:
         → skip to the next task_id. The reason is printed on stderr.
       - exit 0   → you OWN task_id; its git worktree is at $wt. Continue to step c.
         Do NOT trust the box in `$wt/@@TODO@@` — the claim already re-checked @@BASE_BRANCH@@.
-   c. IMPLEMENT task_id. Scope every edit to THIS task only before you skip to the next one; never touch
-      another task, even one you will process later this same pass (you reach the next task_id
-      at step e — this is per-task, not per-session).
+   c. IMPLEMENT task_id. If task_id's line names an issue/spec file, its acceptance criteria define
+      done for this task — they may span files the task title never mentions: satisfy each and tick
+      it there (`[ ]`→`[x]`) as you land it, never ahead of verifying it.
+      Scope every edit to task_id only; never touch another task.
       @@LOOPPROMPT@@
    d. CHECK OFF only your task_id's line in `$wt/@@TODO@@` (`[ ]`→`[x]`); touch no other line.
       Then commit in `$wt` on the worktree's branch.
    e. MERGE: .git/zero.sh merge task_id "$wt"
-      - exit 0 → merged to @@BASE_BRANCH@@, worktree + branch cleaned → continue to the next task_id.
+      - exit 0 → merged to @@BASE_BRANCH@@, worktree + branch cleaned → your one task is zeroed:
+        report it and END YOUR TURN. Do not claim a second task.
       - exit ≠ 0 with output starting `checkbox-merge: refused` → you checked off more than your own
         task. The output lists each offending line as `<file>:<line> <text>`. In `$wt/@@TODO@@` uncheck
         every listed line EXCEPT task_id's (`[x]`→`[ ]`), keep yours checked, run
@@ -1044,16 +1326,17 @@ Keep these facts in mind for every iteration:
         its worktree $wt and its branch (`git -C "$wt" symbolic-ref --short HEAD`), and ask the human to
         clear the unrelated checkboxes, then merge by hand.
       - any other exit ≠ 0 → a merge conflict. Resolve it yourself, iterating until you merge or you see
-        no better merge option. If you cannot, MERGE FAILED: STOP THE LOOP IMMEDIATELY — report task_id,
+        no better merge option. If you cannot, MERGE FAILED: STOP IMMEDIATELY — report task_id,
         its worktree $wt and its branch (`git -C "$wt" symbolic-ref --short HEAD`), and ask the human to
         "resolve the conflict on that branch, then merge by hand".
-3. If every task in @@TODO@@ is now checked → announce "ALL TASKS DONE" and stop the loop: end this
-   pass WITHOUT scheduling the next iteration. Otherwise end this pass and let the scheduled loop re-fire.
+3. End your turn — after zeroing one task, or after walking the whole list without claiming one
+   (say which happened). If every task in @@TODO@@ is now checked, announce "ALL TASKS DONE" first.
+   What runs next is the shell's call: it starts a fresh session for the next task, waits while
+   peers hold everything, or prints the closing report.
 PROMPT_EOF
     prompt=${prompt%$'\n'}          # read keeps the final newline; $(cat) stripped it
     prompt=${prompt//@@TODO@@/$todo}
     prompt=${prompt//@@BASE_BRANCH@@/$BASE_BRANCH}
-    prompt=${prompt//@@LOOP_INTERVAL@@/$LOOP_INTERVAL}
     prompt=${prompt//@@LOOPPROMPT@@/$loopprompt}
     printf '%s\n' "$prompt"
 }

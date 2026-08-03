@@ -7,6 +7,23 @@ Thanks for helping to improve ClaudeZero. Even snow leopards sharpen their claws
 2. **Make your change.** Keep the diff surgical — match the existing style in
    `claudezero.sh`. Update the README and `TEST.md` if behavior changes.
 
+   **`claudezero.sh` must parse under bash 3.2** — macOS ships it as `/bin/bash`,
+   and a parse error there kills the script before line one runs. Avoid:
+
+   ```sh
+   prompt="$(cat <<'EOF'    # here-doc inside $( … ) — bash 3.2 cannot parse it
+   ...
+   EOF
+   )"
+
+   IFS= read -r -d '' prompt <<'EOF' || :    # use this instead
+   ...
+   EOF
+   ```
+
+   `TEST.md` Scenario S guards it: S3a scans for the construct on any host,
+   S3b parses with a real bash 3.x. Locally: `/bin/bash -n claudezero.sh`.
+
 3. **Keep the CI scripts in sync with `claudezero.sh`.** Two scripts under
    `.github/` mirror details of `claudezero.sh` and drift silently if you don't
    update them:

@@ -4,9 +4,10 @@
 
 <h2 align="center">Todo-list sensei for Claude Code. Zeros your list.</h2>
 <h4 align="center">
-Loops claude until every todo is done, committed, and checked off.<br>
-Restarts it on a fresh context before rot.<br>
-Spawn many instances to parallelize.
+Loops Claude until every todo is done, committed, and checked off.<br>
+Restarts the coding session on a fresh context before rot.<br>
+You can spawn multiple instances to parallelize.<br><br>
+It's for practical <a href="#loop-engineering">Loop engineering</a>.<br>
 </h4>
 
 <p align="center">
@@ -32,6 +33,7 @@ Runs [`claude`](https://claude.com/product/claude-code) on a predefined prompt i
 
 - **Guides Claude to zero a todo list unattended** — one task at a time until all are completed, committed, and checkmarked.
 - **Beats context rot** — session Stop hook SIGTERMs `claude` at ~80% of the context window and restarts clean. Fresh context, no quality decay.
+- **One task per session** — `claude` exits once it has zeroed a single todo and the script restarts it, so every task runs on a context isolated from the task before it, which cuts token spend (~20% on a working instance). An instance that has nothing to claim waits in the shell without launching `claude` at all, spending nothing.
 - **Parallel by default** — run many instances at once; they coordinate via git worktrees, each claiming todos the others haven't taken.
 - **Safe merges** — cross-instance merge-back serialized through `flock`; no races, no corrupted base.
 - **Crash resilient** — if `claude` crashes or is killed mid-task, its half-done work isn't lost. The next instance to come by — a peer switching to its next task, or the same loop restarted — reclaims the branch, finishes it, and merges it back. Work only counts as done once it lands on the base branch and its box is checked there.
@@ -40,13 +42,19 @@ Runs [`claude`](https://claude.com/product/claude-code) on a predefined prompt i
 
 ## Quickstart
 
-Change to your repo root with a todo-list file, and make sure the working tree is in a clean state (commit or stash any changes) and the todo file itself is committed on that branch. Then run `claudezero` pointing to your todo-list:
+```
+brew install IvanRublev/tap/claudezero
+```
+
+Change to your repo root with a todo-list file, and make sure the working tree is in a clean state (commit or stash any changes) and the todo file itself is committed on that branch. 
+
+Then run `claudezero` pointing to your todo-list:
 
 ```
 claudezero todo.md
 ```
 
-Run that command in multiple parallel terminals to work through the todos faster.
+You can run that command in multiple parallel terminals to work through the todos faster.
 
 > ⚠️ ClaudeZero runs `claude` **unattended with permissions auto-approved** and **commits on its own** to the branch you launch it on. Only ever point it at a todo file you wrote or reviewed, on a branch with a clean, committed tree — git is your only undo.
 
@@ -62,7 +70,7 @@ $ claudezero todo.md
 
 … claude works a task: forks a worktree, implements, commits, merges, ticks its box …
 
-❄ claude exited after 1 runs · restarting in 5s · press Ctrl+C to stop
+❄ claude exited with code 0 after 1 runs · restarting in 5s · press Ctrl+C to stop
 
 … fresh context, next task …
 
@@ -142,21 +150,29 @@ GitHub-style Markdown checkboxes, one task per line. Each line carries a **uniqu
 
 ## Loop engineering
 
-[Loop engineering](https://claude.com/blog/getting-started-with-loops) shapes an agent's iteration cycle so it gets *better* across turns, not just runs once. Two halves:
+[Loop engineering](https://claude.com/blog/getting-started-with-loops) shapes an agent's iteration cycle so it gets *better* across turns, not just runs once. It is the outermost of three nested levels — each one only works because the one under it holds:
+
+1. **Spec** — what to build. Expected outputs, constraints, acceptance criteria, done-conditions. The contract everything downstream enforces. Without it the layers above have nothing to check against. Here: the todo file, one task per line, each referencing a separate issue file with the details of the specification.
+2. **Harness** — how to keep the agent on the spec, in two directions. *Feedforward* guides steer before it acts (`CLAUDE.md`, conventions, templates); *feedback* sensors catch after (tests, linters, type checks, review). Feedback alone repeats the same mistakes; feedforward alone never proves it worked. Here: the per-iteration algorithm below, plus whatever guides and checks your repo already has.
+3. **Loop** — who does the prompting. The harness on a timer: self-triggering runs, isolated worktrees, subagents that verify and feed back. You stop prompting turn by turn and start designing the thing that prompts itself. Here: ClaudeZero with `--taskprompt` instruction on how to learn by prompting itself.
+
+Levels 1 and 2 are yours; ClaudeZero supports level 3. Together they steer: when a mistake recurs, you don't only fix the code, you sharpen the spec and/or the harness, and the loop needs you less each pass due to the learning instruction.
+
+Loop engineering has two halves:
 
 1. Mechanics — a durable loop over external state; disposable runs that restart before context rots.
 2. Learning — each turn carries a lesson forward, so the agent stops repeating mistakes.
 
 ClaudeZero owns the mechanics and leaves the learning to you. It drills the *form* precisely — how to claim, zero, commit, and check off a todo without collision or rot. You bring the *material* — what this codebase's tasks should teach. Sensei drills the kata; you bring the fight.
 
-The kata is a strict per-iteration algorithm every instance runs:
+The kata is a strict algorithm every instance runs, one task per `claude` session:
 
 1. Find & validate — collect tasks; a missing or duplicate id stops the loop.
 2. Judge independence by evidence — blocked only if the body quotably consumes an *unchecked* task's output; adjacency is not a dependency.
 3. Claim & re-check — one task per git worktree (branch = claim), then guard against a peer who already landed it.
 4. Implement & check off — scoped to that task, tick only its box, commit.
 5. Merge serially — on a conflict or over-check, self-heal once, else stop and hand off to the user rather than corrupt the base.
-6. Repeat — next id; when every box is checked, announce done and stop.
+6. End the session — the shell starts a fresh one for the next task, or waits without spending a token while peers hold the rest; when every box is checked, announce done and stop.
 
 ### Closing the loop
 
@@ -167,10 +183,11 @@ ClaudeZero never writes `CLAUDE.md` — the harness stays learning-agnostic, so 
 Bake a reflection step into the task prompt; the lesson lands in a committed `CLAUDE.md`, survives the restart, and reaches peers after their next merge:
 
 ```sh
-claudezero todo.md -t 'Implement the task following your setup.
+claudezero todo.md --taskprompt 'Implement the task following your setup.
 When done, if you learned something that will help future tasks — a gotcha, a
 project convention, a command that worked — append one concise bullet under a
-"## Learnings" heading in CLAUDE.md, and include that edit in the task commit.'
+"## Learnings" heading in the project CLAUDE.md, and include that edit 
+in the task commit.'
 ```
 
 Now "the leopard remembers what the last winter taught him."
@@ -206,6 +223,18 @@ claudezero -h
 
 ```sh
 CLAUDEZERO_MAX_LOOPS=3 claudezero todo.md
+```
+
+**`CLAUDEZERO_WATCHDOG`** — how long one `claude` may make no progress before it is killed. Default `15m`; accepts plain seconds or an `s`/`m`/`h` suffix (`900`, `90s`, `15m`, `1h`), and `0` disables it. A `claude` that stops making progress never exits, so without the timer the loop parks on it forever — no restart, no report, and nothing left to stop but the whole run. Progress is measured as `claude`'s own cumulative CPU time, not wall clock: one that is thinking, streaming, or running tools burns CPU and keeps resetting the window however long the task takes, while one blocked on a dead socket burns none. When the timer fires it says so on its own console line, then `SIGTERM`s `claude` (the same signal the Stop hook uses, so the restart path is the usual one) and escalates to `SIGKILL` 10s later. The task worktree survives the kill: the next session reclaims it through the crash-recovery path.
+
+```sh
+CLAUDEZERO_WATCHDOG=45m claudezero todo.md
+```
+
+**`CLAUDEZERO_LINK`** — comma-separated top-level names symlinked from the repo root into every task worktree. Unset by default. A worktree is a checkout of tracked files only, so anything gitignored is absent there: if your todo lines point at spec files you keep in another git repository — `issues/ISSUE-031.md` holding the acceptance criteria for `- [ ] ISSUE-031 …` — the session never sees them and works from the one-line title alone. Listing the directory here links it in, so the criteria are readable and a tick lands in the real file rather than in a copy the worktree removal deletes. Each linked name is added to `.git/info/exclude`, so it stays out of the session's `git add -A` and out of this repository.
+
+```sh
+CLAUDEZERO_LINK=issues claudezero todo.md
 ```
 
 ### Logging a run

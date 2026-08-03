@@ -4,6 +4,74 @@ All notable changes to ClaudeZero are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); this project uses
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.0.16] — 2026-08-03
+
+### Added
+
+- `CLAUDEZERO_WATCHDOG` kills a `claude` that has stopped making progress
+  mid-turn, so a wedged API call or a hung tool costs one timeout instead of the
+  whole overnight run. Progress is claude's own cumulative CPU time, so a long
+  honest run is never killed — only one that has stopped working. SIGTERM first,
+  SIGKILL after a 10s grace. Default `15m`; `0` disables it. The kill prints its
+  own `❄ watchdog · no progress from claude for …` line, so it is never mistaken
+  for the ordinary context-full restart (ISSUE-032).
+- `CLAUDEZERO_LINK` — comma-separated top-level names symlinked from the repo
+  root into every task worktree, unset by default. A worktree checks out tracked
+  files only, so a gitignored spec directory a todo line points at is simply not
+  there: the session falls back to the one-line title and reports done against
+  it. Through a link the session reads the acceptance criteria and ticks them in
+  the real file. The whole list is validated at startup and a bad entry (empty,
+  containing `/`, or missing at the repo root) refuses the run — a typo costs the
+  launch, not the tasks (ISSUE-033).
+- `CLAUDEZERO_DEBUG` adds `--debug-file .git/debug-<base>-<instance>-<loop>.log`
+  to the `claude` invocation, so a repeat of a rare startup flake leaves a trace
+  instead of a bare hang. Off by default — a diagnostic opt-in, not a standing
+  cost on every run. Unset, the claude argv is unchanged (ISSUE-030).
+- An `Environment:` block on the `-h`/`--help` screen naming `CLAUDEZERO_WATCHDOG`
+  and `CLAUDEZERO_LINK` with their formats and defaults, so neither knob has to be
+  found by reading the script (ISSUE-032, ISSUE-033).
+- A waiting line while every unchecked task is peer-held: a spinner with an
+  elapsed clock and the held count on a terminal, a periodic line every 20s when
+  stdout is a log or a pipe (ISSUE-031).
+
+### Changed
+
+- A `claude` session zeroes exactly one task and exits; the wait for the next
+  claimable task lives in `claudezero.sh` instead of inside claude. `/loop` is
+  gone from the zero prompt, and the Stop hook now ends the session at every turn
+  end rather than only when the context bucket crosses its threshold. Every task
+  therefore starts on a context isolated from the task before it (~20% fewer
+  tokens on a working instance), and an instance with nothing to claim launches
+  no `claude` at all instead of re-sending a startup context per probe. 
+  `-l/--loopprompt` is unaffected (ISSUE-031).
+- Both "claude exited after N runs" lines — `CLAUDEZERO_MAX_LOOPS`-reached and
+  restarting — carry claude's real exit code: `claude exited with code %s after
+  %s runs · …`. A hang is visible without re-deriving it from timing, and it is
+  one line per event, not two (ISSUE-030).
+- A run stopped by SIGTERM exits `143` (128+15), so a supervisor can tell
+  "terminated" from "finished". Plain `timeout` callers still see its own `124`;
+  use `timeout --preserve-status` to observe the 143 (BUG-029).
+
+### Fixed
+
+- A SIGTERM arriving while `claude` hangs no longer kills the run silently.
+  `claude` ran as a foreground child, and bash defers every trap until a
+  foreground child exits — so with a hung child no handler could run, the
+  follow-up SIGKILL ended the process mid-wait, and the run dropped its
+  `❄ execution stats` report, the fleet `❄ TOTAL`, and the EXIT trap that clears
+  the instance liveness marker. `claude` is now backgrounded and reaped with a
+  re-entrant `wait`, and a trapped TERM forwards to claude and breaks to the
+  existing closer, so every exit path lands at the closing report (BUG-029).
+- The watchdog's SIGKILL escalation rechecks `kill -0` before firing: if the
+  earlier SIGTERM already reaped `claude`, the OS can recycle that pid during
+  the grace sleep, and a blind SIGKILL would land on whatever unrelated process
+  holds it next.
+- `term_owner`/`find_owner` prefer the inherited `CLAUDE_PID` over the bare
+  ancestor-name walk: the walk matched any process named `claude` up to 8 hops
+  with no check it was this session's own, so a live `claude` sitting in the
+  ancestry for an unrelated reason (a nested Task agent, this tool being
+  dogfood-tested from inside a real session) got SIGTERMed instead.
+
 ## [0.0.15] — 2026-07-31
 
 ### Added
