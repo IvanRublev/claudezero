@@ -1419,11 +1419,20 @@ echo "O6 no launches     : $(wc -l < "$STUB_LAUNCHED" | tr -d ' ')  (want 0 — 
 - **O6 PASS** — `missing exit = 1`, `nested exit = 1`, `one bad kills = 1`, each with its naming
   line = 1, and `no launches = 0`.
 
+### O7 — `--help` names the variable, so it is discoverable without the README
+```bash
+H="$(bash "$SCRIPT" -h)"
+echo "O7 env block       : $(printf '%s' "$H" | grep -c 'Environment:')  (want 1)"
+echo "O7 names the var   : $(printf '%s' "$H" | grep -c 'CLAUDEZERO_LINK=name\[,name')  (want 1 — the comma-separated form)"
+echo "O7 says default    : $(printf '%s' "$H" | grep -c 'Unset by default')  (want 1)"
+```
+- **O7 PASS** — all three = 1.
+
 - **O PASS** — every line reports its `want` value. Together they cover the link and its
   readability (O1), write-through with no commit and an empty `git add -A` (O1), the unlisted and
   unset cases (O1/O2), `link_ignored` carrying no validation of its own (O3), a second claim
   appending no duplicate `info/exclude` entry and a dangling link surviving the `-L` guard (O4),
-  the untouched merge gate (O5), and the startup refusals (O6).
+  the untouched merge gate (O5), the startup refusals (O6), and the `--help` `Environment:` block (O7).
 
 ---
 

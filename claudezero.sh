@@ -47,6 +47,15 @@ version @@VERSION@@
 
   -t and -l are mutually exclusive.
 
+  Environment:
+
+    CLAUDEZERO_LINK=name[,name…]   Top-level directories symlinked from the repo root
+                                   into every task worktree. Unset by default. A worktree
+                                   checks out tracked files only, so gitignored spec
+                                   directories a todo line points at are absent there;
+                                   listing them here lets a session read the acceptance
+                                   criteria and tick them in the real file.
+
   Log a run (ClaudeZero's own output only; claude's TUI stays on the terminal):
 
     @@PROG@@ issues/todo.md 2>&1 | { trap '' INT; tee ../run.log; }
