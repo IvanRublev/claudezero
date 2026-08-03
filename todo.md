@@ -17,6 +17,6 @@
 - [x] ISSUE-028 Show the script version on its own line below the usage heading in `--help`
 - [x] BUG-029 Background claude and trap TERM so a SIGTERM while claude hangs still lands at the closing report and exits 143
 - [x] ISSUE-030 Surface claude's own exit code on the restart/stop lines and add an opt-in `CLAUDEZERO_DEBUG` `--debug-file` capture
-- [ ] ISSUE-031 Zero one task per claude session and wait for the next claimable task in the shell — drop `/loop`, keep the context-full restart
+- [x] ISSUE-031 Zero one task per claude session and wait for the next claimable task in the shell — drop `/loop`, keep the context-full restart
 - [ ] ISSUE-032 Kill a hung claude with a `CLAUDEZERO_WATCHDOG` timer (default 15m) and name the watchdog on its own console line
 - [x] ISSUE-033 Symlink gitignored spec directories into every task worktree with `CLAUDEZERO_LINK` so a session reads the acceptance criteria its todo line points at
