@@ -21,7 +21,7 @@ WAIT_TICK=5          # seconds between claimable-task probes while every uncheck
 WAIT_FRAME=1         # seconds per spinner frame on a terminal — one |/-\ revolution every 4
 WAIT_STEP=5          # seconds the terminal's elapsed clock advances in — at 1Hz a live clock is noise
 LOG_TICK=20          # seconds between waiting lines when stdout is a log or a pipe, not a terminal
-WATCHDOG_DEFAULT=15m # CLAUDEZERO_WATCHDOG default: how long ONE claude may run before it is killed
+WATCHDOG_DEFAULT=15m # CLAUDEZERO_WATCHDOG default: how long claude may burn no CPU before it is killed
 WATCHDOG_GRACE=10    # seconds the watchdog waits after its SIGTERM before escalating to SIGKILL
 
 # The braces around the pipe reader in the logging example are load-bearing — do NOT tidy them
@@ -31,7 +31,8 @@ WATCHDOG_GRACE=10    # seconds the watchdog waits after its SIGTERM before escal
 # inherits it and drains the pipe until ClaudeZero exits.
 usage() {
   # single-quoted heredoc keeps backticks literal; sed injects the RESTART_WAIT constant.
-  sed -e "s/@@RESTART_WAIT@@/$RESTART_WAIT/g" -e "s/@@PROG@@/$PROG/g" -e "s/@@VERSION@@/$VERSION/g" <<'USAGE'
+  sed -e "s/@@RESTART_WAIT@@/$RESTART_WAIT/g" -e "s/@@PROG@@/$PROG/g" -e "s/@@VERSION@@/$VERSION/g" \
+      -e "s/@@WATCHDOG_DEFAULT@@/$WATCHDOG_DEFAULT/g" <<'USAGE'
 usage: @@PROG@@ [todo-file-path] [-t|--taskprompt TEXT | -l|--loopprompt TEXT]
 version @@VERSION@@
 
@@ -48,6 +49,12 @@ version @@VERSION@@
   -t and -l are mutually exclusive.
 
   Environment:
+
+    CLAUDEZERO_WATCHDOG=duration   How long claude may make no progress before the watchdog
+                                   kills it, in seconds or with an s/m/h suffix (900, 90s,
+                                   15m, 1h). Default @@WATCHDOG_DEFAULT@@; 0 disables the watchdog.
+                                   Progress is claude's own CPU time, so a long honest run
+                                   is never killed — only one that has stopped working.
 
     CLAUDEZERO_LINK=name[,name…]   Top-level directories symlinked from the repo root
                                    into every task worktree. Unset by default. A worktree
@@ -427,25 +434,36 @@ parse_dur() {
   printf '%s' $((n * mult))
 }
 
+# cumulative CPU time of pid $1 as `ps` prints it, spaces squeezed out; empty once the process is
+# gone. The watchdog's liveness sample: only equality between two readings matters, so the differing
+# BSD (`0:00.03`) and GNU (`00:00:00`) spellings both work and neither needs parsing.
+cpu_time() { ps -o time= -p "$1" 2>/dev/null | tr -d '[:space:]'; }
+
 # start the timer for the claude at $1 (no-op when the watchdog is disabled). A claude that stops
 # making progress never exits, so the loop would park on it forever — no restart, no report, and
 # nothing to Ctrl+C but the whole run. SIGTERM is what the Stop hook already uses, so the kill lands
 # on the tested restart path; SIGKILL follows for a claude that ignores it. The watchdog names
 # itself on its own console line, so the exit-code line under it is not read as claude's own choice.
-# It counts down in WAIT_TICK naps instead of one long sleep so a claude that exits on its own
+# It samples in WAIT_TICK naps instead of sleeping the whole window so a claude that exits on its own
 # retires its timer within a tick — an armed sleeper outliving its claude would eventually fire at
 # a pid the OS has since handed to somebody else.
+# The sample is CPU time, not wall clock: a flat cap would kill the honest long runs this loop is
+# built to leave unattended, while a claude that thinks, streams, or runs tools always burns CPU and
+# one blocked on a dead socket burns none. Any advance restarts the full window.
 arm_watchdog() {
   WATCHDOG_PID=""
   [ "$WATCHDOG_SECS" -gt 0 ] || return 0
   local pid=$1
   {
-    local left=$WATCHDOG_SECS
+    local left=$WATCHDOG_SECS cpu last
+    last="$(cpu_time "$pid")"
     while [ "$left" -gt 0 ] && kill -0 "$pid" 2>/dev/null; do
       sleep "$WAIT_TICK"; left=$((left - WAIT_TICK))
+      cpu="$(cpu_time "$pid")"
+      [ "$cpu" = "$last" ] || { last="$cpu"; left=$WATCHDOG_SECS; }
     done
     if kill -0 "$pid" 2>/dev/null; then
-      printf '\n❄ watchdog · claude ran %s without exiting · killing it (CLAUDEZERO_WATCHDOG=%s)\n' \
+      printf '\n❄ watchdog · no progress from claude for %s · killing it (CLAUDEZERO_WATCHDOG=%s)\n' \
         "$(fmt_dur "$WATCHDOG_SECS")" "$WATCHDOG_RAW"
       kill -TERM "$pid" 2>/dev/null || true
       sleep "$WATCHDOG_GRACE"

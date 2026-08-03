@@ -1268,7 +1268,8 @@ echo "M5 no odd clock  : $(grep -cE '· [0-9]*[1-46-9]s' "$TM/frames.txt")  (wan
 A claude that stops making progress never exits, so the loop parks on it forever. The watchdog
 is the cutoff: it names itself on its own console line, SIGTERMs claude onto the ordinary
 restart path, and escalates to SIGKILL for a claude that ignores TERM. A claude that exits on
-its own must never see it, and `0` must switch it off.
+its own must never see it, and `0` must switch it off. Progress is claude's own CPU time, not
+wall clock, so a claude still working past the window must survive it (N4).
 
 ### Setup
 ```bash
@@ -1284,7 +1285,7 @@ cd "$TN/repo"
 printf '#!/usr/bin/env bash\necho "stub hung"\nsleep 1000\n' > "$TN/bin/claude"; chmod +x "$TN/bin/claude"
 PATH="$TN/bin:$PATH" CLAUDEZERO_WATCHDOG=5 timeout 90 env CLAUDEZERO_MAX_LOOPS=2 bash "$SCRIPT" todo.md -t x > "$TN/hang.log" 2>&1
 echo "N1 exit          : $?  (want 0 — the watchdog's kill is a restart, not a failure of the run)"
-echo "N1 watchdog line : $(grep -c '❄ watchdog · claude ran 5s without exiting · killing it (CLAUDEZERO_WATCHDOG=5)' "$TN/hang.log")  (want 2 — its own line, once per hung launch)"
+echo "N1 watchdog line : $(grep -c '❄ watchdog · no progress from claude for 5s · killing it (CLAUDEZERO_WATCHDOG=5)' "$TN/hang.log")  (want 2 — its own line, once per hung launch)"
 echo "N1 restart code  : $(grep -c 'claude exited with code 143 after 1 runs · restarting in' "$TN/hang.log")  (want 1 — SIGTERM, so the tested restart path)"
 echo "N1 runs          : $(grep -c 'stub hung' "$TN/hang.log")  (want 2 — the loop went on instead of parking on run 1)"
 echo "N1 orphans       : $(pgrep -f "$TN/bin/claude" | wc -l | tr -d ' ')  (want 0)"
@@ -1319,6 +1320,19 @@ echo "N3 bad warning   : $(grep -c 'ignoring CLAUDEZERO_WATCHDOG=15min' "$TN/bad
 ```
 - **N3 PASS** — `off exit = 124` with `off line = 0`, `healthy exit = 0` with `healthy line = 0`,
   and `bad exit = 0` with `bad warning = 1`.
+
+### N4 — a claude still working past the window is not killed
+```bash
+cd "$TN/repo"
+# burns CPU in the claude process itself for 3× the window, then exits on its own
+printf '#!/usr/bin/env bash\necho "stub busy"\nend=$((SECONDS+15))\nwhile [ $SECONDS -lt $end ]; do :; done\nexit 0\n' > "$TN/bin/claude"; chmod +x "$TN/bin/claude"
+PATH="$TN/bin:$PATH" CLAUDEZERO_WATCHDOG=5 timeout 60 env CLAUDEZERO_MAX_LOOPS=1 bash "$SCRIPT" todo.md -t x > "$TN/busy.log" 2>&1
+echo "N4 busy exit     : $?  (want 0 — the stub ran 3× the window and finished by itself)"
+echo "N4 busy line     : $(grep -c '❄ watchdog' "$TN/busy.log")  (want 0 — advancing CPU time resets the window)"
+echo "N4 own exit code : $(grep -c 'claude exited with code 0 after 1 runs' "$TN/busy.log")  (want 1 — not 143/137)"
+```
+- **N4 PASS** — `busy exit = 0`, `busy line = 0`, `own exit code = 1`. Wall clock alone would have
+  killed it at 5s; only the CPU-time sample tells honest long work from a wedged socket.
 
 ---
 
