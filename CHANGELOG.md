@@ -62,6 +62,15 @@ All notable changes to ClaudeZero are documented here. Format follows
   the instance liveness marker. `claude` is now backgrounded and reaped with a
   re-entrant `wait`, and a trapped TERM forwards to claude and breaks to the
   existing closer, so every exit path lands at the closing report (BUG-029).
+- The watchdog's SIGKILL escalation rechecks `kill -0` before firing: if the
+  earlier SIGTERM already reaped `claude`, the OS can recycle that pid during
+  the grace sleep, and a blind SIGKILL would land on whatever unrelated process
+  holds it next.
+- `term_owner`/`find_owner` prefer the inherited `CLAUDE_PID` over the bare
+  ancestor-name walk: the walk matched any process named `claude` up to 8 hops
+  with no check it was this session's own, so a live `claude` sitting in the
+  ancestry for an unrelated reason (a nested Task agent, this tool being
+  dogfood-tested from inside a real session) got SIGTERMed instead.
 
 ## [0.0.15] — 2026-07-31
 
