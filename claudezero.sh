@@ -373,7 +373,18 @@ if [ -n "$tf" ]; then
 fi
 # nearest ancestor named 'claude' → SIGTERM (graceful: reaps bash tree, runs SessionEnd hooks,
 # exits 143). Turn already saved, so the kill loses nothing.
+# Claude Code exports CLAUDE_PID (its own pid) into this hook's env same as any Bash-tool child —
+# that IS the owning session, no walk needed. Verified alive + still named claude before trusting
+# it (a stale inherited value must never fire): this hook's own comment above the outer loop notes
+# the same var can carry a STALE pid across an unrelated invocation boundary. Only when it is
+# absent or fails that check do we fall back to the name-walk, which has no such guarantee — every
+# ancestor up to 8 hops is bare-name-matched, and a live real `claude` sitting there for any other
+# reason (e.g. this hook under test, nested inside a real claude session) gets SIGTERMed instead.
 term_owner() {
+  if [ -n "${CLAUDE_PID:-}" ] && kill -0 "$CLAUDE_PID" 2>/dev/null; then
+    comm="$(ps -o comm= -p "$CLAUDE_PID" 2>/dev/null)"
+    [ "${comm##*/}" = claude ] && { kill -TERM "$CLAUDE_PID"; return 0; }
+  fi
   pid=$PPID; depth=0
   while [ -n "$pid" ] && [ "$pid" -gt 1 ] && [ "$depth" -lt 8 ]; do
     comm="$(ps -o comm= -p "$pid" 2>/dev/null)" || return 0
@@ -900,7 +911,15 @@ BR_SLUG="${BASE_BRANCH//\//-}"
 task_branch() { printf '%s-task-%s' "$BASE_BRANCH" "$1"; }
 
 # Owner = nearest ancestor process named 'claude' (the Bash tool may nest a shell in between).
+# Claude Code exports CLAUDE_PID (its own pid) into this Bash-tool child same as the hook's — try
+# it first (verified alive + still named claude) so a nested Task agent's zero.sh never has to
+# guess which of several real 'claude' ancestors is its own; only fall back to the walk, whose
+# bare-name match has no such guarantee, when that var is absent or fails the check.
 find_owner() {
+  if [ -n "${CLAUDE_PID:-}" ] && kill -0 "$CLAUDE_PID" 2>/dev/null; then
+    local c; c=$(ps -o comm= -p "$CLAUDE_PID" 2>/dev/null)
+    [ "${c##*/}" = claude ] && { echo "$CLAUDE_PID"; return 0; }
+  fi
   local pid=$PPID comm depth=0
   while [ -n "$pid" ] && [ "$pid" -gt 1 ] && [ "$depth" -lt 8 ]; do
     comm=$(ps -o comm= -p "$pid" 2>/dev/null) || return 1

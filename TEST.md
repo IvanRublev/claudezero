@@ -970,7 +970,12 @@ DRIVE
 
 ### Run + assert
 ```bash
-TI="$TI" "$TI/bin/claude" "$TI/drive.sh"
+# -u CLAUDE_PID: this driver IS the ancestor find_owner/term_owner must walk to. An agent
+# running this file autonomously already has a real CLAUDE_PID in env (its own live session) —
+# left set, find_owner trusts that inherited pid over the nearer stub ancestor below, since
+# claudezero.sh trusts CLAUDE_PID whenever it is alive and named claude, with no check that it's
+# actually this invocation's ancestor. Unset so the stub is the only candidate found.
+TI="$TI" env -u CLAUDE_PID "$TI/bin/claude" "$TI/drive.sh"
 ```
 - **I PASS** — every line reports its `want` value. Together they cover the four exit paths, the
   single-field stdout the prompt's `wt=$(…)` depends on, the exit-3 claim leak (I4/I5), and the
@@ -1243,7 +1248,12 @@ echo "M3 closing report: $(grep -c 'execution stats' "$TM/done.log")  (want >=1 
 cd "$TM/repo"
 CLAUDEZERO_TEST_EMIT=1 bash "$SCRIPT" todo.md -t x > /dev/null 2>&1
 HOOK="$TM/repo/.git/compact-exit-hook.sh"
-run_as_claude(){ CLAUDEZERO_MODE="$1" "$TM/owner/claude" -c 'printf "%s" "$2" | bash "$1" >/dev/null 2>&1; sleep 3' _ "$HOOK" "$2"; echo $?; }
+# -u CLAUDE_PID: "$TM/owner/claude" below IS the ancestor term_owner must SIGTERM. An agent
+# running this file autonomously already has a real CLAUDE_PID in env (its own live session) —
+# left set, term_owner trusts that inherited pid unconditionally (alive + named claude, no check
+# it's actually this invocation's ancestor) and SIGTERMs the live agent running the test instead
+# of the stub. Unset so the stub is the only candidate the ancestor walk can find.
+run_as_claude(){ CLAUDEZERO_MODE="$1" env -u CLAUDE_PID "$TM/owner/claude" -c 'printf "%s" "$2" | bash "$1" >/dev/null 2>&1; sleep 3' _ "$HOOK" "$2"; echo $?; }
 echo "M4 zero mode     : $(run_as_claude zero '{}')  (want 143 — ordinary turn end SIGTERMs the owning claude)"
 echo "M4 loop mode     : $(run_as_claude loop '{}')  (want 0 — -l has no task boundary, so it is left running)"
 B="${TMPDIR:-/tmp}"; B="${B%/}/claude-context-bucket-czM4"; : > "$B"
@@ -1430,7 +1440,10 @@ DRIVE
 
 ### Run + assert
 ```bash
-TO="$TO" "$TO/bin/claude" "$TO/drive.sh"
+# -u CLAUDE_PID: see Scenario I — this driver IS the ancestor find_owner must walk to, and an
+# inherited real CLAUDE_PID (an agent running this file autonomously has its own) would otherwise
+# be trusted over the nearer stub.
+TO="$TO" env -u CLAUDE_PID "$TO/bin/claude" "$TO/drive.sh"
 ```
 
 ### O6 — a bad `CLAUDEZERO_LINK` refuses the run at startup, before any claude
