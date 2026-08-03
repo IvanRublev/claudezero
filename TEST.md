@@ -4,11 +4,14 @@ Each scenario lives in its own folder under a single **isolated TESTROOT created
 outside the repo** (via `mktemp -d`). They touch separate throwaway git repos, never
 the project's own working tree or history, and can run concurrently.
 
+- **S — static checks (shellcheck + bash 3.2 syntax).** No claude. Lints `claudezero.sh` and
+  the scripts it emits at runtime, then checks the bash 3.2 heredoc-in-`$(...)` constraint
+  structurally and, where available, with a real bash 3.x parse.
 - **A — parallel zeroing + restart-resume + timing.** 3 agents zero one todo in
   parallel; the script restarts each claude after every task (`CLAUDEZERO_MAX_LOOPS`)
   and resumes. Also asserts the per-instance execution-time report and env-hop.
-- **B — startup-guard refusals.** dirty-tree and detached-HEAD both refuse to start.
-  Pure bash, no claude, finishes in seconds.
+- **B — startup-guard refusals.** dirty-tree, detached-HEAD, wrong-cwd, inside-a-leftover
+  worktree, and untracked-todo all refuse to start. Pure bash, no claude, finishes in seconds.
 - **C — merge-conflict path.** two tasks edit the same line; one merges, the other
   hits a conflict, and the zero run aborts cleanly leaving the base green and the branch for
   a human.
@@ -16,10 +19,40 @@ the project's own working tree or history, and can run concurrently.
   task's box; `merge_task` refuses with a pointer and the agent self-heals (step 2.e).
 - **E — timing accounting.** Deterministic, **no real claude** (a stub `claude` on PATH):
   per-instance in-flight credit routing + idempotency, and startup orphan-file GC.
-- **G — token accounting.** Deterministic, **no real claude** (a stub that fabricates a
+- **F — fenced-checkbox immunity.** Deterministic, no real claude. A `- [ ]`/`- [x]` box
+  inside a fenced code block is prose, not a task — proven for `all_todos_done`/`dojo_proud`
+  and for `zero.sh done`/`box_checked_on_base`.
+- **G1 — token accounting.** Deterministic, **no real claude** (a stub that fabricates a
   session transcript and fires the real Stop hook): `requestId` dedupe, no double-count of
   the nested `iterations`/`cache_creation` fields, accumulation across restarts, and
   `Tokens: n/a` degradation.
+- **G2 — claude's output descriptor (fd 4).** Deterministic. claude writes to fd 4 so a
+  captured run still gets the `❄` reports without the TUI; proves the no-tty fallback to
+  stdout and, via a pty, that the TUI/report split actually holds both ways.
+- **H — claude session display name.** Deterministic. `--name` carries `(<id>) <nickname> ·
+  <activity>` as one argv element, stable across restarts, unique among live peers, and
+  freed again on exit or crash.
+- **I — `zero.sh claim` exit paths.** Deterministic. The four `claim` outcomes — free,
+  peer-held, peer-landed, validation-failed — and their exit codes, plus the exit-3 claim
+  leak and raw-vs-sanitized id matching.
+- **J — fleet TOTAL on the exit path.** Deterministic. The exit-path report sums every
+  peer's per-instance todo/token files into one fleet TOTAL, including a crashed peer that
+  left files but no live marker.
+- **K — SIGTERM while claude hangs.** Deterministic. A hung claude is reaped on SIGTERM
+  (backgrounded + interruptible `wait`) without losing the exit report; normal exit and
+  restart paths are unaffected.
+- **L — claude's exit code + `--debug-file`.** Deterministic. Restart/stop log lines carry
+  claude's real exit code, and `CLAUDEZERO_DEBUG` opts into a per-invocation `--debug-file`
+  with no argv change when unset.
+- **M — one task per session, the shell waits.** Deterministic. The claimable-task probe
+  lives in the shell now: nothing left → close; everything unchecked held by a live peer →
+  wait with no claude launched; anything free (including a crashed peer's branch) → launch.
+- **N — the `CLAUDEZERO_WATCHDOG` timer.** Deterministic. A stalled claude is killed (TERM
+  then KILL) and restarted based on CPU-time inactivity, not wall clock; `0` disables it, a
+  healthy or still-working claude is left alone.
+- **O — `CLAUDEZERO_LINK` into task worktrees.** Deterministic. Symlinks a gitignored
+  directory into a task worktree, write-through, invisible to git via `info/exclude`,
+  validated at startup before any claude launch.
 
 Parallelism (A, C) is enforced with a **file-lock barrier**, not `sleep`, so the
 proof is independent of claude startup/shutdown times.
@@ -83,7 +116,7 @@ ago(){ date -v-"$1"S +%Y%m%d%H%M.%S 2>/dev/null || date -d "-$1 sec" +%Y%m%d%H%M
 in_testroot(){ case "$PWD" in "$TESTROOT"/*) return 0;; *)
   echo "REFUSING: cwd $PWD is not under TESTROOT=$TESTROOT — not invoking claudezero.sh" >&2; return 1;; esac; }
 
-# decoy ancestor for any block that manually fires the real compact-exit-hook.sh (only Scenario G
+# decoy ancestor for any block that manually fires the real compact-exit-hook.sh (only Scenario G1
 # does today). term_owner()/find_owner() in claudezero.sh first trust an inherited CLAUDE_PID if
 # it's alive and named claude, else walk up to 8 PPID hops for the first ancestor whose `ps -o
 # comm=` reads claude, and SIGTERM it. An agent running this file autonomously already has a real,
@@ -609,7 +642,7 @@ cd "$TF/repo"
 - **F2 PASS** — `real done id = 0`, both fenced ids = `1`: a checked example box never
   reports a task as landed.
 
-## Scenario G — token accounting   `[$TESTROOT/G]`   (stub claude, deterministic)
+## Scenario G1 — token accounting   `[$TESTROOT/G]`   (stub claude, deterministic)
 
 The token figures come from the session transcripts the Stop hook records, so a stub
 `claude` that fabricates a transcript and then fires the **real** hook exercises the whole
@@ -656,22 +689,26 @@ printf -- '- [ ] G1 x\n' > todo.md; git add -A; git commit -qm init
 # guarded (see Section 0): the stub below pipes straight into the real compact-exit-hook.sh,
 # whose term_owner() SIGTERMs a `claude`-named ancestor — without the decoy that ancestor walk
 # lands on the real agent session running this file, not the stub.
-grun() { rm -rf "$TG/tx"; mkdir -p "$TG/tx"
-  guard "PATH='$TG/bin:\$PATH' TG_TX='$TG/tx' TG_MODE='$1' timeout 90 env CLAUDEZERO_MAX_LOOPS=3 bash '$SCRIPT' todo.md -t x > '$2' 2>&1" || true; }
+grun() { rm -rf "$TG/tx"; mkdir -p "$TG/tx"; : > "$2"
+  guard "PATH='$TG/bin:$PATH' TG_TX='$TG/tx' TG_MODE='$1' timeout 90 env CLAUDEZERO_MAX_LOOPS=3 bash '$SCRIPT' todo.md -t x > '$2' 2>&1" || true
+  # the decoy above IS the ancestor term_owner() SIGTERMs when loop 1's Stop hook fires, so it
+  # dies (and `wait $!` returns) after just one loop; the run itself keeps going detached the
+  # other two. Poll the log for all three per-loop reports instead of trusting the early return.
+  i=0; while [ "$(grep -c 'execution stats' "$2" 2>/dev/null || echo 0)" -lt 3 ] && [ "$i" -lt 190 ]; do sleep 0.5; i=$((i+1)); done; }
 ```
 
-### G1 — dedupe, no double-count, accumulation across restarts
+### G1.1 — dedupe, no double-count, accumulation across restarts
 ```bash
 cd "$TG/repo"
 grun ok "$TG/ok.log"
 GC="$(cd "$(git rev-parse --git-common-dir)" && pwd)"
 inst="$(sed -n 's/.*execution stats (instance \([A-Za-z0-9]*\) · .*/\1/p' "$TG/ok.log" | head -1)"
-echo "G1 heading       : $(grep -c 'execution stats' "$TG/ok.log")  (want 3 — a report between runs 1|2 and 2|3, plus the closing one)"
-echo "G1 report 1      : $(grep -A1 'Tokens:' "$TG/ok.log" | sed -n '1,2p' | tr '\n' '|')"
-echo "G1 report 2      : $(grep -A1 'Tokens:' "$TG/ok.log" | sed -n '4,5p' | tr '\n' '|')"
-echo "G1 per-instance  : $([ -f "$GC/transcripts-main-$inst" ] && echo yes || echo NO)  (instance $inst)"
+echo "G1.1 heading       : $(grep -c 'execution stats' "$TG/ok.log")  (want 3 — a report between runs 1|2 and 2|3, plus the closing one)"
+echo "G1.1 report 1      : $(grep -A1 'Tokens:' "$TG/ok.log" | sed -n '1,2p' | tr '\n' '|')"
+echo "G1.1 report 2      : $(grep -A1 'Tokens:' "$TG/ok.log" | sed -n '4,5p' | tr '\n' '|')"
+echo "G1.1 per-instance  : $([ -f "$GC/transcripts-main-$inst" ] && echo yes || echo NO)  (instance $inst)"
 ```
-- **G1 PASS** — `heading = 3`, and the first two reports read exactly:
+- **G1.1 PASS** — `heading = 3`, and the first two reports read exactly:
   - report 1: `  Tokens: 1.7k Total|  in 15 · out 27 · cache write 248 · cache read 1.5k|`
     — `req_A`'s three identical lines counted **once** (10+5 in, 20+7 out), `iterations[]`
     not added on top, and the cache write is `248`, not `496` (leaves not added to parent).
@@ -681,28 +718,28 @@ echo "G1 per-instance  : $([ -f "$GC/transcripts-main-$inst" ] && echo yes || ec
   - `per-instance = yes`: the transcript list is namespaced `transcripts-main-<instance>`,
     so parallel instances can never read each other's figures.
 
-### G2 — degradation: never lie, never fail the run
+### G1.2 — degradation: never lie, never fail the run
 ```bash
 cd "$TG/repo"
 grun missing "$TG/missing.log"; grun bad "$TG/bad.log"
-echo "G2 missing file : $(grep -c 'Tokens: n/a' "$TG/missing.log")  (want 4 — one per report, plus the fleet TOTAL)"
-echo "G2 invalid json : $(grep -c 'Tokens: n/a' "$TG/bad.log")  (want 4 — one per report, plus the fleet TOTAL)"
-echo "G2 timing kept  : $(grep -c 'ClaudeZero run loop:' "$TG/bad.log")  (want 3 — one per report; TOTAL omits the row, summed wall times are not a duration)"
+echo "G1.2 missing file : $(grep -c 'Tokens: n/a' "$TG/missing.log")  (want 4 — one per report, plus the fleet TOTAL)"
+echo "G1.2 invalid json : $(grep -c 'Tokens: n/a' "$TG/bad.log")  (want 4 — one per report, plus the fleet TOTAL)"
+echo "G1.2 timing kept  : $(grep -c 'ClaudeZero run loop:' "$TG/bad.log")  (want 3 — one per report; TOTAL omits the row, summed wall times are not a duration)"
 ```
-- **G2 PASS** — both runs print `Tokens: n/a` in every report and in the fleet TOTAL, and
+- **G1.2 PASS** — both runs print `Tokens: n/a` in every report and in the fleet TOTAL, and
   still print the timing rows: a deleted transcript or a truncated/invalid line degrades to
   `n/a` and the run completes normally instead of printing a wrong number.
 
 ---
 
-## Scenario G — claude's output descriptor (fd 4)   `[$TESTROOT/G]`   (stub claude, deterministic)
+## Scenario G2 — claude's output descriptor (fd 4)   `[$TESTROOT/G]`   (stub claude, deterministic)
 
 claude writes to fd 4 so `claudezero.sh … | tee run.log` logs the `❄` reports without the
 TUI. Only the *fallback* is deterministic here: with stdin off the terminal there is no tty to
 split to, so fd 4 must fall back to plain stdout and the stub's bytes must still appear in the
 captured stream. The split itself needs a pty — manual check below.
 
-### Setup + assert
+### G2.1 — fd 4 fallback (no tty)
 ```bash
 TG="$TESTROOT/G"; mkdir -p "$TG/repo" "$TG/bin"
 cat > "$TG/bin/claude" <<'EOF'
@@ -717,15 +754,15 @@ printf -- '- [ ] G1 x\n' > todo.md; git add -A; git commit -qm init
 # stdin off the terminal: fd 4 has no tty to split to and must fall back to stdout
 env PATH="$TG/bin:$PATH" CLAUDEZERO_MAX_LOOPS=1 \
   timeout 30 bash "$SCRIPT" todo.md -t x > "$TG/run.log" 2>&1 < /dev/null || true
-echo "G1 stub output kept : $(grep -c 'STUB-CLAUDE-MARKER' "$TG/run.log")  (want 1 — fd 4 fell back to stdout)"
-echo "G1 own output kept  : $(grep -c '❄ ClaudeZero' "$TG/run.log")  (want >=1)"
+echo "G2.1 stub output kept : $(grep -c 'STUB-CLAUDE-MARKER' "$TG/run.log")  (want 1 — fd 4 fell back to stdout)"
+echo "G2.1 own output kept  : $(grep -c '❄ ClaudeZero' "$TG/run.log")  (want >=1)"
 ```
-- **G1 PASS** — both counts as stated: with stdin not a terminal the `[ -t 0 ]` probe fails,
+- **G2.1 PASS** — both counts as stated: with stdin not a terminal the `[ -t 0 ]` probe fails,
   fd 4 is a dup of stdout, and no scenario that captures output loses stub-claude bytes.
   Redirecting stdin explicitly matters — run from a terminal without `< /dev/null`, the probe
   succeeds and the stub's bytes go to the terminal by design, which is the whole point of the split.
 
-### G2 — the split itself (automated, `script(1)` supplies the pty)
+### G2.2 — the split itself (automated, `script(1)` supplies the pty)
 
 The operator's situation is stdin on a terminal, stdout on a pipe. `script(1)` allocates a pty
 and logs everything crossing it, so running the documented pipe form under it captures **both**
@@ -754,11 +791,11 @@ export PATH="$TG/bin:$PATH"     # inherited by the pty child — keeps the comma
 pty "CLAUDEZERO_MAX_LOOPS=1 bash '$SCRIPT' todo.md -t x 2>&1 | { trap '' INT; tee '$TG/pipe.log'; }" \
     "$TG/typescript" >/dev/null 2>&1
 tr -d '\r' < "$TG/typescript" > "$TG/tty.log"       # pty writes CRLF; strip before matching
-echo "G2 stub sees ttys : $(grep -o 'STUB TTY0=[a-z]* TTY1=[a-z]*' "$TG/tty.log" | head -1)  (want both yes)"
-echo "G2 TUI on tty     : $(grep -c 'TUI-FRAME' "$TG/tty.log")  (want >=1)"
-echo "G2 TUI not in pipe: $(grep -c 'TUI-FRAME' "$TG/pipe.log")  (want 0)"
-echo "G2 report in pipe : $(grep -c 'execution stats' "$TG/pipe.log")  (want >=1)"
-echo "G2 no escapes     : $(grep -c $'\033' "$TG/pipe.log")  (want 0)"
+echo "G2.2 stub sees ttys : $(grep -o 'STUB TTY0=[a-z]* TTY1=[a-z]*' "$TG/tty.log" | head -1)  (want both yes)"
+echo "G2.2 TUI on tty     : $(grep -c 'TUI-FRAME' "$TG/tty.log")  (want >=1)"
+echo "G2.2 TUI not in pipe: $(grep -c 'TUI-FRAME' "$TG/pipe.log")  (want 0)"
+echo "G2.2 report in pipe : $(grep -c 'execution stats' "$TG/pipe.log")  (want >=1)"
+echo "G2.2 no escapes     : $(grep -c $'\033' "$TG/pipe.log")  (want 0)"
 
 # The other direction. Under `tee` the report reaches BOTH the file and the terminal — that is
 # what tee is for — so "own output stays off the tty" can only be asserted on the redirect form,
@@ -766,28 +803,15 @@ echo "G2 no escapes     : $(grep -c $'\033' "$TG/pipe.log")  (want 0)"
 pty "CLAUDEZERO_MAX_LOOPS=1 bash '$SCRIPT' todo.md -t x > '$TG/redir.log' 2>&1" \
     "$TG/typescript2" >/dev/null 2>&1
 tr -d '\r' < "$TG/typescript2" > "$TG/tty2.log"
-echo "G2 report in file : $(grep -c 'execution stats' "$TG/redir.log")  (want >=1)"
-echo "G2 report off tty : $(grep -c 'execution stats' "$TG/tty2.log")  (want 0)"
-echo "G2 TUI still tty  : $(grep -c 'TUI-FRAME' "$TG/tty2.log")  (want >=1)"
+echo "G2.2 report in file : $(grep -c 'execution stats' "$TG/redir.log")  (want >=1)"
+echo "G2.2 report off tty : $(grep -c 'execution stats' "$TG/tty2.log")  (want 0)"
+echo "G2.2 TUI still tty  : $(grep -c 'TUI-FRAME' "$TG/tty2.log")  (want >=1)"
 ```
-- **G2 PASS** — all eight as stated. `stub sees ttys = yes yes` proves fd 4 is a real terminal
+- **G2.2 PASS** — all eight as stated. `stub sees ttys = yes yes` proves fd 4 is a real terminal
   descriptor (a dup of stdin), not a pipe. The split is asserted in both directions: claude's
   `TUI-FRAME` reaches the terminal and never the capture file, and ClaudeZero's own `❄` report
   reaches the capture file and — on the redirect form, where `tee` is not echoing it back —
   never the terminal. No escape byte reaches the file.
-
-### G3 — the kqueue regression (manual, needs a real `claude`)
-
-G2 proves the descriptor is a tty and the split holds, but a stub cannot reproduce what this
-descriptor choice exists for: claude's Node runtime rejecting a `/dev/tty`-derived fd with
-`EINVAL … kqueue`. Only the real binary can. Run the documented form by hand in a scratch repo:
-
-```bash
-./claudezero.sh issues/todo.md 2>&1 | { trap '' INT; tee run.log; }
-```
-- **G3 PASS** — a real `claude` reaches its prompt instead of dying at startup, the terminal
-  shows the TUI, and pressing Ctrl+C in the between-runs gap lands the closing report in
-  `run.log`.
 
 ---
 
@@ -819,7 +843,7 @@ ACT=('drilling the fork-implement-merge kata' 'hauling snow buckets uphill' \
      'practicing one clean strike per task' "leaving a peer's branch untouched" \
      'walking back to the merge gate')
 # claude's own output goes to fd 4, which falls back to stdout only when stdin is not a terminal
-# — run with stdin off the tty so the stub's ARGV line lands in the capture file (see Scenario G).
+# — run with stdin off the tty so the stub's ARGV line lands in the capture file (see Scenario G2).
 notty() { "$@" < /dev/null; }
 # the fifteen nicknames, verbatim (claudezero.sh pick_nickname)
 NICKS=(ash bob cleo dax elk finn gus hana ivo jun kit lux moss nix opal)
