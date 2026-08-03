@@ -467,7 +467,9 @@ arm_watchdog() {
         "$(fmt_dur "$WATCHDOG_SECS")" "$WATCHDOG_RAW"
       kill -TERM "$pid" 2>/dev/null || true
       sleep "$WATCHDOG_GRACE"
-      kill -KILL "$pid" 2>/dev/null || true
+      # recheck: if the TERM already reaped it, the pid may be recycled by now — a blind
+      # KILL here would hit whatever unrelated process the OS handed that number to next.
+      if kill -0 "$pid" 2>/dev/null; then kill -KILL "$pid" 2>/dev/null || true; fi
     fi
   } &
   WATCHDOG_PID=$!
