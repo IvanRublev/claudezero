@@ -83,6 +83,25 @@ ago(){ date -v-"$1"S +%Y%m%d%H%M.%S 2>/dev/null || date -d "-$1 sec" +%Y%m%d%H%M
 in_testroot(){ case "$PWD" in "$TESTROOT"/*) return 0;; *)
   echo "REFUSING: cwd $PWD is not under TESTROOT=$TESTROOT — not invoking claudezero.sh" >&2; return 1;; esac; }
 
+# decoy ancestor for any block that manually fires the real compact-exit-hook.sh (only Scenario G
+# does today). term_owner()/find_owner() in claudezero.sh first trust an inherited CLAUDE_PID if
+# it's alive and named claude, else walk up to 8 PPID hops for the first ancestor whose `ps -o
+# comm=` reads claude, and SIGTERM it. An agent running this file autonomously already has a real,
+# live claude ancestor within that many hops (its own session) — the walk finds no `claude`-named
+# process any closer because every wrapper in between (this file's own bash, claudezero.sh's own
+# `bash "$SCRIPT"`, the agent's own Bash-tool shell) is invoked via `bash script`, not exec'd
+# directly, so `ps -o comm=` reports bash for all of them, not the script's filename. `guard`
+# plants a REAL bash binary (not a #!/bin/bash script — a script would report comm=bash too, same
+# problem) copied to a file literally named claude, one hop above the command, and drops
+# CLAUDE_PID first — so the walk's first (and only) claude-named match is this harmless decoy,
+# never the real session further up.
+# `$1 & wait $!`, not a bare `-c "$1"`: bash execve()-replaces a `-c` process in place (no fork,
+# same pid, new image) when the whole script is one tail command — the decoy's own pid would
+# silently become the payload's own command name mid-run, undoing the rename this exists for.
+# Backgrounding forces a real fork; `wait $!` then blocks on it and forwards its real exit status.
+mkdir -p "$TESTROOT/guard"; cp "$(command -v bash)" "$TESTROOT/guard/claude"
+guard(){ env -u CLAUDE_PID "$TESTROOT/guard/claude" -c "$1"' & wait $!'; }
+
 write_gate(){ cat > "$1" <<'EOF'
 #!/usr/bin/env bash
 # Barrier + latch: block until NEED distinct agents are simultaneously in-flight,
@@ -634,9 +653,11 @@ cd "$TG/repo"
 git init -q -b main; git config user.email t@t.t; git config user.name test
 printf -- '- [ ] G1 x\n' > todo.md; git add -A; git commit -qm init
 # $1 = stub mode, $2 = log file. Fresh transcript dir per run.
+# guarded (see Section 0): the stub below pipes straight into the real compact-exit-hook.sh,
+# whose term_owner() SIGTERMs a `claude`-named ancestor — without the decoy that ancestor walk
+# lands on the real agent session running this file, not the stub.
 grun() { rm -rf "$TG/tx"; mkdir -p "$TG/tx"
-  PATH="$TG/bin:$PATH" TG_TX="$TG/tx" TG_MODE="$1" \
-    timeout 90 env CLAUDEZERO_MAX_LOOPS=3 bash "$SCRIPT" todo.md -t x > "$2" 2>&1 || true; }
+  guard "PATH='$TG/bin:\$PATH' TG_TX='$TG/tx' TG_MODE='$1' timeout 90 env CLAUDEZERO_MAX_LOOPS=3 bash '$SCRIPT' todo.md -t x > '$2' 2>&1" || true; }
 ```
 
 ### G1 — dedupe, no double-count, accumulation across restarts
@@ -917,6 +938,12 @@ git add -A; git commit -qm init
 # bootstrap: real claudezero writes .git/zero.sh, stub claude exits, loop ends
 PATH="$TI/bin:$PATH" timeout 30 env CLAUDEZERO_MAX_LOOPS=1 bash "$SCRIPT" todo.md -t x > "$TI/boot.log" 2>&1 || true
 cp "$(command -v bash)" "$TI/bin/claude"   # ensure_owner walks `ps -o comm=` for an ancestor named claude
+# same real-binary-not-script trick as `guard` in Section 0, but for the opposite reason: this one
+# needs ensure_owner to FIND a claude ancestor (claim/merge FATAL out at exit 3 without one), not to
+# stop term_owner from killing one — claim never SIGTERMs anything, so a wrongly-found ancestor here
+# only misattributes bookkeeping, it can't take down this session. Kept inline (driver is a whole
+# script file with real work between every claim, never a bare tail command) rather than routed
+# through `guard`, whose `& wait $!` shape exists for a single -c command, not a multi-step driver.
 cat > "$TI/drive.sh" <<'DRIVE'
 set -uo pipefail
 cd "$TI/repo"
@@ -1253,6 +1280,12 @@ HOOK="$TM/repo/.git/compact-exit-hook.sh"
 # left set, term_owner trusts that inherited pid unconditionally (alive + named claude, no check
 # it's actually this invocation's ancestor) and SIGTERMs the live agent running the test instead
 # of the stub. Unset so the stub is the only candidate the ancestor walk can find.
+# This IS `guard` from Section 0's technique (real bash binary named claude, not a script — a
+# shebang script would report comm=bash, not claude, to the walk), applied by hand instead of
+# calling `guard` directly: this needs CLAUDEZERO_MODE set as a prefix on the SAME command, and the
+# `-c` body is two statements ending in `sleep 3`, so — same reasoning as guard's own `& wait $!` —
+# the real work (printf | bash "$1", where the hook's term_owner runs) is never in tail position and
+# this process's own comm can't get execve()-replaced out from under it before the kill lands.
 run_as_claude(){ CLAUDEZERO_MODE="$1" env -u CLAUDE_PID "$TM/owner/claude" -c 'printf "%s" "$2" | bash "$1" >/dev/null 2>&1; sleep 3' _ "$HOOK" "$2"; echo $?; }
 echo "M4 zero mode     : $(run_as_claude zero '{}')  (want 143 — ordinary turn end SIGTERMs the owning claude)"
 echo "M4 loop mode     : $(run_as_claude loop '{}')  (want 0 — -l has no task boundary, so it is left running)"
@@ -1388,6 +1421,10 @@ printf -- '- [ ] criterion one\n' > issues/ISSUE-O.md      # the spec the todo l
 printf 'private\n' > sources/s.txt                         # gitignored, NOT listed in CLAUDEZERO_LINK
 PATH="$TO/bin:$PATH" timeout 30 env CLAUDEZERO_MAX_LOOPS=1 bash "$SCRIPT" todo.md -t x > "$TO/boot.log" 2>&1 || true
 cp "$(command -v bash)" "$TO/bin/claude"   # ensure_owner walks `ps -o comm=` for an ancestor named claude
+# same reasoning as Scenario I's identical line (see there): `guard` in Section 0 codifies this
+# real-binary trick for the term_owner-kill case; claim/link_ignored here only need ensure_owner to
+# FIND an ancestor (no kill involved), and the driver below is a multi-step script, not a bare
+# tail command, so it's inline rather than routed through `guard`.
 cat > "$TO/drive.sh" <<'DRIVE'
 set -uo pipefail
 cd "$TO/repo"
