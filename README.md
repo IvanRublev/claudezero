@@ -28,6 +28,7 @@ Runs [`claude`](https://claude.com/product/claude-code) on a predefined prompt i
 - [Tests](#tests)
 - [Security](#security)
 - [Contributing](#contributing)
+- [Commercial Support](#commercial-support)
 
 ## What it does
 
@@ -296,6 +297,10 @@ ClaudeZero runs `claude` unattended with auto-approved permissions and commits o
 ## Contributing
 
 Fork, branch, run the tests, open a PR. Full steps in [CONTRIBUTING.md](CONTRIBUTING.md).
+
+## Commercial Support
+
+Built and maintained by Ivan Rublev. Need integration help, Loop Engineering training for the team, or a one-time "office hours" consultation? See [services](https://www.ivanrublev.com).
 
 ## Copyright
 
