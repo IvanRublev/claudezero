@@ -7,7 +7,7 @@
 # Run -h for usage.
 set -euo pipefail
 
-VERSION="0.0.16"
+VERSION="0.0.17"
 PROG="$(basename "$0")"   # name shown in usage/errors, from how the script was invoked
 
 RESTART_WAIT=5       # seconds between claude restarts — the window to press Ctrl+C
