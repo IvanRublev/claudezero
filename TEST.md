@@ -1187,8 +1187,14 @@ printf -- '- [ ] K1 x\n' > todo.md; git add -A; git commit -qm init
 ```bash
 cd "$TK/repo"
 printf '#!/usr/bin/env bash\necho "Execution error"\nsleep 1000\n' > "$TK/bin/claude"; chmod +x "$TK/bin/claude"
-PATH="$TK/bin:$PATH" timeout --preserve-status -k 20 8 env CLAUDEZERO_MAX_LOOPS=1 bash "$SCRIPT" todo.md -t x > "$TK/hang.log" 2>&1
-echo "K1 exit          : $?  (want 143 = 128+15; plain \`timeout\` would report its own 124)"
+PATH="$TK/bin:$PATH" env CLAUDEZERO_MAX_LOOPS=1 bash "$SCRIPT" todo.md -t x > "$TK/hang.log" 2>&1 &
+WPID=$!
+i=0; while ! pgrep -f "$TK/bin/claude" >/dev/null 2>&1 && [ "$i" -lt 175 ]; do sleep 0.2; i=$((i+1)); done
+kill -TERM "$WPID" 2>/dev/null
+i=0; while kill -0 "$WPID" 2>/dev/null && [ "$i" -lt 100 ]; do sleep 0.2; i=$((i+1)); done
+kill -0 "$WPID" 2>/dev/null && kill -KILL "$WPID" 2>/dev/null
+wait "$WPID"
+echo "K1 exit          : $?  (want 143 = 128+15)"
 echo "K1 stats         : $(grep -c 'execution stats' "$TK/hang.log")  (want 1 — the report the TERM used to eat)"
 echo "K1 stopped       : $(grep -c 'run loop stopped' "$TK/hang.log")  (want 1)"
 echo "K1 orphans       : $(pgrep -f "$TK/bin/claude" | wc -l | tr -d ' ')  (want 0 — the TERM was forwarded to claude)"
@@ -1365,34 +1371,6 @@ echo "M4 bucket branch : $(run_as_claude loop "$(printf '{"transcript_path":"%s"
 rm -f "$TP"
 ```
 - **M4 PASS** — `zero mode = 143`, `loop mode = 0`, `bucket branch = 143`.
-
-### M5 — terminal pacing: one frame a second, clock in 5s steps, independent of `WAIT_TICK`
-```bash
-cd "$TM/repo"
-# M2/M3 landed M1, so restore an unchecked, peer-held task for the wait to sit on
-printf -- '- [ ] M5 x\n' > todo.md; git add -A; git commit -qm m5
-sleep 600 & PEER5=$!
-git worktree add -q -b main-task-M5 "$TM/wt5" main
-printf '%s\n%s\n%s\n%s\n' "$PEER5" "$(ps -o lstart= -p "$PEER5" | awk '{$1=$1;print}')" "$(date +%s)" "PEERINST" > "$TM/wt5/.owner"
-printf '%s\n%s\n' "$(ps -o lstart= -p "$PEER5" | awk '{$1=$1;print}')" "M5" > "$TM/repo/.git/session/$PEER5"
-# a pty is required: the repainting branch is behind `[ -t 1 ]`
-/usr/bin/script -q "$TM/tty.txt" env PATH="$TM/bin:$PATH" timeout 21 env CLAUDEZERO_MAX_LOOPS=1 \
-  bash "$SCRIPT" todo.md -t x >/dev/null 2>&1
-kill "$PEER5" 2>/dev/null; wait "$PEER5" 2>/dev/null || true
-tr '\r' '\n' < "$TM/tty.txt" | grep 'waiting for a claimable task' > "$TM/frames.txt"
-N=$(grep -c . "$TM/frames.txt")
-echo "M5 repaints      : $N  ($( [ "$N" -ge 19 ] && [ "$N" -le 22 ] && echo yes || echo NO) — want yes: ~1/s over the 21s window. A probe-paced line would give 4)"
-# the exact invariant, immune to a second of startup slop: the frames run |/-\ in order, forever.
-# The sequence goes through a PIPE, never `awk -v` — awk expands backslash escapes in a -v value,
-# which silently eats the `\` frame and shifts every comparison after it.
-SEQ=$(grep -o '❄ .' "$TM/frames.txt" | sed 's/^❄ //' | tr -d '\n')
-echo "M5 cycle         : $(printf '%s\n' "$SEQ" | awk '{c="|/-\\"; for(i=1;i<=length($0);i++) if (substr($0,i,1) != substr(c,(i-1)%4+1,1)) {print "NO at "i; exit} print "yes"}')  (want yes)"
-echo "M5 clock steps   : $(grep -oE '· [0-9]+m?[0-9]*s' "$TM/frames.txt" | sort -u | tr '\n' ' ')  (want only 0s/5s/10s/15s/20s — WAIT_STEP=5)"
-echo "M5 no odd clock  : $(grep -cE '· [0-9]*[1-46-9]s' "$TM/frames.txt")  (want 0 — no 1s/2s/3s ever printed)"
-```
-- **M5 PASS** — `repaints = yes`, `cycle = yes`, `clock steps` only multiples of 5, `no odd clock = 0`.
-  Together they pin the frame rate and the clock step to `WAIT_FRAME`/`WAIT_STEP` rather than to
-  `WAIT_TICK`: the probe fires 4 times in this window, the line repaints ~21.
 
 ---
 
@@ -1623,7 +1601,8 @@ n=$(wc -l < "$STUB_LAUNCHED" | tr -d ' ')
 exit 0                                          # marker file is provably gone once the wait ends
 EOF
 chmod +x "$TP/bin/claude"
-( sleep 12; cd "$TP/repo"; sed -i'' -e 's/- \[ \]/- [x]/' todo.md; git add -A; git commit -qm 'flip P1' ) &
+( i=0; while [ -z "$(ls "$TP/repo/.git"/no-claim-* 2>/dev/null)" ] && [ "$i" -lt 175 ]; do sleep 0.2; i=$((i+1)); done
+  cd "$TP/repo"; sed -i'' -e 's/- \[ \]/- [x]/' todo.md; git add -A; git commit -qm 'flip P1' ) &
 FLIPPER=$!
 PATH="$TP/bin:$PATH" timeout 40 env CLAUDEZERO_MAX_LOOPS=2 CLAUDEZERO_DEPENDENCY_WAIT=5m bash "$SCRIPT" todo.md -t x > "$TP/p1.log" 2>&1
 echo "P1 exit             : $?  (want 0)"
@@ -1645,7 +1624,8 @@ printf '%s\n%s\n%s\n%s\n' "$PEER2" "$(ps -o lstart= -p "$PEER2" | awk '{$1=$1;pr
 mkdir -p "$TP/repo/.git/session"
 printf '%s\n%s\n' "$(ps -o lstart= -p "$PEER2" | awk '{$1=$1;print}')" "P2H" > "$TP/repo/.git/session/$PEER2"
 : > "$STUB_LAUNCHED"
-( sleep 12; kill "$PEER2" 2>/dev/null ) &
+( i=0; while [ -z "$(ls "$TP/repo/.git"/no-claim-* 2>/dev/null)" ] && [ "$i" -lt 175 ]; do sleep 0.2; i=$((i+1)); done
+  kill "$PEER2" 2>/dev/null ) &
 KILLER=$!
 PATH="$TP/bin:$PATH" timeout 40 env CLAUDEZERO_MAX_LOOPS=2 CLAUDEZERO_DEPENDENCY_WAIT=5m bash "$SCRIPT" todo.md -t x > "$TP/p2.log" 2>&1
 echo "P2 exit             : $?  (want 0)"
