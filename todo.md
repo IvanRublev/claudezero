@@ -20,3 +20,5 @@
 - [x] ISSUE-031 Zero one task per claude session and wait for the next claimable task in the shell — drop `/loop`, keep the context-full restart
 - [x] ISSUE-032 Kill a hung claude with a `CLAUDEZERO_WATCHDOG` timer (default 15m) and name the watchdog on its own console line
 - [x] ISSUE-033 Symlink gitignored spec directories into every task worktree with `CLAUDEZERO_LINK` so a session reads the acceptance criteria its todo line points at
+- [ ] ISSUE-034 Stop relaunching claude once every unchecked task is dependency-blocked, and resume the moment that changes
+- [ ] ISSUE-035 Compute the context-full restart signal in ClaudeZero's own Stop hook so no third-party hook is a prerequisite
