@@ -23,6 +23,7 @@ WAIT_STEP=5          # seconds the terminal's elapsed clock advances in — at 1
 LOG_TICK=20          # seconds between waiting lines when stdout is a log or a pipe, not a terminal
 WATCHDOG_DEFAULT=15m # CLAUDEZERO_WATCHDOG default: how long claude may burn no CPU before it is killed
 WATCHDOG_GRACE=10    # seconds the watchdog waits after its SIGTERM before escalating to SIGKILL
+DEPENDENCY_WAIT_DEFAULT=10m # CLAUDEZERO_DEPENDENCY_WAIT default: ceiling on the no-claim wait below
 
 # The braces around the pipe reader in the logging example are load-bearing — do NOT tidy them
 # into a bare pipe. Ctrl+C signals the whole foreground group; the reader's default SIGINT action
@@ -32,7 +33,8 @@ WATCHDOG_GRACE=10    # seconds the watchdog waits after its SIGTERM before escal
 usage() {
   # single-quoted heredoc keeps backticks literal; sed injects the RESTART_WAIT constant.
   sed -e "s/@@RESTART_WAIT@@/$RESTART_WAIT/g" -e "s/@@PROG@@/$PROG/g" -e "s/@@VERSION@@/$VERSION/g" \
-      -e "s/@@WATCHDOG_DEFAULT@@/$WATCHDOG_DEFAULT/g" <<'USAGE'
+      -e "s/@@WATCHDOG_DEFAULT@@/$WATCHDOG_DEFAULT/g" \
+      -e "s/@@DEPENDENCY_WAIT_DEFAULT@@/$DEPENDENCY_WAIT_DEFAULT/g" <<'USAGE'
 usage: @@PROG@@ [todo-file-path] [-t|--taskprompt TEXT | -l|--loopprompt TEXT]
 version @@VERSION@@
 
@@ -55,6 +57,16 @@ version @@VERSION@@
                                    15m, 1h). Default @@WATCHDOG_DEFAULT@@; 0 disables the watchdog.
                                    Progress is claude's own CPU time, so a long honest run
                                    is never killed — only one that has stopped working.
+
+    CLAUDEZERO_DEPENDENCY_WAIT=duration
+                                   Ceiling on the wait after a session walks the whole todo
+                                   list and claims nothing because every unchecked task is
+                                   dependency-blocked (step 2.a). Same grammar as
+                                   CLAUDEZERO_WATCHDOG (900, 90s, 15m, 1h). Default
+                                   @@DEPENDENCY_WAIT_DEFAULT@@; 0 relaunches claude
+                                   immediately every cycle. The wait ends the instant the
+                                   block clears (a peer merges or its holder dies) or this
+                                   ceiling elapses, whichever comes first.
 
     CLAUDEZERO_LINK=name[,name…]   Top-level directories symlinked from the repo root
                                    into every task worktree. Unset by default. A worktree
@@ -169,6 +181,13 @@ if [ -z "$WATCHDOG_SECS" ]; then
 fi
 WATCHDOG_PID=""      # set per launch by arm_watchdog, cleared by disarm_watchdog
 
+DEPENDENCY_WAIT_SECS="$(parse_dur "${CLAUDEZERO_DEPENDENCY_WAIT:-$DEPENDENCY_WAIT_DEFAULT}" || true)"
+DEPENDENCY_WAIT_RAW="${CLAUDEZERO_DEPENDENCY_WAIT:-$DEPENDENCY_WAIT_DEFAULT}"
+if [ -z "$DEPENDENCY_WAIT_SECS" ]; then
+    echo "$PROG: ignoring CLAUDEZERO_DEPENDENCY_WAIT=$DEPENDENCY_WAIT_RAW (want 900, 90s, 15m, 1h, or 0 to disable) — using $DEPENDENCY_WAIT_DEFAULT" >&2
+    DEPENDENCY_WAIT_RAW="$DEPENDENCY_WAIT_DEFAULT"; DEPENDENCY_WAIT_SECS="$(parse_dur "$DEPENDENCY_WAIT_DEFAULT")"
+fi
+
 reap_dead_sessions   # startup: clear markers left by crashed prior runs before the first claude
 while true; do
     # zero mode: the SHELL decides whether a claude session is worth starting. Nothing left → the
@@ -177,6 +196,7 @@ while true; do
     if [ "${MODE:-}" = zero ]; then
         if all_todos_done; then break; fi
         if ! wait_for_claimable; then break; fi
+        if ! wait_for_dependency_clear; then break; fi
     fi
     # first prompt submitted straight from the CLI arg. The session Stop hook SIGTERMs claude
     # when context fills; exit 143 is the normal restart path, so swallow it.
@@ -639,6 +659,56 @@ wait_for_claimable() {
           "$h" "$(fmt_dur $(( last - start )))"
       fi
       sleep "$WAIT_TICK" || true     # SIGINT interrupts sleep and fires the INT trap
+    fi
+  done
+}
+
+# block while a no-claim marker (written by claude via `.git/zero.sh no-claim-mark`, step 3)
+# still matches the live dependency signature — a session already walked the whole list and
+# found the unheld remainder genuinely blocked, so relaunching immediately would spend a fresh
+# claude session on the same judgment. wait_for_claimable's `u <= h` means "everything is
+# peer-held"; this means "u > h, yet nothing was claimable" — a distinct reason to wait, so it
+# gets a distinct line. 0 = launch claude; 1 = break to the closer (Ctrl+C/SIGTERM).
+wait_for_dependency_clear() {
+  local marker="$GITDIR_ABS/no-claim-$INSTANCE_ID" stored="" live start=0 last=0 spin=0 i u h frames="|/-\\"
+  # one-shot read+delete: this instance's marker is consumed here, now, or never. Comparing the
+  # FILE again on every poll would find it already gone after the first tick and read as "no
+  # marker" — i.e. launch — even though the block it recorded never cleared.
+  if [ -f "$marker" ]; then stored=$(cat "$marker" 2>/dev/null || true); rm -f "$marker"; fi
+  [ -n "$stored" ] || return 0                              # no marker: normal launch, no new poll
+  [ "$DEPENDENCY_WAIT_SECS" -gt 0 ] || return 0              # 0 = always relaunch immediately
+  live=$("$ZERO_SH" no-claim-signature 2>/dev/null || true)
+  [ "$live" = "$stored" ] || return 0                        # already stale: normal launch
+  start=$(date +%s)
+  while true; do
+    if [ "$STOP" = 1 ]; then return 1; fi
+    live=$("$ZERO_SH" no-claim-signature 2>/dev/null || true)
+    if [ "$live" != "$stored" ]; then
+      if [ -t 1 ]; then printf '\r\033[K'; fi
+      return 0
+    fi
+    if [ $(( $(date +%s) - start )) -ge "$DEPENDENCY_WAIT_SECS" ]; then
+      if [ -t 1 ]; then printf '\r\033[K'; fi
+      return 0                                               # ceiling: let a fresh session re-judge
+    fi
+    u=$(unchecked_todos); h=$(held_todos)
+    if [ -t 1 ]; then
+      i=0
+      while [ "$i" -lt $((WAIT_TICK / WAIT_FRAME)) ]; do
+        printf '\r❄ %s waiting for a claimable task (now blocked %s) · %s held by peers · %s\033[K' \
+          "${frames:$((spin%4)):1}" "$((u - h))" "$h" \
+          "$(fmt_dur $(( ( ( $(date +%s) - start ) / WAIT_STEP ) * WAIT_STEP )))"
+        spin=$((spin+1)); i=$((i+1))
+        sleep "$WAIT_FRAME" || true
+        if [ "$STOP" = 1 ]; then return 1; fi
+      done
+    else
+      if [ $(( $(date +%s) - last )) -ge "$LOG_TICK" ]; then
+        last=$(date +%s)
+        printf '❄ waiting for a claimable task (now blocked %s) · %s held by peers · %s\n' \
+          "$((u - h))" "$h" "$(fmt_dur $(( last - start )))"
+      fi
+      sleep "$WAIT_TICK" || true
     fi
   done
 }
@@ -1209,6 +1279,46 @@ is_done() {
   git merge-base --is-ancestor "$head" "$BASE_BRANCH"
 }
 
+# ids of tasks live peers hold right now, one per line — same scan claudezero.sh's own
+# held_todos() does (live .owner pid + start-time match, current session marker names this
+# task), but emitting the ids themselves rather than a bare count: a signature needs to notice
+# task X's holder dying even when the total held COUNT stays identical (a different peer claims
+# something else in the same tick).
+held_ids() {
+  local path branch id pid st cur
+  while IFS=$'\t' read -r path branch; do
+    case "$branch" in "$BASE_BRANCH-task-"*) id=${branch#"$BASE_BRANCH"-task-} ;; *) continue ;; esac
+    [ -f "$path/.owner" ] || continue
+    { read -r pid; read -r st; } < "$path/.owner" 2>/dev/null || continue
+    kill -0 "$pid" 2>/dev/null || continue
+    [ "$(proc_start "$pid")" = "$st" ] || continue
+    cur=""
+    if [ -f "$SESSION_DIR/$pid" ]; then { read -r _; read -r cur; } < "$SESSION_DIR/$pid" 2>/dev/null || cur=""; fi
+    [ "$cur" = "$id" ] && printf '%s\n' "$id"
+  done < <(git worktree list --porcelain | awk '
+    /^worktree /            { p = substr($0, 10) }
+    /^branch refs\/heads\// { printf "%s\t%s\n", p, substr($0, 19) }')
+}
+
+# deterministic signature for "what would have to change before a retry could possibly claim
+# something": the todo blob's own SHA (changes the instant any box flips or any task text
+# changes) plus the sorted set of ids peers currently hold. Single source of truth, computed
+# here rather than by the LLM, so claudezero.sh's wait can compare it without reimplementing
+# the scan.
+no_claim_signature() {
+  printf '%s %s\n' \
+    "$(git rev-parse "$BASE_BRANCH:$TODO_PATH" 2>/dev/null)" \
+    "$(held_ids | sort | tr '\n' ,)"
+}
+
+# no-claim-mark: record "nothing was claimable at this signature" for THIS instance (keyed by
+# CLAUDEZERO_INSTANCE, not the owner pid — the marker outlives this session's Stop-hook restart),
+# so claudezero.sh can skip relaunching until the signature changes. Atomic publish (temp+rename,
+# same idiom as add_counter): the shell may read this file without a lock.
+no_claim_mark() {
+  no_claim_signature > "$GITDIR/no-claim-$INSTANCE_ID.tmp" && mv -f "$GITDIR/no-claim-$INSTANCE_ID.tmp" "$GITDIR/no-claim-$INSTANCE_ID"
+}
+
 case "${1:-}" in
   claim)   ensure_owner; claim_task "$2" ;;
   acquire) ensure_owner; acquire_task "$(sanitize_id "$2")" ;;
@@ -1216,7 +1326,9 @@ case "${1:-}" in
   merge)   ensure_owner; merge_task "$(sanitize_id "$2")" "$3" && set_current none || exit $? ;;  # clear only on success
   done)    is_done "$2" "${3:-}" ;;
   credit_inflight_time)   credit_inflight_time ;;
-  *) echo "usage: zero.sh {claim N | acquire N | release N WT | merge N WT | done N [WT] | credit_inflight_time}" >&2; exit 64 ;;
+  no-claim-mark)          no_claim_mark ;;
+  no-claim-signature)     no_claim_signature ;;
+  *) echo "usage: zero.sh {claim N | acquire N | release N WT | merge N WT | done N [WT] | credit_inflight_time | no-claim-mark | no-claim-signature}" >&2; exit 64 ;;
 esac
 ZERO_EOF
     } > "$gitdir/zero.sh"
@@ -1330,9 +1442,12 @@ Keep these facts in mind:
         its worktree $wt and its branch (`git -C "$wt" symbolic-ref --short HEAD`), and ask the human to
         "resolve the conflict on that branch, then merge by hand".
 3. End your turn — after zeroing one task, or after walking the whole list without claiming one
-   (say which happened). If every task in @@TODO@@ is now checked, announce "ALL TASKS DONE" first.
-   What runs next is the shell's call: it starts a fresh session for the next task, waits while
-   peers hold everything, or prints the closing report.
+   (say which happened). If you walked the whole list and claimed nothing, run
+   `.git/zero.sh no-claim-mark` first — it lets the shell wait for that block to clear instead of
+   spending a fresh session on the same judgment. If every task in @@TODO@@ is now checked, announce
+   "ALL TASKS DONE" first. What runs next is the shell's call: it starts a fresh session for the
+   next task, waits while peers hold everything or the remainder is dependency-blocked, or prints
+   the closing report.
 PROMPT_EOF
     prompt=${prompt%$'\n'}          # read keeps the final newline; $(cat) stripped it
     prompt=${prompt//@@TODO@@/$todo}

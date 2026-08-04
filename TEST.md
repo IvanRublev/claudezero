@@ -53,6 +53,11 @@ the project's own working tree or history, and can run concurrently.
 - **O — `CLAUDEZERO_LINK` into task worktrees.** Deterministic. Symlinks a gitignored
   directory into a task worktree, write-through, invisible to git via `info/exclude`,
   validated at startup before any claude launch.
+- **P — the dependency-blocked wait (`CLAUDEZERO_DEPENDENCY_WAIT`).** Deterministic. A session
+  that walks the whole list and claims nothing marks the block (`no-claim-mark`); the shell
+  waits on the deterministic signature instead of relaunching blindly, breaks the instant a
+  box flips or a peer's marker goes stale, `0` disables the wait, and an unchanged signature
+  past the ceiling forces a relaunch anyway.
 
 Parallelism (A, C) is enforced with a **file-lock barrier**, not `sleep`, so the
 proof is independent of claude startup/shutdown times.
@@ -1540,6 +1545,128 @@ echo "O7 says default    : $(printf '%s' "$H" | grep -c 'Unset by default')  (wa
   unset cases (O1/O2), `link_ignored` carrying no validation of its own (O3), a second claim
   appending no duplicate `info/exclude` entry and a dangling link surviving the `-L` guard (O4),
   the untouched merge gate (O5), the startup refusals (O6), and the `--help` `Environment:` block (O7).
+
+---
+
+## Scenario P — the dependency-blocked wait (`CLAUDEZERO_DEPENDENCY_WAIT`)   `[$TESTROOT/P]`   (stub claude, deterministic)
+
+Dependency judgment lives in claude's own prompt (step 2.a), invisible to the shell. Without a
+signal, a fully dependency-blocked list looks identical to a genuinely stuck one: a session
+launches, claims nothing, the shell restarts it after `RESTART_WAIT`, and it happens again —
+one claude session burned per cycle for zero possible progress. Step 3 closes the gap: a session
+that claims nothing marks the block (`.git/zero.sh no-claim-mark`) before ending its turn, and
+the shell waits on a deterministic signature (the todo blob's SHA + the sorted ids peers
+currently hold) instead of relaunching blindly.
+
+### Setup
+```bash
+TP="$TESTROOT/P"; mkdir -p "$TP/repo" "$TP/bin"
+cd "$TP/repo"
+git init -q -b main; git config user.email t@t.t; git config user.name test
+printf -- '- [ ] P1 x\n' > todo.md; git add -A; git commit -qm init
+CLAUDEZERO_TEST_EMIT=1 bash "$SCRIPT" todo.md >/dev/null 2>&1   # writes .git/zero.sh once, up front
+export STUB_ZERO="$TP/repo/.git/zero.sh"
+export STUB_LAUNCHED="$TP/launched"
+```
+
+### P1 — a marker blocks relaunch until the todo blob's SHA changes; a distinct waiting line
+```bash
+cd "$TP/repo"
+: > "$STUB_LAUNCHED"
+cat > "$TP/bin/claude" <<'EOF'
+#!/usr/bin/env bash
+echo launched >> "$STUB_LAUNCHED"
+n=$(wc -l < "$STUB_LAUNCHED" | tr -d ' ')
+[ "$n" -eq 1 ] && "$STUB_ZERO" no-claim-mark   # only the FIRST launch marks the block, so the
+exit 0                                          # marker file is provably gone once the wait ends
+EOF
+chmod +x "$TP/bin/claude"
+( sleep 12; cd "$TP/repo"; sed -i'' -e 's/- \[ \]/- [x]/' todo.md; git add -A; git commit -qm 'flip P1' ) &
+FLIPPER=$!
+PATH="$TP/bin:$PATH" timeout 40 env CLAUDEZERO_MAX_LOOPS=2 CLAUDEZERO_DEPENDENCY_WAIT=5m bash "$SCRIPT" todo.md -t x > "$TP/p1.log" 2>&1
+echo "P1 exit             : $?  (want 0)"
+echo "P1 launches         : $(wc -l < "$STUB_LAUNCHED" | tr -d ' ')  (want 2 — one that marked the block, one after the flip broke it)"
+echo "P1 dependency line  : $(grep -c 'waiting for a claimable task (now blocked 1)' "$TP/p1.log")  (want >=1 — its own wording, not wait_for_claimable's)"
+echo "P1 no plain line    : $(grep -c '^❄ waiting for a claimable task · ' "$TP/p1.log")  (want 0 — P1 is never peer-held, so that wait never runs here)"
+echo "P1 marker gone      : $(ls "$TP/repo/.git"/no-claim-* 2>/dev/null | wc -l | tr -d ' ')  (want 0 — consumed once read)"
+wait "$FLIPPER" 2>/dev/null || true
+```
+- **P1 PASS** — `exit = 0`, `launches = 2`, `dependency line >= 1`, `no plain line = 0`, `marker gone = 0`.
+
+### P2 — a peer's marker going stale (its worktree dies) breaks the wait even though the blob is unchanged
+```bash
+cd "$TP/repo"
+printf -- '- [ ] P2 x\n- [ ] P2H y\n' >> todo.md; git add -A; git commit -qm 'add P2 tasks'
+sleep 600 & PEER2=$!
+git worktree add -q -b main-task-P2H "$TP/wt2h" main
+printf '%s\n%s\n%s\n%s\n' "$PEER2" "$(ps -o lstart= -p "$PEER2" | awk '{$1=$1;print}')" "$(date +%s)" "PEERINST" > "$TP/wt2h/.owner"
+mkdir -p "$TP/repo/.git/session"
+printf '%s\n%s\n' "$(ps -o lstart= -p "$PEER2" | awk '{$1=$1;print}')" "P2H" > "$TP/repo/.git/session/$PEER2"
+: > "$STUB_LAUNCHED"
+( sleep 12; kill "$PEER2" 2>/dev/null ) &
+KILLER=$!
+PATH="$TP/bin:$PATH" timeout 40 env CLAUDEZERO_MAX_LOOPS=2 CLAUDEZERO_DEPENDENCY_WAIT=5m bash "$SCRIPT" todo.md -t x > "$TP/p2.log" 2>&1
+echo "P2 exit             : $?  (want 0)"
+echo "P2 launches         : $(wc -l < "$STUB_LAUNCHED" | tr -d ' ')  (want 2 — the wait broke on the held-ids change, no todo edit at all)"
+wait "$KILLER" 2>/dev/null || true
+git worktree remove --force "$TP/wt2h" 2>/dev/null || true; git branch -qD main-task-P2H 2>/dev/null || true
+```
+- **P2 PASS** — `exit = 0`, `launches = 2`.
+
+### P3 — `CLAUDEZERO_DEPENDENCY_WAIT=0` relaunches immediately every cycle
+```bash
+cd "$TP/repo"
+printf -- '- [ ] P3 x\n' >> todo.md; git add -A; git commit -qm 'add P3'
+: > "$STUB_LAUNCHED"
+PATH="$TP/bin:$PATH" timeout 20 env CLAUDEZERO_MAX_LOOPS=2 CLAUDEZERO_DEPENDENCY_WAIT=0 bash "$SCRIPT" todo.md -t x > "$TP/p3.log" 2>&1
+echo "P3 exit             : $?  (want 0)"
+echo "P3 launches         : $(wc -l < "$STUB_LAUNCHED" | tr -d ' ')  (want 2 — 0 disables the wait outright)"
+echo "P3 no wait line     : $(grep -c 'now blocked' "$TP/p3.log")  (want 0)"
+```
+- **P3 PASS** — `exit = 0`, `launches = 2`, `no wait line = 0`.
+
+### P4 — an unchanged signature past the ceiling forces a relaunch anyway
+```bash
+cd "$TP/repo"
+printf -- '- [ ] P4 x\n' >> todo.md; git add -A; git commit -qm 'add P4'
+: > "$STUB_LAUNCHED"
+PATH="$TP/bin:$PATH" timeout 40 env CLAUDEZERO_MAX_LOOPS=2 CLAUDEZERO_DEPENDENCY_WAIT=6s bash "$SCRIPT" todo.md -t x > "$TP/p4.log" 2>&1
+echo "P4 exit             : $?  (want 0)"
+echo "P4 launches         : $(wc -l < "$STUB_LAUNCHED" | tr -d ' ')  (want 2 — nothing changed, so the ceiling itself ended the wait)"
+echo "P4 marker gone      : $(ls "$TP/repo/.git"/no-claim-* 2>/dev/null | wc -l | tr -d ' ')  (want 0)"
+```
+- **P4 PASS** — `exit = 0`, `launches = 2`, `marker gone = 0`.
+
+### P5 — absence check: no marker written, relaunch timing and output are unaffected
+```bash
+cd "$TP/repo"
+printf -- '- [ ] P5 x\n' >> todo.md; git add -A; git commit -qm 'add P5'
+cat > "$TP/bin/claude" <<'EOF'
+#!/usr/bin/env bash
+echo launched >> "$STUB_LAUNCHED"
+exit 0
+EOF
+chmod +x "$TP/bin/claude"
+: > "$STUB_LAUNCHED"
+PATH="$TP/bin:$PATH" timeout 20 env CLAUDEZERO_MAX_LOOPS=2 bash "$SCRIPT" todo.md -t x > "$TP/p5.log" 2>&1
+echo "P5 exit             : $?  (want 0)"
+echo "P5 launches         : $(wc -l < "$STUB_LAUNCHED" | tr -d ' ')  (want 2 — a claude that never marks a block is never made to wait)"
+echo "P5 no wait line     : $(grep -c 'now blocked' "$TP/p5.log")  (want 0 — no marker, no new poll)"
+```
+- **P5 PASS** — `exit = 0`, `launches = 2`, `no wait line = 0`.
+
+### P6 — `-h`/`--help` names the variable
+```bash
+H="$(bash "$SCRIPT" -h)"
+echo "P6 names the var    : $(printf '%s' "$H" | grep -c 'CLAUDEZERO_DEPENDENCY_WAIT=duration')  (want 1)"
+```
+- **P6 PASS** — `names the var = 1`.
+
+- **P PASS** — every line reports its `want` value. Together they cover the marker blocking a
+  relaunch until the blob changes and the wait's distinct line (P1), a peer's marker going stale
+  as an independent trigger (P2), the `0` off-switch (P3), the ceiling forcing a relaunch when
+  nothing changes (P4), the marker being consumed either way (P1/P4), the absence case costing no
+  new sleep or poll (P5), and `--help` documenting the variable (P6).
 
 ---
 

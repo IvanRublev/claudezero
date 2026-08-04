@@ -232,6 +232,12 @@ CLAUDEZERO_MAX_LOOPS=3 claudezero todo.md
 CLAUDEZERO_WATCHDOG=45m claudezero todo.md
 ```
 
+**`CLAUDEZERO_DEPENDENCY_WAIT`** — ceiling on the wait after a claude session walks the whole todo list and claims nothing because every unchecked task is dependency-blocked (step 2.a's independence judgment). Default `10m`; same grammar as `CLAUDEZERO_WATCHDOG` (`900`, `90s`, `15m`, `1h`), and `0` relaunches claude immediately every cycle, same as before this existed. Without it, a fully dependency-blocked list looks identical to a genuinely stuck one: a session launches, finds every remaining task blocked, ends its turn, `RESTART_WAIT` ticks down, another launches — same judgment, same nothing-claimed outcome, one claude session burned per cycle for zero possible progress. The session marks the block on its way out (`.git/zero.sh no-claim-mark`); the shell then waits, comparing a deterministic signature (the todo blob's SHA plus the sorted set of ids peers currently hold) instead of relaunching, and stops waiting the instant a peer merges the blocking task or its holder dies — or after this ceiling, whichever comes first, so a session always gets a chance to re-judge the list fresh.
+
+```sh
+CLAUDEZERO_DEPENDENCY_WAIT=20m claudezero todo.md
+```
+
 **`CLAUDEZERO_LINK`** — comma-separated top-level names symlinked from the repo root into every task worktree. Unset by default. A worktree is a checkout of tracked files only, so anything gitignored is absent there: if your todo lines point at spec files you keep in another git repository — `issues/ISSUE-031.md` holding the acceptance criteria for `- [ ] ISSUE-031 …` — the session never sees them and works from the one-line title alone. Listing the directory here links it in, so the criteria are readable and a tick lands in the real file rather than in a copy the worktree removal deletes. Each linked name is added to `.git/info/exclude`, so it stays out of the session's `git add -A` and out of this repository.
 
 ```sh
