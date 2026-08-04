@@ -1,19 +1,13 @@
 #!/usr/bin/env bash
 # claudezero.sh — run claude with a predefined first prompt in an endless loop.
 #
-# prerequisite: suggest-compact hook (https://github.com/affaan-m/ECC) installed globally in
-# ~/.claude/settings.json, in a version that writes the per-session context-bucket state file
-# (claude-context-bucket-<id>). We reuse that file as the "context full, restart" signal: when
-# it appears the session Stop hook SIGTERMs claude and the loop restarts it on fresh context.
-# No edit to the hook needed — we only read its state file.
-#
 # prerequisite: flock (brew install flock), runnable not just present. Serializes cross-instance
 # merges and worktree rescues; without it parallel zeroing races and corrupts the base.
 
 # Run -h for usage.
 set -euo pipefail
 
-VERSION="0.0.16"
+VERSION="0.0.17"
 PROG="$(basename "$0")"   # name shown in usage/errors, from how the script was invoked
 
 RESTART_WAIT=5       # seconds between claude restarts — the window to press Ctrl+C
@@ -23,6 +17,7 @@ WAIT_STEP=5          # seconds the terminal's elapsed clock advances in — at 1
 LOG_TICK=20          # seconds between waiting lines when stdout is a log or a pipe, not a terminal
 WATCHDOG_DEFAULT=15m # CLAUDEZERO_WATCHDOG default: how long claude may burn no CPU before it is killed
 WATCHDOG_GRACE=10    # seconds the watchdog waits after its SIGTERM before escalating to SIGKILL
+DEPENDENCY_WAIT_DEFAULT=10m # CLAUDEZERO_DEPENDENCY_WAIT default: ceiling on the no-claim wait below
 
 # The braces around the pipe reader in the logging example are load-bearing — do NOT tidy them
 # into a bare pipe. Ctrl+C signals the whole foreground group; the reader's default SIGINT action
@@ -32,7 +27,8 @@ WATCHDOG_GRACE=10    # seconds the watchdog waits after its SIGTERM before escal
 usage() {
   # single-quoted heredoc keeps backticks literal; sed injects the RESTART_WAIT constant.
   sed -e "s/@@RESTART_WAIT@@/$RESTART_WAIT/g" -e "s/@@PROG@@/$PROG/g" -e "s/@@VERSION@@/$VERSION/g" \
-      -e "s/@@WATCHDOG_DEFAULT@@/$WATCHDOG_DEFAULT/g" <<'USAGE'
+      -e "s/@@WATCHDOG_DEFAULT@@/$WATCHDOG_DEFAULT/g" \
+      -e "s/@@DEPENDENCY_WAIT_DEFAULT@@/$DEPENDENCY_WAIT_DEFAULT/g" <<'USAGE'
 usage: @@PROG@@ [todo-file-path] [-t|--taskprompt TEXT | -l|--loopprompt TEXT]
 version @@VERSION@@
 
@@ -56,6 +52,16 @@ version @@VERSION@@
                                    Progress is claude's own CPU time, so a long honest run
                                    is never killed — only one that has stopped working.
 
+    CLAUDEZERO_DEPENDENCY_WAIT=duration
+                                   Ceiling on the wait after a session walks the whole todo
+                                   list and claims nothing because every unchecked task is
+                                   dependency-blocked (step 2.a). Same grammar as
+                                   CLAUDEZERO_WATCHDOG (900, 90s, 15m, 1h). Default
+                                   @@DEPENDENCY_WAIT_DEFAULT@@; 0 relaunches claude
+                                   immediately every cycle. The wait ends the instant the
+                                   block clears (a peer merges or its holder dies) or this
+                                   ceiling elapses, whichever comes first.
+
     CLAUDEZERO_LINK=name[,name…]   Top-level directories symlinked from the repo root
                                    into every task worktree. Unset by default. A worktree
                                    checks out tracked files only, so gitignored spec
@@ -71,39 +77,38 @@ version @@VERSION@@
 USAGE
 }
 
-# Self-contained install instructions for the suggest-compact hook, inlined from the README so the
-# hint needs no network and no README file. Keep in sync with the README "Install" section.
-# shellcheck disable=SC2016  # $TMPDIR is literal instructional text shown to the user, must not expand
-INSTALL_HINT='Install the suggest-compact Claude Code hook globally in ~/.claude/settings.json (requires node). Source: https://github.com/affaan-m/ECC pinned to commit 7777656. The hook must write a per-session file at $TMPDIR/claude-context-bucket-<session_id> once the context bucket crosses its threshold; presence of that file is the "context full, restart" signal ClaudeZero reads. ClaudeZero only reads the file, so no other edits are needed.'
+# CONTEXT_THRESHOLDS: model-id pattern → restart-at token count, one pair per line, matched in
+# order against the newest transcript usage record's model id — first match wins, so a row below
+# one that already matched is dead and nothing reports it. Unmatched → CONTEXT_THRESHOLD_DEFAULT.
+# A word-suffix tier (e.g. claude-fable-5-mini) is NOT its family's row and falls to the default;
+# giving it its own number means adding a `-mini` row of its own — where that row SITS in the
+# table is then a no-op, since first-match-wins already sorts it out on its own text alone.
+# 200000 comes from Opus 4.8's measured degradation curve (see README's "Context rot"); 160000 is
+# 80% of an assumed 200k window. Neither is inherited from the third-party hook this table replaces.
+# This table is the ONLY place these numbers live, and they are meant to be retuned from real
+# runs, not treated as settled. Sort a model with:
+#   grep -rhoE '"model":"[^"]*"' ~/.claude/projects/ | sort | uniq -c
+# — appearing ONLY bare on sessions known to run a 1M window → safe to add a row; appearing both
+# bare AND with `[1m]` → do NOT add a row, since a 200000 row would then sit at that session's
+# hard wall instead of before it, where the 160000 default already puts it.
+# This table goes stale by default and fails LOW when it does: sessions on a new model restarting
+# far sooner than expected is the symptom that means it needs a row here.
+#                model-id pattern                       restart at
+CONTEXT_THRESHOLDS='
+  \[1m\]                                                200000
+  claude-fable-5(-[0-9]|[^A-Za-z0-9-])                  200000
+  claude-mythos-5(-[0-9]|[^A-Za-z0-9-])                 200000
+  claude-opus-5(-[0-9]|[^A-Za-z0-9-])                   200000
+  claude-sonnet-5(-[0-9]|[^A-Za-z0-9-])                 200000
+'
+CONTEXT_THRESHOLD_DEFAULT=160000    # anything unlisted: assume a 200k window, restart at 80% of it
 
-# hook_missing REASON: print why the suggest-compact prerequisite failed plus a ready-to-run
-# command that has Claude install it, then exit. Single hint for every hook path.
-hook_missing() {
-  echo "$PROG: $1" >&2
-  echo "" >&2
-  echo "Install the suggest-compact hook, then retry. To have Claude set it up for you, run:" >&2
-  echo "" >&2
-  echo "  claude \"$INSTALL_HINT\"" >&2
-  exit 1
-}
-
-# run_doctor: verify every prerequisite (claude CLI, suggest-compact hook, flock). The single
-# source of truth for prerequisite checks — run on normal startup AND via `--doctor` (which the
-# brew formula calls as a post-install step). Exits nonzero with an actionable message on failure.
+# run_doctor: verify every prerequisite (claude CLI, flock). The single source of truth for
+# prerequisite checks — run on normal startup AND via `--doctor` (which the brew formula calls as
+# a post-install step). Exits nonzero with an actionable message on failure.
 run_doctor() {
   # guard: claude CLI present.
   command -v claude >/dev/null 2>&1 || { echo "$PROG: claude CLI not found on PATH — install Claude Code: https://claude.com/product/claude-code"; exit 1; }
-
-  # guard: suggest-compact prerequisite (see top) — installed and writes the context-bucket file.
-  SETTINGS="$HOME/.claude/settings.json"
-  [ -f "$SETTINGS" ] || hook_missing "$SETTINGS not found"
-  # pull the .js path out of the hook command line
-  HOOK_JS="$(grep -oE '[^" ]*suggest-compact\.js' "$SETTINGS" | head -1)"
-  [ -n "$HOOK_JS" ] || hook_missing "suggest-compact hook not installed in $SETTINGS"
-  HOOK_JS="${HOOK_JS/#\$HOME/$HOME}"; HOOK_JS="${HOOK_JS/#\~/$HOME}"
-  [ -f "$HOOK_JS" ] || hook_missing "hook script not found at $HOOK_JS"
-  grep -q 'claude-context-bucket-' "$HOOK_JS" \
-    || hook_missing "suggest-compact hook lacks the context-size signal (writes no claude-context-bucket file); update it"
 
   # guard: flock prerequisite (see top) — present AND runnable.
   command -v flock >/dev/null 2>&1 || { echo "$PROG: flock not found on PATH (Linux: util-linux; macOS: brew install flock)"; exit 1; }
@@ -169,6 +174,13 @@ if [ -z "$WATCHDOG_SECS" ]; then
 fi
 WATCHDOG_PID=""      # set per launch by arm_watchdog, cleared by disarm_watchdog
 
+DEPENDENCY_WAIT_SECS="$(parse_dur "${CLAUDEZERO_DEPENDENCY_WAIT:-$DEPENDENCY_WAIT_DEFAULT}" || true)"
+DEPENDENCY_WAIT_RAW="${CLAUDEZERO_DEPENDENCY_WAIT:-$DEPENDENCY_WAIT_DEFAULT}"
+if [ -z "$DEPENDENCY_WAIT_SECS" ]; then
+    echo "$PROG: ignoring CLAUDEZERO_DEPENDENCY_WAIT=$DEPENDENCY_WAIT_RAW (want 900, 90s, 15m, 1h, or 0 to disable) — using $DEPENDENCY_WAIT_DEFAULT" >&2
+    DEPENDENCY_WAIT_RAW="$DEPENDENCY_WAIT_DEFAULT"; DEPENDENCY_WAIT_SECS="$(parse_dur "$DEPENDENCY_WAIT_DEFAULT")"
+fi
+
 reap_dead_sessions   # startup: clear markers left by crashed prior runs before the first claude
 while true; do
     # zero mode: the SHELL decides whether a claude session is worth starting. Nothing left → the
@@ -177,6 +189,7 @@ while true; do
     if [ "${MODE:-}" = zero ]; then
         if all_todos_done; then break; fi
         if ! wait_for_claimable; then break; fi
+        if ! wait_for_dependency_clear; then break; fi
     fi
     # first prompt submitted straight from the CLI arg. The session Stop hook SIGTERMs claude
     # when context fills; exit 143 is the normal restart path, so swallow it.
@@ -325,9 +338,9 @@ fi
 
 # session-scoped Stop hook: written into the git dir, wired via `claude --settings` so ONLY the
 # session we launch gets it (parallel zero-mode sessions stay isolated; global settings.json untouched).
-# --settings MERGES over global config and hooks are additive, so suggest-compact keeps firing and
-# this Stop hook is added on top. Fires at each turn end; SIGTERMs claude once suggest-compact has
-# written the session's context-bucket file (threshold crossed), and the loop restarts it fresh.
+# --settings MERGES over global config, so any hooks already installed there keep firing and this
+# Stop hook is added on top. Fires at each turn end; computes its own context-rot restart signal
+# (below) from the session transcript and SIGTERMs claude once it fires, restarting it fresh.
 GITDIR_ABS="$(cd "$(git rev-parse --git-dir)" && pwd)"
 SESSION_DIR="$(cd "$(git rev-parse --git-common-dir)" && pwd)/session"   # matches zero.sh's marker dir
 TODOS_TIME_FILE="$(cd "$(git rev-parse --git-common-dir)" && pwd)/todos-seconds-${BASE_BRANCH//\//-}-$INSTANCE_ID"   # this instance's file (matches zero.sh's todos_file)
@@ -355,20 +368,42 @@ INSTANCE_NICK="$(pick_nickname)"    # kept in a var: the report header says it t
 SESSION_NAME="($INSTANCE_ID) $INSTANCE_NICK · $(dojo_student "$INSTANCE_ID")"
 
 STOP_HOOK="$GITDIR_ABS/compact-exit-hook.sh"
-cat >"$STOP_HOOK" <<'HOOK_EOF'
+# Stop hook: emitted as TWO heredocs into the same file. The first is UNQUOTED so
+# $CONTEXT_THRESHOLDS/$CONTEXT_THRESHOLD_DEFAULT interpolate; the second (unchanged, `>>`) stays
+# QUOTED — its body is full of live `$`. Four characters in CONTEXT_THRESHOLDS's VALUE cannot
+# survive the unquoted heredoc: `$` and a backtick would expand, a backslash before any of
+# `$` `` ` `` `\` or a newline would be eaten, and a `'` would end the single-quoted value early —
+# every other byte, including the `\[`/`\]` the marker row needs, survives untouched. None of the
+# table rows above use any of those four characters, so this holds today; a future row must keep
+# it that way. Baking the table into the emitted hook — unlike CLAUDEZERO_TRANSCRIPTS, which the
+# body below still refuses to bake in — is safe because this value is per-SCRIPT-VERSION, not
+# per-instance: every peer running the SAME claudezero.sh writes the SAME bytes to this shared
+# path, so concurrent writers racing last-writer-wins is a no-op. Peers on DIFFERENT script
+# versions overwrite each other's table on every launch — benign (whichever version wrote last is
+# what the next turn reads), and deliberately left unlocked.
+cat >"$STOP_HOOK" <<HOOK_HEAD
 #!/usr/bin/env bash
-# Stop hook. Fires post-turn (transcript already persisted). If suggest-compact wrote its
-# per-session context-bucket file (= threshold crossed), SIGTERM the owning claude so the outer
-# loop restarts fresh. Reusing that bucket file as the signal means no separate flag and no edit
-# to the hook. Couples to its filename/tmpdir; update if ECC changes them.
+CONTEXT_THRESHOLDS='$CONTEXT_THRESHOLDS'
+CONTEXT_THRESHOLD_DEFAULT=$CONTEXT_THRESHOLD_DEFAULT
+HOOK_HEAD
+cat >>"$STOP_HOOK" <<'HOOK_EOF'
+# Stop hook. Fires post-turn (transcript already persisted). Couples to the transcript's
+# `message.usage` schema (the same shape read_tokens_total parses, see its own comment) — no
+# other hook, no state file. The context-rot guard below reads only the last 256 KiB of the
+# transcript (`tail -c 262144`): that keeps its cost flat on every turn regardless of transcript
+# size, needed because it runs every turn and only the newest usage record ever matters. `model`
+# sits near the start of a record and `content` is the only part that grows, so a large record can
+# have its `model` cut away while `usage` (at the very end) survives the same cut — that degrades
+# to a row miss (the default threshold applies), never to a parse failure, and never later than
+# the record's true resolution.
 input="$(cat)"
 # token accounting: record this session's transcript path for the outer loop to sum after claude
 # exits. The hook file is shared by all instances in this git dir, so the destination comes from
 # the env of the claude WE launched (CLAUDEZERO_TRANSCRIPTS), never baked in. One line per path;
-# best-effort, never fails the turn.
+# best-effort, never fails the turn. `tp` is shared with the context-rot guard below.
 tf="${CLAUDEZERO_TRANSCRIPTS:-}"
+tp="$(printf '%s' "$input" | sed -n 's/.*"transcript_path"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')"
 if [ -n "$tf" ]; then
-  tp="$(printf '%s' "$input" | sed -n 's/.*"transcript_path"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')"
   [ -n "$tp" ] && ! grep -qxF "$tp" "$tf" 2>/dev/null && printf '%s\n' "$tp" >> "$tf"
 fi
 # nearest ancestor named 'claude' → SIGTERM (graceful: reaps bash tree, runs SessionEnd hooks,
@@ -393,10 +428,59 @@ term_owner() {
     depth=$((depth+1))
   done
 }
-sid="$(printf '%s' "$input" | sed -n 's/.*"session_id"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | tr -cd 'A-Za-z0-9_-')"
-dir="${TMPDIR:-${TMP:-${TEMP:-/tmp}}}"; dir="${dir%/}"      # match node os.tmpdir()
-# context-rot guard: suggest-compact's bucket file = threshold crossed, restart on fresh context.
-[ -n "$sid" ] && [ -f "$dir/claude-context-bucket-$sid" ] && { term_owner; exit 0; }
+# context-rot guard: resolve THIS turn's restart threshold from CONTEXT_THRESHOLDS against the
+# newest usage record's token total, and SIGTERM if it is at or past it. Five things below are
+# not free choices:
+#   - `grep -noE` extracts each field into its OWN short `LINE:"key":value` output line before
+#     awk ever sees it — macOS's stock (bwk) awk is O(n^2) matching a regex against one very long
+#     $0 (measured ~9.5s for a single 262144-byte record on that awk; grep's own matcher stays
+#     linear on the same input). A record padded past the cap is exactly what the cap exists to
+#     keep cheap, so awk must never be handed the raw line. `-n` keeps each match's original line
+#     number, so fields stay grouped by the record they came from without awk re-scanning $0.
+#   - the table reaches awk through ENVIRON[], never -v: `-v` expands backslash escapes, so
+#     `\[1m\]` would arrive as the character class `[1m]`, matching a bare "1" or "m".
+#   - no `$` anchor for the end-of-id test — macOS's bwk awk is inconsistent with one inside an
+#     alternation. A sentinel (one appended space) stands in for it instead.
+#   - `tail` carries its OWN `2>/dev/null`, separate from awk's: `[ -f "$tp" ]` is true for a
+#     chmod 000 file, so `tail` is what raises Permission denied, not awk — it must not leak onto
+#     an otherwise-silent turn's stderr.
+#   - the comparison is `>=`, not `>`: a total exactly AT the threshold restarts too.
+# Degrade, never lie: a missing, unreadable, empty, or usage-free transcript yields no output
+# below, and the guard does not fire.
+if [ -n "$tp" ] && [ -f "$tp" ]; then
+  if [ "$(tail -c 262144 "$tp" 2>/dev/null | grep -noE '"model":"[^"]*"|"input_tokens":[0-9]+|"cache_read_input_tokens":[0-9]+|"cache_creation_input_tokens":[0-9]+|"output_tokens":[0-9]+' | CZ_TABLE="$CONTEXT_THRESHOLDS" CZ_DEFAULT="$CONTEXT_THRESHOLD_DEFAULT" awk '
+    BEGIN {
+      def = ENVIRON["CZ_DEFAULT"] + 0
+      n = split(ENVIRON["CZ_TABLE"], tln, "\n")
+      for (i = 1; i <= n; i++) {
+        if (split(tln[i], f, " ") < 2) continue
+        tn++; pat[tn] = f[1]; thr[tn] = f[2] + 0
+      }
+    }
+    {
+      if (!match($0, /^[0-9]+:/)) next
+      L = substr($0, 1, RLENGTH - 1); rest = substr($0, RLENGTH + 1)
+      if (!match(rest, /^"[a-zA-Z_]+":/)) next
+      key = substr(rest, 2, RLENGTH - 3); val = substr(rest, RLENGTH + 1)
+      if ((L, key) in seen) next    # first match per (line,key) is the parent field
+      seen[L, key] = 1
+      if (key == "model") { sub(/^"/, "", val); sub(/"$/, "", val); mdl[L] = val; next }
+      if (key == "output_tokens") { saw_out[L] = 1; next }
+      tot[L] += val + 0
+    }
+    END {
+      best = ""
+      for (L in saw_out) { if ((tot[L]+0) > 0 && (best == "" || (L+0) > (best+0))) best = L }
+      if (best == "") exit
+      id = mdl[best] " "
+      th = def
+      for (i = 1; i <= tn; i++) { if (id ~ pat[i]) { th = thr[i]; break } }
+      if ((tot[best]+0) >= th) print 1
+    }
+  ' 2>/dev/null)" = 1 ]; then
+    term_owner; exit 0
+  fi
+fi
 # ordinary turn end (task merged, or nothing claimable): end the session too, so the next task
 # starts on a context isolated from this one and an idle instance costs nothing. A turn end is
 # claude sitting idle at the prompt — the transcript is already recorded above, and any half-done
@@ -639,6 +723,56 @@ wait_for_claimable() {
           "$h" "$(fmt_dur $(( last - start )))"
       fi
       sleep "$WAIT_TICK" || true     # SIGINT interrupts sleep and fires the INT trap
+    fi
+  done
+}
+
+# block while a no-claim marker (written by claude via `.git/zero.sh no-claim-mark`, step 3)
+# still matches the live dependency signature — a session already walked the whole list and
+# found the unheld remainder genuinely blocked, so relaunching immediately would spend a fresh
+# claude session on the same judgment. wait_for_claimable's `u <= h` means "everything is
+# peer-held"; this means "u > h, yet nothing was claimable" — a distinct reason to wait, so it
+# gets a distinct line. 0 = launch claude; 1 = break to the closer (Ctrl+C/SIGTERM).
+wait_for_dependency_clear() {
+  local marker="$GITDIR_ABS/no-claim-$INSTANCE_ID" stored="" live start=0 last=0 spin=0 i u h frames="|/-\\"
+  # one-shot read+delete: this instance's marker is consumed here, now, or never. Comparing the
+  # FILE again on every poll would find it already gone after the first tick and read as "no
+  # marker" — i.e. launch — even though the block it recorded never cleared.
+  if [ -f "$marker" ]; then stored=$(cat "$marker" 2>/dev/null || true); rm -f "$marker"; fi
+  [ -n "$stored" ] || return 0                              # no marker: normal launch, no new poll
+  [ "$DEPENDENCY_WAIT_SECS" -gt 0 ] || return 0              # 0 = always relaunch immediately
+  live=$("$ZERO_SH" no-claim-signature 2>/dev/null || true)
+  [ "$live" = "$stored" ] || return 0                        # already stale: normal launch
+  start=$(date +%s)
+  while true; do
+    if [ "$STOP" = 1 ]; then return 1; fi
+    live=$("$ZERO_SH" no-claim-signature 2>/dev/null || true)
+    if [ "$live" != "$stored" ]; then
+      if [ -t 1 ]; then printf '\r\033[K'; fi
+      return 0
+    fi
+    if [ $(( $(date +%s) - start )) -ge "$DEPENDENCY_WAIT_SECS" ]; then
+      if [ -t 1 ]; then printf '\r\033[K'; fi
+      return 0                                               # ceiling: let a fresh session re-judge
+    fi
+    u=$(unchecked_todos); h=$(held_todos)
+    if [ -t 1 ]; then
+      i=0
+      while [ "$i" -lt $((WAIT_TICK / WAIT_FRAME)) ]; do
+        printf '\r❄ %s waiting for a claimable task (now blocked %s) · %s held by peers · %s\033[K' \
+          "${frames:$((spin%4)):1}" "$((u - h))" "$h" \
+          "$(fmt_dur $(( ( ( $(date +%s) - start ) / WAIT_STEP ) * WAIT_STEP )))"
+        spin=$((spin+1)); i=$((i+1))
+        sleep "$WAIT_FRAME" || true
+        if [ "$STOP" = 1 ]; then return 1; fi
+      done
+    else
+      if [ $(( $(date +%s) - last )) -ge "$LOG_TICK" ]; then
+        last=$(date +%s)
+        printf '❄ waiting for a claimable task (now blocked %s) · %s held by peers · %s\n' \
+          "$((u - h))" "$h" "$(fmt_dur $(( last - start )))"
+      fi
+      sleep "$WAIT_TICK" || true
     fi
   done
 }
@@ -1209,6 +1343,46 @@ is_done() {
   git merge-base --is-ancestor "$head" "$BASE_BRANCH"
 }
 
+# ids of tasks live peers hold right now, one per line — same scan claudezero.sh's own
+# held_todos() does (live .owner pid + start-time match, current session marker names this
+# task), but emitting the ids themselves rather than a bare count: a signature needs to notice
+# task X's holder dying even when the total held COUNT stays identical (a different peer claims
+# something else in the same tick).
+held_ids() {
+  local path branch id pid st cur
+  while IFS=$'\t' read -r path branch; do
+    case "$branch" in "$BASE_BRANCH-task-"*) id=${branch#"$BASE_BRANCH"-task-} ;; *) continue ;; esac
+    [ -f "$path/.owner" ] || continue
+    { read -r pid; read -r st; } < "$path/.owner" 2>/dev/null || continue
+    kill -0 "$pid" 2>/dev/null || continue
+    [ "$(proc_start "$pid")" = "$st" ] || continue
+    cur=""
+    if [ -f "$SESSION_DIR/$pid" ]; then { read -r _; read -r cur; } < "$SESSION_DIR/$pid" 2>/dev/null || cur=""; fi
+    [ "$cur" = "$id" ] && printf '%s\n' "$id"
+  done < <(git worktree list --porcelain | awk '
+    /^worktree /            { p = substr($0, 10) }
+    /^branch refs\/heads\// { printf "%s\t%s\n", p, substr($0, 19) }')
+}
+
+# deterministic signature for "what would have to change before a retry could possibly claim
+# something": the todo blob's own SHA (changes the instant any box flips or any task text
+# changes) plus the sorted set of ids peers currently hold. Single source of truth, computed
+# here rather than by the LLM, so claudezero.sh's wait can compare it without reimplementing
+# the scan.
+no_claim_signature() {
+  printf '%s %s\n' \
+    "$(git rev-parse "$BASE_BRANCH:$TODO_PATH" 2>/dev/null)" \
+    "$(held_ids | sort | tr '\n' ,)"
+}
+
+# no-claim-mark: record "nothing was claimable at this signature" for THIS instance (keyed by
+# CLAUDEZERO_INSTANCE, not the owner pid — the marker outlives this session's Stop-hook restart),
+# so claudezero.sh can skip relaunching until the signature changes. Atomic publish (temp+rename,
+# same idiom as add_counter): the shell may read this file without a lock.
+no_claim_mark() {
+  no_claim_signature > "$GITDIR/no-claim-$INSTANCE_ID.tmp" && mv -f "$GITDIR/no-claim-$INSTANCE_ID.tmp" "$GITDIR/no-claim-$INSTANCE_ID"
+}
+
 case "${1:-}" in
   claim)   ensure_owner; claim_task "$2" ;;
   acquire) ensure_owner; acquire_task "$(sanitize_id "$2")" ;;
@@ -1216,7 +1390,9 @@ case "${1:-}" in
   merge)   ensure_owner; merge_task "$(sanitize_id "$2")" "$3" && set_current none || exit $? ;;  # clear only on success
   done)    is_done "$2" "${3:-}" ;;
   credit_inflight_time)   credit_inflight_time ;;
-  *) echo "usage: zero.sh {claim N | acquire N | release N WT | merge N WT | done N [WT] | credit_inflight_time}" >&2; exit 64 ;;
+  no-claim-mark)          no_claim_mark ;;
+  no-claim-signature)     no_claim_signature ;;
+  *) echo "usage: zero.sh {claim N | acquire N | release N WT | merge N WT | done N [WT] | credit_inflight_time | no-claim-mark | no-claim-signature}" >&2; exit 64 ;;
 esac
 ZERO_EOF
     } > "$gitdir/zero.sh"
@@ -1330,9 +1506,12 @@ Keep these facts in mind:
         its worktree $wt and its branch (`git -C "$wt" symbolic-ref --short HEAD`), and ask the human to
         "resolve the conflict on that branch, then merge by hand".
 3. End your turn — after zeroing one task, or after walking the whole list without claiming one
-   (say which happened). If every task in @@TODO@@ is now checked, announce "ALL TASKS DONE" first.
-   What runs next is the shell's call: it starts a fresh session for the next task, waits while
-   peers hold everything, or prints the closing report.
+   (say which happened). If you walked the whole list and claimed nothing, run
+   `.git/zero.sh no-claim-mark` first — it lets the shell wait for that block to clear instead of
+   spending a fresh session on the same judgment. If every task in @@TODO@@ is now checked, announce
+   "ALL TASKS DONE" first. What runs next is the shell's call: it starts a fresh session for the
+   next task, waits while peers hold everything or the remainder is dependency-blocked, or prints
+   the closing report.
 PROMPT_EOF
     prompt=${prompt%$'\n'}          # read keeps the final newline; $(cat) stripped it
     prompt=${prompt//@@TODO@@/$todo}

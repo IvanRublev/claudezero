@@ -25,8 +25,6 @@ do anything I could do at this terminal."
 - **CLAUDE.md steers every run.** The reflection loop lets the agent append to
   it; a poisoned CLAUDE.md redirects all future tasks. Review its diffs like
   any other code.
-- **The suggest-compact hook is third-party** (affaan-m/ECC) and runs in your
-  Claude session. Audit and pin it; ClaudeZero only reads its state file.
 
 ### Blast radius, and how it's bounded
 

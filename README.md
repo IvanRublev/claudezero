@@ -22,6 +22,7 @@ Runs [`claude`](https://claude.com/product/claude-code) on a predefined prompt i
 - [Quickstart](#quickstart)
 - [Install](#install-for-the-claude-coding-agent)
 - [Todo file format](#todo-file-format)
+- [Context Rot](#context-rot)
 - [Loop engineering](#loop-engineering)
 - [Usage](#usage)
 - [Cleanup](#cleanup)
@@ -33,7 +34,7 @@ Runs [`claude`](https://claude.com/product/claude-code) on a predefined prompt i
 ## What it does
 
 - **Guides Claude to zero a todo list unattended** — one task at a time until all are completed, committed, and checkmarked.
-- **Beats context rot** — session Stop hook SIGTERMs `claude` at ~80% of the context window and restarts clean. Fresh context, no quality decay.
+- **Beats context rot** — session Stop hook SIGTERMs `claude` once its context total crosses a threshold (see [Context rot](#context-rot)) and restarts clean. Fresh context, no quality decay.
 - **One task per session** — `claude` exits once it has zeroed a single todo and the script restarts it, so every task runs on a context isolated from the task before it, which cuts token spend (~20% on a working instance). An instance that has nothing to claim waits in the shell without launching `claude` at all, spending nothing.
 - **Parallel by default** — run many instances at once; they coordinate via git worktrees, each claiming todos the others haven't taken.
 - **Safe merges** — cross-instance merge-back serialized through `flock`; no races, no corrupted base.
@@ -120,15 +121,9 @@ Supported on **macOS and Linux** (the script is bash-3.2-safe, so stock macOS `b
    brew install flock          # macOS; Linux ships it in util-linux
    ```
 
-2. **suggest-compact hook** — the context-full restart signal. Install globally in `~/.claude/settings.json`. Requires `node`.
-   - Source: https://github.com/affaan-m/ECC — pin commit `7777656` (known-good with this release; later commits may change the state-file name or path).
-   - ClaudeZero only *reads* the hook's state file — no hook edits needed.
+This prerequisite is guard-checked at startup; the script exits with a clear message if it is missing.
 
-   **State-file contract.** ClaudeZero couples to one artifact the hook produces: a per-session file at `$TMPDIR/claude-context-bucket-<session_id>` (`<session_id>` is the Claude session id; `$TMPDIR` matches node's `os.tmpdir()`). The hook must create this file once the context bucket crosses its threshold. Content is not parsed — **presence alone is the "context full, restart" signal.** Any hook that writes that file, at that path, on threshold works; the pinned commit is just the version verified to do so.
-
-Both prerequisites are guard-checked at startup; the script exits with a clear message if either is missing.
-
-**Transcript-schema contract.** The token figures in the execution-stats report are a second coupling to Claude Code internals, alongside the state file above. ClaudeZero's own Stop hook records each session's `transcript_path` (a field of the hook payload it already parses `session_id` from), and after `claude` exits the loop reads those session JSONL transcripts and sums the `message.usage` fields of every assistant line: `input_tokens`, `output_tokens`, `cache_creation_input_tokens`, `cache_read_input_tokens` — the four categories Anthropic bills separately. One API request is written as several transcript lines, one per content block, each repeating the same `usage` object verbatim, so records are **deduped by the line's `requestId`**, and only the first (parent) match of each field name on a line is taken: `usage.iterations[]` repeats all four names one level down, and `usage.cache_creation` carries the `ephemeral_5m`/`ephemeral_1h` leaves that already sum into the parent. Transcripts are only ever read, and no schema change can fail a run — any parse miss prints `Tokens: n/a` and the run continues.
+**Transcript-schema contract.** ClaudeZero couples to one thing in Claude Code internals: the session transcript's `message.usage` schema. ClaudeZero's own Stop hook records each session's `transcript_path` (a field of the hook payload), and reads it twice, for two different readers. The **context-rot guard** (below) reads the newest usage record on every turn to decide whether to restart. The **token report**, after `claude` exits, reads the whole transcript and sums the `message.usage` fields of every assistant line: `input_tokens`, `output_tokens`, `cache_creation_input_tokens`, `cache_read_input_tokens` — the four categories Anthropic bills separately. One API request is written as several transcript lines, one per content block, each repeating the same `usage` object verbatim, so the token report **dedupes by the line's `requestId`** — a rule that belongs to the token report alone, since the context-rot guard keeps only the latest record regardless of request. Both readers take only the first (parent) match of each field name on a line: `usage.iterations[]` repeats all four names one level down, and `usage.cache_creation` carries the `ephemeral_5m`/`ephemeral_1h` leaves that already sum into the parent. Transcripts are only ever read, and no schema change can fail a run — any parse miss on the token report prints `Tokens: n/a`, and any parse miss on the context-rot guard leaves the session running; either way the run continues.
 
 Two limits: **subagent tokens are invisible** — a session that used the Agent tool writes no `isSidechain` usage lines, so anything the task prompt spawns is missing from the totals, and the size of the under-count is not measurable from inside; and the figures are **per instance run, for this repo only**, unlike whole-machine tools such as `ccusage`, whose denominator is every Claude Code session on the box.
 
@@ -148,6 +143,22 @@ GitHub-style Markdown checkboxes, one task per line. Each line carries a **uniqu
 `````
 
 `[ ]` = still to do, `[x]` = done (skipped). Before zeroing, the LLM validates the whole file: a task missing an id, or a duplicate id, stops the loop with a report. Checkboxes inside fenced code blocks (```` ``` ````) are ignored.
+
+## Context rot
+
+The session Stop hook computes its own restart signal. Models whose plain id means a 1M window restart at **200.000** tokens; everything else restarts at **160.000**, 80% of an assumed 200k window. Matching is first-match-wins against the model id, falling to the 160.000 default when nothing matches.
+
+Why a threshold below the context window limit at all: **context rot**. A long session accumulates tool output, dead ends and superseded reasoning that stay in the window and compete for attention, so quality decays well before the window fills — ClaudeZero restarts earlier. Which is possible due to amnesia by design, durable external state carrying what mattered forward (see [Closing the loop](#closing-the-loop)). Restarting early is also the cheaper direction, since every turn re-sends the whole context; without a restart the re-orientation to another task costs tokens.
+
+The two numbers rest on different evidence:
+
+- **200.000 for a 1M window**, anchored on Opus 4.8, the only high-confidence figure. Its [system card §8.9](https://www-cdn.anthropic.com/0b4915911bb0d19eca5b5ee635c80fef830a37ea.pdf) reports GraphWalks BFS 85.9 @256k → 68.1 @1M and Parents 99.3 → 83.3, its harness compacts at 200k, and [CodeRabbit](https://www.coderabbit.ai/blog/opus-4-8-release) independently sees it "degrade visibly once context crosses 200k"
+  - Opus 4.6 and Sonnet 4.6 bracket the same knee on MRCR v2
+  - Opus 5 and Sonnet 5 publish no depth-resolved eval, yet still compact at 200k, so "holds throughout 1M" is a claim with nothing measuring it
+  - Fable 5 and Mythos 5 are absent from the evidence entirely — one measured curve, four families inheriting it
+- **160.000 for the 200k default** — 80% of the assumed window, and **inference, not measurement**: no 200k model publishes a long-context eval. Haiku 4.5's [system card](https://assets.anthropic.com/m/99128ddd009bdcb/original/Claude-Haiku-4-5-System-Card.pdf) only notes it "frequently encounter[s] physical context-window limits", putting its knee nearer 80–100k — so 160000 is the permissive end, and Haiku 4.5 the standing candidate for its own row.
+
+The model-threshold table is defined as `CONTEXT_THRESHOLDS` in the claudezero script.
 
 ## Loop engineering
 
@@ -230,6 +241,12 @@ CLAUDEZERO_MAX_LOOPS=3 claudezero todo.md
 
 ```sh
 CLAUDEZERO_WATCHDOG=45m claudezero todo.md
+```
+
+**`CLAUDEZERO_DEPENDENCY_WAIT`** — ceiling on the wait after a claude session walks the whole todo list and claims nothing because every unchecked task is dependency-blocked (step 2.a's independence judgment). Default `10m`; same grammar as `CLAUDEZERO_WATCHDOG` (`900`, `90s`, `15m`, `1h`), and `0` relaunches claude immediately every cycle, same as before this existed. Without it, a fully dependency-blocked list looks identical to a genuinely stuck one: a session launches, finds every remaining task blocked, ends its turn, `RESTART_WAIT` ticks down, another launches — same judgment, same nothing-claimed outcome, one claude session burned per cycle for zero possible progress. The session marks the block on its way out (`.git/zero.sh no-claim-mark`); the shell then waits, comparing a deterministic signature (the todo blob's SHA plus the sorted set of ids peers currently hold) instead of relaunching, and stops waiting the instant a peer merges the blocking task or its holder dies — or after this ceiling, whichever comes first, so a session always gets a chance to re-judge the list fresh.
+
+```sh
+CLAUDEZERO_DEPENDENCY_WAIT=20m claudezero todo.md
 ```
 
 **`CLAUDEZERO_LINK`** — comma-separated top-level names symlinked from the repo root into every task worktree. Unset by default. A worktree is a checkout of tracked files only, so anything gitignored is absent there: if your todo lines point at spec files you keep in another git repository — `issues/ISSUE-031.md` holding the acceptance criteria for `- [ ] ISSUE-031 …` — the session never sees them and works from the one-line title alone. Listing the directory here links it in, so the criteria are readable and a tick lands in the real file rather than in a copy the worktree removal deletes. Each linked name is added to `.git/info/exclude`, so it stays out of the session's `git add -A` and out of this repository.

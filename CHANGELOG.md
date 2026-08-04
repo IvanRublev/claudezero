@@ -4,6 +4,29 @@ All notable changes to ClaudeZero are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); this project uses
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.0.17] - 2026-08-04
+
+### Added
+
+- `CLAUDEZERO_DEPENDENCY_WAIT` — ceiling on the wait after a zero-mode session walks the whole
+  todo list and claims nothing because every unchecked task is dependency-blocked. Without it, a
+  fully dependency-blocked list looked identical to a genuinely stuck one: a fresh claude session
+  launched, found the same block, and ended its turn — one session burned per cycle for zero
+  possible progress. The session now marks the block on its way out, and the shell waits,
+  comparing a deterministic signature of the todo blob and the ids peers currently hold, instead
+  of relaunching blindly — stopping the instant a peer merges the blocking task or its holder
+  dies, or after this ceiling, whichever comes first. Default `10m`; same grammar as
+  `CLAUDEZERO_WATCHDOG`; `0` relaunches immediately every cycle, same as before this existed
+  (ISSUE-034).
+
+### Changed
+
+- The context-full restart signal is now computed in ClaudeZero's own Stop hook, from a
+  threshold table (`CONTEXT_THRESHOLDS`) at the top of `claudezero.sh`, instead of depending on
+  a third-party `suggest-compact` hook — one prerequisite instead of two. Existing installs need
+  no action: a still-installed `suggest-compact` hook keeps writing a file nothing reads, so it
+  is inert, not conflicting, and removing it is optional (ISSUE-035).
+
 ## [0.0.16] — 2026-08-03
 
 ### Added

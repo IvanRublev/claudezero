@@ -53,6 +53,17 @@ the project's own working tree or history, and can run concurrently.
 - **O — `CLAUDEZERO_LINK` into task worktrees.** Deterministic. Symlinks a gitignored
   directory into a task worktree, write-through, invisible to git via `info/exclude`,
   validated at startup before any claude launch.
+- **P — the dependency-blocked wait (`CLAUDEZERO_DEPENDENCY_WAIT`).** Deterministic. A session
+  that walks the whole list and claims nothing marks the block (`no-claim-mark`); the shell
+  waits on the deterministic signature instead of relaunching blindly, breaks the instant a
+  box flips or a peer's marker goes stale, `0` disables the wait, and an unchanged signature
+  past the ceiling forces a relaunch anyway.
+- **Q — the context-rot guard.** No claude. The Stop hook's own threshold table resolves a
+  restart signal from a fixture transcript: `[1m]` and each bare family id at 200000, a
+  word-suffix tier and unlisted ids at the 160000 default, `>=` at the exact threshold, row
+  order deciding overlapping rows, the marker row's backslash escapes surviving the `ENVIRON[]`
+  hand-off, the 256 KiB read cap degrading to a row miss past it, and every degraded input
+  (missing/unreadable/usage-free transcript) leaving the session running.
 
 Parallelism (A, C) is enforced with a **file-lock barrier**, not `sleep`, so the
 proof is independent of claude startup/shutdown times.
@@ -75,13 +86,12 @@ it did, refusing instead of silently proceeding on a miss.
 can run it autonomously and report the results.
 
 **Prerequisites:** `flock`, `uuidgen`, `timeout`, `git`, `date`, `find`, `stat`, `mv`
-on PATH. A and C need real `claude` on PATH and the `suggest-compact` hook installed in
-`~/.claude/settings.json` (claudezero.sh refuses to start without it — if A/C logs show
-an immediate hook error, report "prerequisite missing — suggest-compact hook"). B, E, F and
-G do **not** need real claude but still need `flock` and the `suggest-compact` hook (both
-startup guards run before any claude launch; E/F/G supply a stub `claude` so claudezero
-writes `zero.sh` and loops out at once). A missing hook makes them exit with the wrong
-message and their assertions fail.
+on PATH — `flock` is the one remaining external prerequisite claudezero.sh's own startup guard
+checks. A and C need real `claude` on PATH. B, E, F and G do **not** invoke claude but still
+need it present on PATH: `run_doctor` tests `command -v claude` before any startup guard runs,
+so a missing `claude` fails them at the wrong step (E/F/G additionally supply a stub `claude`
+so claudezero writes `zero.sh` and loops out at once; B needs none beyond the PATH check since
+every case there refuses before a launch).
 
 Inform about progress during the test; at the end return a summary report
 of passes, fails, and causes.
@@ -405,14 +415,48 @@ git -C "$TB/worktree" branch --list '*-task-*-task-*' | grep -q . && echo "B4 FA
 cd "$TB/untracked"                             # clean repo, but the todo is not in the base tree
 if out=$(timeout 20 bash "$SCRIPT" todo.md -t x 2>&1); then rc=0; else rc=$?; fi
 { [ "$rc" != 0 ] && echo "$out" | grep -qi 'not tracked'; } && echo "B5 untracked-guard PASS" || echo "B5 FAIL (rc=$rc): $out"
+
+# run_doctor coverage: no ~/.claude/settings.json is a prerequisite anymore, and --doctor is
+# the same code path a normal startup runs first. `mkbin DIR tool…` symlinks only the named
+# tools into an otherwise-empty dir, so PATH=DIR alone proves a tool's true absence — --doctor
+# exits before main() reaches any of git/sed/awk/uuidgen/etc, so `basename`, `mktemp` and
+# (conditionally) `claude`/`flock` are the whole surface it needs.
+mkbin(){ local d="$1"; shift; mkdir -p "$d"; local t p; for t in "$@"; do p=$(command -v "$t" 2>/dev/null) || continue; ln -sf "$p" "$d/$t"; done; }
+BASH_BIN="$(command -v bash)"   # PATH=bin-no* below excludes bash itself; invoke it by absolute path
+mkdir -p "$TB/emptyhome"    # HOME with no ~/.claude directory at all
+
+if out=$(HOME="$TB/emptyhome" bash "$SCRIPT" --doctor 2>&1); then rc=0; else rc=$?; fi
+{ [ "$rc" = 0 ] && echo "$out" | grep -qi 'all prerequisites OK'; } && echo "B6 doctor-no-settings PASS" || echo "B6 FAIL (rc=$rc): $out"
+
+cd "$TB/dirty"                                 # same dirty tree as B1, now under the empty HOME
+if out=$(HOME="$TB/emptyhome" timeout 20 bash "$SCRIPT" todo.md -t x 2>&1); then rc=0; else rc=$?; fi
+{ [ "$rc" != 0 ] && echo "$out" | grep -qi dirty; } && echo "B7 startup-no-settings PASS" || echo "B7 FAIL (rc=$rc): $out"
+
+mkbin "$TB/bin-noclaude" basename mktemp flock
+if out=$(HOME="$TB/emptyhome" PATH="$TB/bin-noclaude" "$BASH_BIN" "$SCRIPT" --doctor 2>&1); then rc=0; else rc=$?; fi
+{ [ "$rc" != 0 ] && echo "$out" | grep -qi 'claude CLI not found'; } && echo "B8 doctor-no-claude PASS" || echo "B8 FAIL (rc=$rc): $out"
+
+mkbin "$TB/bin-noflock" basename mktemp claude
+if out=$(HOME="$TB/emptyhome" PATH="$TB/bin-noflock" "$BASH_BIN" "$SCRIPT" --doctor 2>&1); then rc=0; else rc=$?; fi
+{ [ "$rc" != 0 ] && echo "$out" | grep -qi 'flock not found'; } && echo "B9 doctor-no-flock PASS" || echo "B9 FAIL (rc=$rc): $out"
+
+mkbin "$TB/bin-badflock" basename mktemp claude
+printf '#!/usr/bin/env bash\nexit 1\n' > "$TB/bin-badflock/flock"; chmod +x "$TB/bin-badflock/flock"
+if out=$(HOME="$TB/emptyhome" PATH="$TB/bin-badflock" "$BASH_BIN" "$SCRIPT" --doctor 2>&1); then rc=0; else rc=$?; fi
+{ [ "$rc" != 0 ] && echo "$out" | grep -qi 'flock present but not runnable'; } && echo "B10 doctor-flock-broken PASS" || echo "B10 FAIL (rc=$rc): $out"
 ```
-- **B PASS** — B1, B2, B3, B4, and B5 all report PASS (non-zero exit + the expected message,
-  before any claude launch), and no `*-task-*-task-*` branch exists. B3 proves the
-  worktree-path assumption is enforced: a subdir launch refuses rather than misfiring
-  `../ts-*` paths. B4 proves the same for a launch *inside* a leftover claim worktree, where
-  the base branch would otherwise be poisoned to a peer's claim and both instances would take
-  the same todo (BUG-014). B5 proves a todo the base branch does not track refuses up front
-  instead of letting every merge be refused for checking zero boxes (BUG-026).
+- **B PASS** — B1 through B10 all report PASS (non-zero exit + the expected message, before
+  any claude launch — B6/B7 exit 0/nonzero respectively), and no `*-task-*-task-*` branch
+  exists. B3 proves the worktree-path assumption is enforced: a subdir launch refuses rather
+  than misfiring `../ts-*` paths. B4 proves the same for a launch *inside* a leftover claim
+  worktree, where the base branch would otherwise be poisoned to a peer's claim and both
+  instances would take the same todo (BUG-014). B5 proves a todo the base branch does not
+  track refuses up front instead of letting every merge be refused for checking zero boxes
+  (BUG-026). B6 proves `--doctor` no longer needs `~/.claude/settings.json`; B7 proves a
+  normal startup from the same `HOME` gets past that same prerequisite check and refuses on
+  the dirty-tree guard instead, so both paths run the same `run_doctor` code. B8, B9 and B10
+  prove `--doctor` still refuses, with its existing message, when `claude` is absent, when
+  `flock` is absent, and when `flock` is present but not runnable.
 
 ---
 
@@ -463,19 +507,27 @@ grep -Eril 'conflict|merge fail|resolve|stop' "$TC"/log_*.txt >/dev/null && echo
 
 ---
 
-## Scenario D — foreign check-off refusal + self-heal   `[$TESTROOT/D]`
+## Scenario D — foreign check-off refusal + self-heal   `[$TESTROOT/D]`   (scripted setup, real claude for merge+heal)
 
-One agent, two tasks. The `-t` prompt **induces** the agent to tick a SECOND checkbox
-(a task it does not own) and ignore step 2.d's touch-no-other-line rule, so the foreign tick
-reaches the merge. `merge_task` enforces the one-box invariant on **every** merge (not
-just conflicting ones), refuses with a `checkbox-merge: refused` pointer listing the
-offending `file:line`s, and step 2.e self-heals: uncheck the foreign line, amend, retry —
-then the merge lands. No parallelism, no gate; a single instance triggers it because the
-branch carries two check-offs vs its fork point.
+The foreign double-tick is fabricated directly, not induced through a real agent: a
+natural-language prompt asking an agent to deliberately violate the touch-no-other-line
+rule trips this account's `--permission-mode auto` classifier (it silently denies the
+very edit/commit the inducement needs, the CLI prints `Execution error`, and the session
+hangs until the outer timeout kills it — the classifier ends up an accidental guard
+against the exact bad edit this scenario needs to happen). So the violation is scripted
+via `zero.sh claim` plus direct commits, reproducing exactly the state a misbehaving
+agent would leave. Only the part actually worth testing with a real agent — noticing the
+refusal and following its pointer to self-heal — runs through a real, narrowly-scoped
+`claude -p` call under `--permission-mode bypassPermissions`: safe here (confined to a
+throwaway repo under `$TESTROOT`), and that mode has no classifier to trip at all.
+`merge_task` enforces the one-box invariant on **every** merge (not just conflicting
+ones), refuses with a `checkbox-merge: refused` pointer listing the offending
+`file:line`s, and step 2.e self-heals: uncheck the foreign line, amend, retry — then the
+merge lands.
 
 ### Setup
 ```bash
-H="$TESTROOT/D"; mkdir -p "$H/repo"
+H="$TESTROOT/D"; mkdir -p "$H/repo" "$H/bin"
 cd "$H/repo"
 git init -q -b master; git config user.email t@t.t; git config user.name test
 U1=$(uuidgen); U2=$(uuidgen)
@@ -483,36 +535,57 @@ U1=$(uuidgen); U2=$(uuidgen)
 echo "- [ ] T1 Create file markers/$U1.done with the single line \`agent=<label> task=T1\`, then commit." >> todo.md
 echo "- [ ] T2 Create file markers/$U2.done with the single line \`agent=<label> task=T2\`, then commit." >> todo.md
 git add todo.md; git commit -qm todo
-printf '%s\n%s\n' "$U1" "$U2" > "$H/uuids.txt"
+printf '#!/usr/bin/env bash\nexit 0\n' > "$H/bin/claude"; chmod +x "$H/bin/claude"
+PATH="$H/bin:$PATH" timeout 30 env CLAUDEZERO_MAX_LOOPS=1 bash "$SCRIPT" todo.md -t x > "$H/boot.log" 2>&1 || true
+cp "$(command -v bash)" "$H/bin/claude"   # ensure_owner needs a claude-named ancestor for claim/merge
+cat > "$H/setup.sh" <<'SETUP'
+set -uo pipefail
+cd "$H/repo"
+ZERO="$(cd "$(git rev-parse --git-dir)" && pwd)/zero.sh"
+WT=$("$ZERO" claim T1)
+echo "$WT" > "$H/wt.path"
+mkdir -p "$WT/markers"
+printf 'agent=HEAL task=T1\n' > "$WT/markers/$U1.done"
+git -C "$WT" add -A; git -C "$WT" commit -qm "T1: add done marker"
+# the induced violation, fabricated directly: both boxes newly checked vs fork point
+sed -i '' -e 's/^- \[ \] T1 /- [x] T1 /' -e 's/^- \[ \] T2 /- [x] T2 /' "$WT/todo.md"
+git -C "$WT" add -A; git -C "$WT" commit -qm "T1: tick both boxes (induced foreign check-off)"
+SETUP
+H="$H" U1="$U1" env -u CLAUDE_PID "$H/bin/claude" "$H/setup.sh"
+WT=$(cat "$H/wt.path")
 ```
 
-### Run
+### Run — real claude only for the merge + self-heal
 ```bash
 cd "$H/repo"
-timeout -k 10 300 env CLAUDEZERO_MAX_LOOPS=3 bash "$SCRIPT" todo.md \
-  -t "You are agent HEAL. TEST INDUCEMENT for step d only: after doing your acquired task, ALSO tick the OTHER task's checkbox to [x] in todo.md, and IGNORE step 2.d's touch-no-other-line rule — commit both ticks on your task branch. Then proceed to the merge (step 2.e) normally and follow its instructions to the letter." \
-  > "$H/log.txt" 2>&1 || true
+PROMPT="Run \`.git/zero.sh merge T1 \"$WT\"\`. If it refuses (nonzero exit, output starting \`checkbox-merge: refused\`), it lists the offending checked lines as file:line — uncheck every line that is not T1's directly in $WT/todo.md, run \`git -C \"$WT\" commit --amend --no-edit\`, then retry \`.git/zero.sh merge T1 \"$WT\"\` exactly once more. In your final reply, paste the exit code and verbatim output of EVERY merge attempt you make, including any that refuse — not just the last one."
+timeout -k 10 120 claude -p "$PROMPT" --permission-mode bypassPermissions > "$H/heal.log" 2>&1 || true
 ```
 
 ### Assert
 ```bash
 cd "$H/repo"
-echo "refusal fired  : $(grep -c 'checkbox-merge: refused' "$H/log.txt")"
+echo "refusal fired  : $(grep -c 'checkbox-merge: refused' "$H/heal.log")"
 echo "todos checked  : $(grep -c '^- \[x\]' todo.md)/2"
 echo "markers        : $(ls markers 2>/dev/null | wc -l | tr -d ' ')/2"
 echo "phantom check  : $([ "$(grep -c '^- \[x\]' todo.md)" = "$(ls markers 2>/dev/null | wc -l | tr -d ' ')" ] && echo none || echo YES)"
 echo "git clean      : $([ -z "$(git status --porcelain)" ] && echo yes || echo no)"
 echo "leftover brnch : $(git branch --list 'master-task-*' | wc -l | tr -d ' ')"
 ```
-- **D PASS** — `phantom check = none`: every checked task has a real `markers/<uuid>.done`.
-  Ideally `todos checked = 2/2` with `markers = 2/2` (guard refused the double-tick, agent
-  self-healed, then completed both), `git clean = yes`, no leftover branches.
+- **D PASS** — `phantom check = none`, `todos checked = 1/2` (T1 only — T2's box was
+  unchecked again by the self-heal), `markers = 1/2` (T1's only — T2 was never really
+  done, by design), `git clean = yes` (an account-local `probity.config.js`
+  `SessionStart`-hook artifact is a known, unrelated false positive here — see Scenario
+  A/C notes), `leftover brnch = 0` (a landed merge deletes the branch). The scripted
+  state always newly-checks exactly 2 boxes on the first attempt, so the guard refusing
+  is deterministic — but `refusal fired` only reads it back correctly if the agent
+  actually pastes both attempts' output as asked; `phantom check` is the real, git-truth
+  gate. If `refusal fired = 0` despite `phantom check = none`, check for a dangling
+  commit (`git fsck --unreachable`) with the same message as the amended commit but both
+  boxes checked — that's the pre-heal commit, and its existence proves the refusal fired
+  even when the agent's own summary omitted it.
 - **D FAIL** — a box is checked with no marker (`phantom check = YES`): the guard let a
-  foreign tick through (as happened when the check lived only in the conflict-only driver).
-- `refusal fired` is **best-effort only**, not the gate: the refusal text prints to the
-  agent's `zero.sh merge` tool output, not claudezero's stdout log, so this grep often
-  reads 0 even on a correct self-heal. Trust `phantom check`, and read the agent's own
-  narration in `log.txt` for the refuse→uncheck→amend→retry trace.
+  foreign tick through.
 
 ---
 
@@ -1143,8 +1216,14 @@ printf -- '- [ ] K1 x\n' > todo.md; git add -A; git commit -qm init
 ```bash
 cd "$TK/repo"
 printf '#!/usr/bin/env bash\necho "Execution error"\nsleep 1000\n' > "$TK/bin/claude"; chmod +x "$TK/bin/claude"
-PATH="$TK/bin:$PATH" timeout --preserve-status -k 20 8 env CLAUDEZERO_MAX_LOOPS=1 bash "$SCRIPT" todo.md -t x > "$TK/hang.log" 2>&1
-echo "K1 exit          : $?  (want 143 = 128+15; plain \`timeout\` would report its own 124)"
+PATH="$TK/bin:$PATH" env CLAUDEZERO_MAX_LOOPS=1 bash "$SCRIPT" todo.md -t x > "$TK/hang.log" 2>&1 &
+WPID=$!
+i=0; while ! pgrep -f "$TK/bin/claude" >/dev/null 2>&1 && [ "$i" -lt 175 ]; do sleep 0.2; i=$((i+1)); done
+kill -TERM "$WPID" 2>/dev/null
+i=0; while kill -0 "$WPID" 2>/dev/null && [ "$i" -lt 100 ]; do sleep 0.2; i=$((i+1)); done
+kill -0 "$WPID" 2>/dev/null && kill -KILL "$WPID" 2>/dev/null
+K1RC=0; wait "$WPID" || K1RC=$?
+echo "K1 exit          : $K1RC  (want 143 = 128+15)"
 echo "K1 stats         : $(grep -c 'execution stats' "$TK/hang.log")  (want 1 — the report the TERM used to eat)"
 echo "K1 stopped       : $(grep -c 'run loop stopped' "$TK/hang.log")  (want 1)"
 echo "K1 orphans       : $(pgrep -f "$TK/bin/claude" | wc -l | tr -d ' ')  (want 0 — the TERM was forwarded to claude)"
@@ -1228,7 +1307,7 @@ The claimable probe moved out of claude and into the shell: nothing left → the
 everything unchecked held by a *live* peer → wait, launching no claude at all; anything free
 (including a crashed peer's branch, which only claude can rescue) → launch. The Stop hook is
 the other half — in zero mode it ends the session at every turn end, so one session zeroes one
-task; in `-l` loop mode only the context-bucket file still ends it.
+task; in `-l` loop mode only the context-rot guard still ends it.
 
 ### Setup
 ```bash
@@ -1313,39 +1392,14 @@ HOOK="$TM/repo/.git/compact-exit-hook.sh"
 run_as_claude(){ CLAUDEZERO_MODE="$1" env -u CLAUDE_PID "$TM/owner/claude" -c 'printf "%s" "$2" | bash "$1" >/dev/null 2>&1; sleep 3' _ "$HOOK" "$2"; echo $?; }
 echo "M4 zero mode     : $(run_as_claude zero '{}')  (want 143 — ordinary turn end SIGTERMs the owning claude)"
 echo "M4 loop mode     : $(run_as_claude loop '{}')  (want 0 — -l has no task boundary, so it is left running)"
-B="${TMPDIR:-/tmp}"; B="${B%/}/claude-context-bucket-czM4"; : > "$B"
-echo "M4 bucket branch : $(run_as_claude loop '{"session_id":"czM4"}')  (want 143 — the context-rot guard is unchanged and still first)"
-rm -f "$B"
+# a transcript whose newest usage record is at/over claude-opus-5's 200000 threshold
+# (9000 + 250000 + 1000 = 260000) — the context-rot guard's own fixture, see Scenario Q.
+TP="$TM/ctx-over.jsonl"
+printf '%s\n' '{"type":"assistant","requestId":"r1","message":{"model":"claude-opus-5","usage":{"input_tokens":9000,"cache_read_input_tokens":250000,"cache_creation_input_tokens":1000,"output_tokens":500}}}' > "$TP"
+echo "M4 bucket branch : $(run_as_claude loop "$(printf '{"transcript_path":"%s"}' "$TP")")  (want 143 — the context-rot guard is unchanged and still first)"
+rm -f "$TP"
 ```
 - **M4 PASS** — `zero mode = 143`, `loop mode = 0`, `bucket branch = 143`.
-
-### M5 — terminal pacing: one frame a second, clock in 5s steps, independent of `WAIT_TICK`
-```bash
-cd "$TM/repo"
-# M2/M3 landed M1, so restore an unchecked, peer-held task for the wait to sit on
-printf -- '- [ ] M5 x\n' > todo.md; git add -A; git commit -qm m5
-sleep 600 & PEER5=$!
-git worktree add -q -b main-task-M5 "$TM/wt5" main
-printf '%s\n%s\n%s\n%s\n' "$PEER5" "$(ps -o lstart= -p "$PEER5" | awk '{$1=$1;print}')" "$(date +%s)" "PEERINST" > "$TM/wt5/.owner"
-printf '%s\n%s\n' "$(ps -o lstart= -p "$PEER5" | awk '{$1=$1;print}')" "M5" > "$TM/repo/.git/session/$PEER5"
-# a pty is required: the repainting branch is behind `[ -t 1 ]`
-/usr/bin/script -q "$TM/tty.txt" env PATH="$TM/bin:$PATH" timeout 21 env CLAUDEZERO_MAX_LOOPS=1 \
-  bash "$SCRIPT" todo.md -t x >/dev/null 2>&1
-kill "$PEER5" 2>/dev/null; wait "$PEER5" 2>/dev/null || true
-tr '\r' '\n' < "$TM/tty.txt" | grep 'waiting for a claimable task' > "$TM/frames.txt"
-N=$(grep -c . "$TM/frames.txt")
-echo "M5 repaints      : $N  ($( [ "$N" -ge 19 ] && [ "$N" -le 22 ] && echo yes || echo NO) — want yes: ~1/s over the 21s window. A probe-paced line would give 4)"
-# the exact invariant, immune to a second of startup slop: the frames run |/-\ in order, forever.
-# The sequence goes through a PIPE, never `awk -v` — awk expands backslash escapes in a -v value,
-# which silently eats the `\` frame and shifts every comparison after it.
-SEQ=$(grep -o '❄ .' "$TM/frames.txt" | sed 's/^❄ //' | tr -d '\n')
-echo "M5 cycle         : $(printf '%s\n' "$SEQ" | awk '{c="|/-\\"; for(i=1;i<=length($0);i++) if (substr($0,i,1) != substr(c,(i-1)%4+1,1)) {print "NO at "i; exit} print "yes"}')  (want yes)"
-echo "M5 clock steps   : $(grep -oE '· [0-9]+m?[0-9]*s' "$TM/frames.txt" | sort -u | tr '\n' ' ')  (want only 0s/5s/10s/15s/20s — WAIT_STEP=5)"
-echo "M5 no odd clock  : $(grep -cE '· [0-9]*[1-46-9]s' "$TM/frames.txt")  (want 0 — no 1s/2s/3s ever printed)"
-```
-- **M5 PASS** — `repaints = yes`, `cycle = yes`, `clock steps` only multiples of 5, `no odd clock = 0`.
-  Together they pin the frame rate and the clock step to `WAIT_FRAME`/`WAIT_STEP` rather than to
-  `WAIT_TICK`: the probe fires 4 times in this window, the line repaints ~21.
 
 ---
 
@@ -1540,6 +1594,320 @@ echo "O7 says default    : $(printf '%s' "$H" | grep -c 'Unset by default')  (wa
   unset cases (O1/O2), `link_ignored` carrying no validation of its own (O3), a second claim
   appending no duplicate `info/exclude` entry and a dangling link surviving the `-L` guard (O4),
   the untouched merge gate (O5), the startup refusals (O6), and the `--help` `Environment:` block (O7).
+
+---
+
+## Scenario P — the dependency-blocked wait (`CLAUDEZERO_DEPENDENCY_WAIT`)   `[$TESTROOT/P]`   (stub claude, deterministic)
+
+Dependency judgment lives in claude's own prompt (step 2.a), invisible to the shell. Without a
+signal, a fully dependency-blocked list looks identical to a genuinely stuck one: a session
+launches, claims nothing, the shell restarts it after `RESTART_WAIT`, and it happens again —
+one claude session burned per cycle for zero possible progress. Step 3 closes the gap: a session
+that claims nothing marks the block (`.git/zero.sh no-claim-mark`) before ending its turn, and
+the shell waits on a deterministic signature (the todo blob's SHA + the sorted ids peers
+currently hold) instead of relaunching blindly.
+
+### Setup
+```bash
+TP="$TESTROOT/P"; mkdir -p "$TP/repo" "$TP/bin"
+cd "$TP/repo"
+git init -q -b main; git config user.email t@t.t; git config user.name test
+printf -- '- [ ] P1 x\n' > todo.md; git add -A; git commit -qm init
+CLAUDEZERO_TEST_EMIT=1 bash "$SCRIPT" todo.md >/dev/null 2>&1   # writes .git/zero.sh once, up front
+export STUB_ZERO="$TP/repo/.git/zero.sh"
+export STUB_LAUNCHED="$TP/launched"
+```
+
+### P1 — a marker blocks relaunch until the todo blob's SHA changes; a distinct waiting line
+```bash
+cd "$TP/repo"
+: > "$STUB_LAUNCHED"
+cat > "$TP/bin/claude" <<'EOF'
+#!/usr/bin/env bash
+echo launched >> "$STUB_LAUNCHED"
+n=$(wc -l < "$STUB_LAUNCHED" | tr -d ' ')
+[ "$n" -eq 1 ] && "$STUB_ZERO" no-claim-mark   # only the FIRST launch marks the block, so the
+exit 0                                          # marker file is provably gone once the wait ends
+EOF
+chmod +x "$TP/bin/claude"
+( i=0; while ! grep -q 'now blocked' "$TP/p1.log" 2>/dev/null && [ "$i" -lt 175 ]; do sleep 0.2; i=$((i+1)); done
+  cd "$TP/repo"; sed -i'' -e 's/- \[ \]/- [x]/' todo.md; git add -A; git commit -qm 'flip P1' ) &
+FLIPPER=$!
+PATH="$TP/bin:$PATH" timeout 40 env CLAUDEZERO_MAX_LOOPS=2 CLAUDEZERO_DEPENDENCY_WAIT=5m bash "$SCRIPT" todo.md -t x > "$TP/p1.log" 2>&1
+echo "P1 exit             : $?  (want 0)"
+echo "P1 launches         : $(wc -l < "$STUB_LAUNCHED" | tr -d ' ')  (want 2 — one that marked the block, one after the flip broke it)"
+echo "P1 dependency line  : $(grep -c 'waiting for a claimable task (now blocked 1)' "$TP/p1.log")  (want >=1 — its own wording, not wait_for_claimable's)"
+echo "P1 no plain line    : $(grep -c '^❄ waiting for a claimable task · ' "$TP/p1.log")  (want 0 — P1 is never peer-held, so that wait never runs here)"
+echo "P1 marker gone      : $(ls "$TP/repo/.git"/no-claim-* 2>/dev/null | wc -l | tr -d ' ')  (want 0 — consumed once read)"
+wait "$FLIPPER" 2>/dev/null || true
+```
+- **P1 PASS** — `exit = 0`, `launches = 2`, `dependency line >= 1`, `no plain line = 0`, `marker gone = 0`.
+
+### P2 — a peer's marker going stale (its worktree dies) breaks the wait even though the blob is unchanged
+```bash
+cd "$TP/repo"
+printf -- '- [ ] P2 x\n- [ ] P2H y\n' >> todo.md; git add -A; git commit -qm 'add P2 tasks'
+sleep 600 & PEER2=$!
+git worktree add -q -b main-task-P2H "$TP/wt2h" main
+printf '%s\n%s\n%s\n%s\n' "$PEER2" "$(ps -o lstart= -p "$PEER2" | awk '{$1=$1;print}')" "$(date +%s)" "PEERINST" > "$TP/wt2h/.owner"
+mkdir -p "$TP/repo/.git/session"
+printf '%s\n%s\n' "$(ps -o lstart= -p "$PEER2" | awk '{$1=$1;print}')" "P2H" > "$TP/repo/.git/session/$PEER2"
+: > "$STUB_LAUNCHED"
+( i=0; while ! grep -q 'now blocked' "$TP/p2.log" 2>/dev/null && [ "$i" -lt 175 ]; do sleep 0.2; i=$((i+1)); done
+  kill "$PEER2" 2>/dev/null ) &
+KILLER=$!
+PATH="$TP/bin:$PATH" timeout 40 env CLAUDEZERO_MAX_LOOPS=2 CLAUDEZERO_DEPENDENCY_WAIT=5m bash "$SCRIPT" todo.md -t x > "$TP/p2.log" 2>&1
+echo "P2 exit             : $?  (want 0)"
+echo "P2 launches         : $(wc -l < "$STUB_LAUNCHED" | tr -d ' ')  (want 2 — the wait broke on the held-ids change, no todo edit at all)"
+wait "$KILLER" 2>/dev/null || true
+git worktree remove --force "$TP/wt2h" 2>/dev/null || true; git branch -qD main-task-P2H 2>/dev/null || true
+```
+- **P2 PASS** — `exit = 0`, `launches = 2`.
+
+### P3 — `CLAUDEZERO_DEPENDENCY_WAIT=0` relaunches immediately every cycle
+```bash
+cd "$TP/repo"
+printf -- '- [ ] P3 x\n' >> todo.md; git add -A; git commit -qm 'add P3'
+: > "$STUB_LAUNCHED"
+PATH="$TP/bin:$PATH" timeout 20 env CLAUDEZERO_MAX_LOOPS=2 CLAUDEZERO_DEPENDENCY_WAIT=0 bash "$SCRIPT" todo.md -t x > "$TP/p3.log" 2>&1
+echo "P3 exit             : $?  (want 0)"
+echo "P3 launches         : $(wc -l < "$STUB_LAUNCHED" | tr -d ' ')  (want 2 — 0 disables the wait outright)"
+echo "P3 no wait line     : $(grep -c 'now blocked' "$TP/p3.log")  (want 0)"
+```
+- **P3 PASS** — `exit = 0`, `launches = 2`, `no wait line = 0`.
+
+### P4 — an unchanged signature past the ceiling forces a relaunch anyway
+```bash
+cd "$TP/repo"
+printf -- '- [ ] P4 x\n' >> todo.md; git add -A; git commit -qm 'add P4'
+: > "$STUB_LAUNCHED"
+PATH="$TP/bin:$PATH" timeout 40 env CLAUDEZERO_MAX_LOOPS=2 CLAUDEZERO_DEPENDENCY_WAIT=6s bash "$SCRIPT" todo.md -t x > "$TP/p4.log" 2>&1
+echo "P4 exit             : $?  (want 0)"
+echo "P4 launches         : $(wc -l < "$STUB_LAUNCHED" | tr -d ' ')  (want 2 — nothing changed, so the ceiling itself ended the wait)"
+echo "P4 marker gone      : $(ls "$TP/repo/.git"/no-claim-* 2>/dev/null | wc -l | tr -d ' ')  (want 0)"
+```
+- **P4 PASS** — `exit = 0`, `launches = 2`, `marker gone = 0`.
+
+### P5 — absence check: no marker written, relaunch timing and output are unaffected
+```bash
+cd "$TP/repo"
+printf -- '- [ ] P5 x\n' >> todo.md; git add -A; git commit -qm 'add P5'
+cat > "$TP/bin/claude" <<'EOF'
+#!/usr/bin/env bash
+echo launched >> "$STUB_LAUNCHED"
+exit 0
+EOF
+chmod +x "$TP/bin/claude"
+: > "$STUB_LAUNCHED"
+PATH="$TP/bin:$PATH" timeout 20 env CLAUDEZERO_MAX_LOOPS=2 bash "$SCRIPT" todo.md -t x > "$TP/p5.log" 2>&1
+echo "P5 exit             : $?  (want 0)"
+echo "P5 launches         : $(wc -l < "$STUB_LAUNCHED" | tr -d ' ')  (want 2 — a claude that never marks a block is never made to wait)"
+echo "P5 no wait line     : $(grep -c 'now blocked' "$TP/p5.log")  (want 0 — no marker, no new poll)"
+```
+- **P5 PASS** — `exit = 0`, `launches = 2`, `no wait line = 0`.
+
+### P6 — `-h`/`--help` names the variable
+```bash
+H="$(bash "$SCRIPT" -h)"
+echo "P6 names the var    : $(printf '%s' "$H" | grep -c 'CLAUDEZERO_DEPENDENCY_WAIT=duration')  (want 1)"
+```
+- **P6 PASS** — `names the var = 1`.
+
+- **P PASS** — every line reports its `want` value. Together they cover the marker blocking a
+  relaunch until the blob changes and the wait's distinct line (P1), a peer's marker going stale
+  as an independent trigger (P2), the `0` off-switch (P3), the ceiling forcing a relaunch when
+  nothing changes (P4), the marker being consumed either way (P1/P4), the absence case costing no
+  new sleep or poll (P5), and `--help` documenting the variable (P6).
+
+---
+
+## Scenario Q — the context-rot guard   `[$TESTROOT/Q]`   (no claude)
+
+The Stop hook computes its own restart signal from `CONTEXT_THRESHOLDS` against a session
+transcript — no third-party hook, no state file. Every case here drives the hook directly with
+a static JSONL fixture, in `loop` mode, so the guard is the only branch that can fire (zero mode
+ends every turn regardless — that is M4's subject, not this one's).
+
+### Setup
+```bash
+TQ="$TESTROOT/Q"; mkdir -p "$TQ/repo"
+mkdir -p "$TQ/owner"; cp "$(command -v bash)" "$TQ/owner/claude"   # decoy ancestor, Section 0's `guard` technique
+cd "$TQ/repo"
+git init -q -b main; git config user.email t@t.t; git config user.name test
+printf -- '- [ ] Q1 x\n' > todo.md; git add -A; git commit -qm init
+CLAUDEZERO_TEST_EMIT=1 bash "$SCRIPT" todo.md -t x > /dev/null 2>&1   # writes the real emitted hook, no claude needed
+HOOK="$TQ/repo/.git/compact-exit-hook.sh"
+
+# fires the emitted hook with $2 as its stdin payload, against the given hook file, in loop mode.
+# Same shape as M4's own driver — read that comment first. `-c` body is two statements ending in
+# `sleep 3`: the real work (printf | bash, where term_owner runs) is never in tail position, so
+# this process's own comm can't get execve()-replaced out from under it before the kill lands.
+run_hook(){ local hook="$1" payload="$2"
+  CLAUDEZERO_MODE=loop env -u CLAUDE_PID "$TQ/owner/claude" \
+    -c 'printf "%s" "$2" | bash "$1" >/dev/null 2>&1; sleep 3' _ "$hook" "$payload"
+  echo $?
+}
+run_as_claude(){ run_hook "$HOOK" "$1"; }
+# same driver, stderr redirected to $3 instead of discarded — the empty-stderr assertion (Q10)
+# needs to observe it, which run_hook's own >/dev/null 2>&1 cannot.
+run_hook_stderr(){ local hook="$1" payload="$2" errfile="$3"
+  CLAUDEZERO_MODE=loop env -u CLAUDE_PID "$TQ/owner/claude" \
+    -c 'printf "%s" "$2" | bash "$1" >/dev/null 2>"$3"; sleep 3' _ "$hook" "$payload" "$errfile"
+  echo $?
+}
+path(){ printf '{"transcript_path":"%s"}' "$1"; }   # the Stop hook payload shape
+
+# one transcript line: requestId model input cache_read cache_creation output
+rec(){ printf '{"type":"assistant","requestId":"%s","message":{"model":"%s","usage":{"input_tokens":%s,"cache_read_input_tokens":%s,"cache_creation_input_tokens":%s,"output_tokens":%s}}}' "$1" "$2" "$3" "$4" "$5" "$6"; }
+```
+
+### Q1 — over/under the resolved threshold, `>=` not `>`
+```bash
+TP="$TQ/over.jsonl";  rec r1 claude-opus-5 9000 250000 1000 500 > "$TP"      # 260000
+echo "Q1 over    : $(run_as_claude "$(path "$TP")")  (want 143 — 260000 >= claude-opus-5's 200000)"
+TP="$TQ/under.jsonl"; rec r1 claude-opus-5 9000 100000 1000 500 > "$TP"      # 110000
+echo "Q1 under   : $(run_as_claude "$(path "$TP")")  (want 0 — 110000 < 200000)"
+TP="$TQ/exact.jsonl"; rec r1 claude-opus-5 9000 190000 1000 500 > "$TP"      # exactly 200000
+echo "Q1 exact   : $(run_as_claude "$(path "$TP")")  (want 143 — total == threshold restarts too)"
+```
+- **Q1 PASS** — `over = 143`, `under = 0`, `exact = 143`.
+
+### Q2 — latest record wins (both orders), `usage.iterations[]` is not double-counted
+```bash
+TP="$TQ/two-a.jsonl"; { rec r1 claude-opus-5 9000 250000 1000 500; echo; rec r2 claude-opus-5 9000 100000 1000 500; } > "$TP"
+echo "Q2 over-then-under : $(run_as_claude "$(path "$TP")")  (want 0 — the LAST record, 110000, wins)"
+TP="$TQ/two-b.jsonl"; { rec r1 claude-opus-5 9000 100000 1000 500; echo; rec r2 claude-opus-5 9000 250000 1000 500; } > "$TP"
+echo "Q2 under-then-over : $(run_as_claude "$(path "$TP")")  (want 143 — the LAST record, 260000, wins)"
+# parent total 110000 (want 0); nested iterations carry 900000s that would flip this to 143 if
+# num()'s first-match-per-line stopped matching the parent field instead.
+TP="$TQ/iter.jsonl"
+printf '{"type":"assistant","requestId":"r1","message":{"model":"claude-opus-5","usage":{"input_tokens":9000,"cache_read_input_tokens":100000,"cache_creation_input_tokens":1000,"output_tokens":500,"iterations":[{"input_tokens":900000,"cache_read_input_tokens":900000,"cache_creation_input_tokens":900000,"output_tokens":900000}]}}}\n' > "$TP"
+echo "Q2 iterations      : $(run_as_claude "$(path "$TP")")  (want 0 — parent total only, nested iterations ignored)"
+```
+- **Q2 PASS** — `over-then-under = 0`, `under-then-over = 143`, `iterations = 0`.
+
+### Q3 — each matching rule
+```bash
+# [1m] resolves 200000 through the table's FIRST row, whatever the family (here: none of the 4).
+TP="$TQ/marker.jsonl"; rec r1 "claude-opus-4-8[1m]" 9000 250000 1000 500 > "$TP"
+echo "Q3 marker           : $(run_as_claude "$(path "$TP")")  (want 143)"
+
+# bare family ids -> 200000
+for fam in claude-opus-5 claude-sonnet-5 claude-fable-5 claude-mythos-5; do
+  TP="$TQ/fam-$fam.jsonl"; rec r1 "$fam" 9000 250000 1000 500 > "$TP"
+  echo "Q3 bare $fam : $(run_as_claude "$(path "$TP")")  (want 143)"
+done
+
+# version/date suffix keeps the family row, prefixed too (unanchored pattern)
+for id in claude-fable-5-20260115-v1:0 us.anthropic.claude-fable-5-20260115-v1:0; do
+  TP="$TQ/ver-$(printf '%s' "$id" | tr -c 'A-Za-z0-9' -).jsonl"; rec r1 "$id" 9000 250000 1000 500 > "$TP"
+  echo "Q3 versioned $id : $(run_as_claude "$(path "$TP")")  (want 143)"
+done
+
+# a WORD suffix ("-mini") is a different tier, not the family row: falls to the 160000 default.
+# Pinned at a total BETWEEN 160000 and 200000 — a broken ENVIRON hand-off (-v instead) would
+# corrupt \[1m\] into the character class [1m], matching the bare "m" in "mini" and wrongly
+# resolving this to the marker's 200000, flipping this from 143 to 0.
+TP="$TQ/mini.jsonl"; rec r1 claude-fable-5-mini 9000 170000 1000 500 > "$TP"   # 180000
+echo "Q3 fable-5-mini     : $(run_as_claude "$(path "$TP")")  (want 143 — default 160000, not the marker's 200000)"
+TP="$TQ/haiku.jsonl"; rec r1 claude-haiku-4-5 9000 250000 1000 500 > "$TP"     # 260000
+echo "Q3 haiku-4-5        : $(run_as_claude "$(path "$TP")")  (want 143 — default, unlisted family)"
+
+# no Opus 4.x / Sonnet 4.x row: bare vs [1m]-marked differ, both at the SAME between-value total
+# so the two thresholds (160000 default vs 200000 marker) are distinguishable.
+TP="$TQ/opus48-bare.jsonl";   rec r1 claude-opus-4-8        9000 170000 1000 500 > "$TP"   # 180000
+echo "Q3 opus-4-8 bare    : $(run_as_claude "$(path "$TP")")  (want 143 — default 160000, no Opus 4.x row)"
+TP="$TQ/opus48-marked.jsonl"; rec r1 "claude-opus-4-8[1m]"   9000 170000 1000 500 > "$TP"   # 180000
+echo "Q3 opus-4-8 marked  : $(run_as_claude "$(path "$TP")")  (want 0 — 180000 < the marker's 200000)"
+```
+- **Q3 PASS** — every line above reports its `want` value.
+
+### Q4 — the table ships exactly five rows
+```bash
+N=$(sed -n "/^CONTEXT_THRESHOLDS='\$/,/^'\$/p" "$SCRIPT" | sed '1d;$d' | grep -c .)
+echo "Q4 row count : $N  (want 5 — marker + fable-5 + mythos-5 + opus-5 + sonnet-5)"
+```
+- **Q4 PASS** — `row count = 5`.
+
+### Q5 — row order decides between two rows that both match
+```bash
+# a genuinely overlapping second row: `claude-fable-5-2026` matches the versioned id used in
+# Q3, so ABOVE the family row it wins (160000), BELOW it the family row (200000) still wins
+# first — edited on a COPY of the emitted hook, never on claudezero.sh or via a runtime override.
+sed '/claude-fable-5(/i\
+  claude-fable-5-2026                                   160000' "$HOOK" > "$TQ/hook-above.sh"
+sed '/claude-fable-5(/a\
+  claude-fable-5-2026                                   160000' "$HOOK" > "$TQ/hook-below.sh"
+TP="$TQ/order.jsonl"; rec r1 claude-fable-5-20260115-v1:0 9000 170000 1000 500 > "$TP"   # 180000
+echo "Q5 row above    : $(run_hook "$TQ/hook-above.sh" "$(path "$TP")")  (want 143 — the inserted 160000 row wins)"
+echo "Q5 row below    : $(run_hook "$TQ/hook-below.sh" "$(path "$TP")")  (want 0 — the family row, 200000, is still first)"
+```
+- **Q5 PASS** — `row above = 143`, `row below = 0`.
+
+### Q6 — the marker row resolves THROUGH the table, not a hardcoded branch
+```bash
+# only the marker row's line (the one literal `\[1m\]`) has its 200000 rewritten to 300000 —
+# every other row also reads "200000" so the sed address must anchor on the marker text itself.
+sed '/\\\[1m\\\]/s/200000/300000/' "$HOOK" > "$TQ/hook-marker-edit.sh"
+TP="$TQ/marker-edit.jsonl"; rec r1 "claude-opus-4-8[1m]" 9000 250000 1000 500 > "$TP"   # 260000
+echo "Q6 unedited table : $(run_as_claude "$(path "$TP")")  (want 143 — unedited marker row is 200000)"
+echo "Q6 edited marker  : $(run_hook "$TQ/hook-marker-edit.sh" "$(path "$TP")")  (want 0 — edited marker row is 300000)"
+```
+- **Q6 PASS** — `unedited table = 143`, `edited marker = 0`.
+
+### Q7 — the 256 KiB cap: a record just under it resolves `model`, padded past it (by more than
+### `model`'s own offset) it does not, and the total is unaffected either way
+```bash
+mkpad(){ yes x | tr -d '\n' | head -c "$1"; }   # bash's ${var//pat/rep} is O(n^2) at this size
+rec_pad(){ printf '{"type":"assistant","requestId":"r1","message":{"model":"claude-opus-5","content":"%s","usage":{"input_tokens":9000,"cache_read_input_tokens":170000,"cache_creation_input_tokens":1000,"output_tokens":500}}}' "$1"; }   # 180000 total, between the two thresholds
+
+under_line="$(rec_pad "$(mkpad 100)")"
+model_offset=$(awk 'match($0,/"model":/){print RSTART-1; exit}' <<< "$under_line")
+TP="$TQ/cap-under.jsonl"; printf '%s' "$under_line" > "$TP"
+echo "Q7 under cap : $(run_as_claude "$(path "$TP")")  (want 0 — whole record read, resolves claude-opus-5's family row (200000), 180000 < 200000)"
+
+over_line="$(rec_pad "$(mkpad $((262144 + model_offset + 1000)))")"
+TP="$TQ/cap-over.jsonl"; printf '%s' "$over_line" > "$TP"
+echo "Q7 over cap  : $(run_as_claude "$(path "$TP")")  (want 143 — model cropped away by the tail -c cut, default 160000 applies, 180000 >= 160000)"
+```
+- **Q7 PASS** — `under cap = 0`, `over cap = 143`. The token report is unaffected by this cap —
+  `read_tokens_total`'s own body carries no `tail -c`:
+  ```bash
+  echo "Q7 token report uncapped : $(awk '/^read_tokens_total\(\)/{f=1} f{print} f&&/^}/{exit}' "$SCRIPT" | grep -c 'tail -c')  (want 0 — the cap belongs to the guard alone)"
+  ```
+
+### Q8 — degrade, never lie: every bad input leaves the session running
+```bash
+echo "Q8 missing file  : $(run_as_claude "$(path "$TQ/does-not-exist.jsonl")")  (want 0)"
+TP="$TQ/no-usage.jsonl"; printf '{"type":"assistant","requestId":"r1","message":{"model":"claude-opus-5"}}\n' > "$TP"
+echo "Q8 no usage      : $(run_as_claude "$(path "$TP")")  (want 0)"
+TP="$TQ/zero-usage.jsonl"; rec r1 claude-opus-5 0 0 0 0 > "$TP"
+echo "Q8 zero usage    : $(run_as_claude "$(path "$TP")")  (want 0)"
+echo "Q8 no path key   : $(run_as_claude '{}')  (want 0)"
+if [ "$(id -u)" != 0 ]; then      # chmod 000 does not deny root, so this leg is meaningless there
+  TP="$TQ/unreadable.jsonl"; rec r1 claude-opus-5 9000 250000 1000 500 > "$TP"; chmod 000 "$TP"
+  ERR="$TQ/unreadable.err"
+  echo "Q8 unreadable exit   : $(run_hook_stderr "$HOOK" "$(path "$TP")" "$ERR")  (want 0)"
+  echo "Q8 unreadable stderr : $(wc -c < "$ERR" | tr -d ' ')  (want 0 — tail's OWN 2>/dev/null swallows Permission denied)"
+  chmod 644 "$TP"
+else
+  echo "Q8 unreadable        : SKIPPED (running as root)"
+fi
+```
+- **Q8 PASS** — every `want 0` line reports it; `unreadable stderr = 0` (or the case is skipped as root).
+
+### Q9 — the emitted hook is byte-identical across two instances of the same `claudezero.sh`
+```bash
+cd "$TQ/repo"
+CLAUDEZERO_TEST_EMIT=1 bash "$SCRIPT" todo.md -t x > /dev/null 2>&1; cp "$HOOK" "$TQ/hook-1.sh"
+CLAUDEZERO_TEST_EMIT=1 bash "$SCRIPT" todo.md -t x > /dev/null 2>&1; cp "$HOOK" "$TQ/hook-2.sh"
+echo "Q9 byte-identical : $(cmp -s "$TQ/hook-1.sh" "$TQ/hook-2.sh" && echo yes || echo NO)  (want yes)"
+```
+- **Q9 PASS** — `byte-identical = yes`.
+
+- **Q PASS** — Q1 through Q9 all report PASS. Together with M4's `zero mode`/`loop mode` cases
+  (this scenario runs everything in loop mode, where the guard is the only kill path) they prove
+  the guard sits above `claudezero.sh`'s zero-mode turn-end branch and is reachable in loop mode.
 
 ---
 
