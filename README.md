@@ -22,6 +22,7 @@ Runs [`claude`](https://claude.com/product/claude-code) on a predefined prompt i
 - [Quickstart](#quickstart)
 - [Install](#install-for-the-claude-coding-agent)
 - [Todo file format](#todo-file-format)
+- [Context Rot](#context-rot)
 - [Loop engineering](#loop-engineering)
 - [Usage](#usage)
 - [Cleanup](#cleanup)
@@ -143,6 +144,22 @@ GitHub-style Markdown checkboxes, one task per line. Each line carries a **uniqu
 
 `[ ]` = still to do, `[x]` = done (skipped). Before zeroing, the LLM validates the whole file: a task missing an id, or a duplicate id, stops the loop with a report. Checkboxes inside fenced code blocks (```` ``` ````) are ignored.
 
+## Context rot
+
+The session Stop hook computes its own restart signal. Models whose plain id means a 1M window restart at **200.000** tokens; everything else restarts at **160.000**, 80% of an assumed 200k window. Matching is first-match-wins against the model id, falling to the 160.000 default when nothing matches.
+
+Why a threshold below the context window limit at all: **context rot**. A long session accumulates tool output, dead ends and superseded reasoning that stay in the window and compete for attention, so quality decays well before the window fills — ClaudeZero restarts earlier. Which is possible due to amnesia by design, durable external state carrying what mattered forward (see [Closing the loop](#closing-the-loop)). Restarting early is also the cheaper direction, since every turn re-sends the whole context; without a restart the re-orientation to another task costs tokens.
+
+The two numbers rest on different evidence:
+
+- **200.000 for a 1M window**, anchored on Opus 4.8, the only high-confidence figure. Its [system card §8.9](https://www-cdn.anthropic.com/0b4915911bb0d19eca5b5ee635c80fef830a37ea.pdf) reports GraphWalks BFS 85.9 @256k → 68.1 @1M and Parents 99.3 → 83.3, its harness compacts at 200k, and [CodeRabbit](https://www.coderabbit.ai/blog/opus-4-8-release) independently sees it "degrade visibly once context crosses 200k"
+  - Opus 4.6 and Sonnet 4.6 bracket the same knee on MRCR v2
+  - Opus 5 and Sonnet 5 publish no depth-resolved eval, yet still compact at 200k, so "holds throughout 1M" is a claim with nothing measuring it
+  - Fable 5 and Mythos 5 are absent from the evidence entirely — one measured curve, four families inheriting it
+- **160.000 for the 200k default** — 80% of the assumed window, and **inference, not measurement**: no 200k model publishes a long-context eval. Haiku 4.5's [system card](https://assets.anthropic.com/m/99128ddd009bdcb/original/Claude-Haiku-4-5-System-Card.pdf) only notes it "frequently encounter[s] physical context-window limits", putting its knee nearer 80–100k — so 160000 is the permissive end, and Haiku 4.5 the standing candidate for its own row.
+
+The model-threshold table is defined as `CONTEXT_THRESHOLDS` in the claudezero script.
+
 ## Loop engineering
 
 [Loop engineering](https://claude.com/blog/getting-started-with-loops) shapes an agent's iteration cycle so it gets *better* across turns, not just runs once. It is the outermost of three nested levels — each one only works because the one under it holds:
@@ -237,19 +254,6 @@ CLAUDEZERO_DEPENDENCY_WAIT=20m claudezero todo.md
 ```sh
 CLAUDEZERO_LINK=issues claudezero todo.md
 ```
-
-### Context rot
-
-The session Stop hook computes its own restart signal — no environment variable, no runtime override. The only place the thresholds live is the `CONTEXT_THRESHOLDS` table at the top of `claudezero.sh`; that table is authoritative, and this section does not reproduce its rows.
-
-Two values: models whose plain id means a 1M window restart at **200000** tokens; everything else restarts at **160000**, 80% of an assumed 200k window. Matching is first-match-wins against the newest usage record's model id, falling to the 160000 default when nothing matches.
-
-Why a threshold below the window limit at all: **context rot**. A long session accumulates tool output, dead ends and superseded reasoning that stay in the window and compete for attention, so quality decays well before the window fills — the hard wall is not what the restart avoids, auto-compact already handles that. ClaudeZero's answer is amnesia by design, durable external state carrying what mattered forward (see [Closing the loop](#closing-the-loop)). Restarting early is also the cheaper direction, since every turn re-sends the whole context; re-orientation cost is the counter-force that stops the numbers going lower.
-
-The two numbers rest on different evidence:
-
-- **200000 for a 1M window**, anchored on Opus 4.8, the only high-confidence figure. Its [system card §8.9](https://www-cdn.anthropic.com/0b4915911bb0d19eca5b5ee635c80fef830a37ea.pdf) reports GraphWalks BFS 85.9 @256k → 68.1 @1M and Parents 99.3 → 83.3, its harness compacts at 200k, and [CodeRabbit](https://www.coderabbit.ai/blog/opus-4-8-release) independently sees it "degrade visibly once context crosses 200k"; Opus 4.6 and Sonnet 4.6 bracket the same knee on MRCR v2. Opus 5 and Sonnet 5 publish no depth-resolved eval, yet still compact at 200k, so "holds throughout 1M" is a claim with nothing measuring it. Fable 5 and Mythos 5 are absent from the evidence entirely — one measured curve, four families inheriting it.
-- **160000 for the 200k default** — 80% of the assumed window, and **inference, not measurement**: no 200k model publishes a long-context eval. Haiku 4.5's [system card](https://assets.anthropic.com/m/99128ddd009bdcb/original/Claude-Haiku-4-5-System-Card.pdf) only notes it "frequently encounter[s] physical context-window limits", putting its knee nearer 80–100k — so 160000 is the permissive end, and Haiku 4.5 the standing candidate for its own row.
 
 ### Logging a run
 
