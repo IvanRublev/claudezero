@@ -4,6 +4,16 @@ All notable changes to ClaudeZero are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); this project uses
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+- The context-full restart signal is now computed in ClaudeZero's own Stop hook, from a
+  threshold table (`CONTEXT_THRESHOLDS`) at the top of `claudezero.sh`, instead of depending on
+  a third-party `suggest-compact` hook — one prerequisite instead of two. Existing installs need
+  no action: a still-installed `suggest-compact` hook keeps writing a file nothing reads, so it
+  is inert, not conflicting, and removing it is optional (ISSUE-035).
+
 ## [0.0.16] — 2026-08-03
 
 ### Added

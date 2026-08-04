@@ -58,6 +58,12 @@ the project's own working tree or history, and can run concurrently.
   waits on the deterministic signature instead of relaunching blindly, breaks the instant a
   box flips or a peer's marker goes stale, `0` disables the wait, and an unchanged signature
   past the ceiling forces a relaunch anyway.
+- **Q — the context-rot guard.** No claude. The Stop hook's own threshold table resolves a
+  restart signal from a fixture transcript: `[1m]` and each bare family id at 200000, a
+  word-suffix tier and unlisted ids at the 160000 default, `>=` at the exact threshold, row
+  order deciding overlapping rows, the marker row's backslash escapes surviving the `ENVIRON[]`
+  hand-off, the 256 KiB read cap degrading to a row miss past it, and every degraded input
+  (missing/unreadable/usage-free transcript) leaving the session running.
 
 Parallelism (A, C) is enforced with a **file-lock barrier**, not `sleep`, so the
 proof is independent of claude startup/shutdown times.
@@ -80,13 +86,12 @@ it did, refusing instead of silently proceeding on a miss.
 can run it autonomously and report the results.
 
 **Prerequisites:** `flock`, `uuidgen`, `timeout`, `git`, `date`, `find`, `stat`, `mv`
-on PATH. A and C need real `claude` on PATH and the `suggest-compact` hook installed in
-`~/.claude/settings.json` (claudezero.sh refuses to start without it — if A/C logs show
-an immediate hook error, report "prerequisite missing — suggest-compact hook"). B, E, F and
-G do **not** need real claude but still need `flock` and the `suggest-compact` hook (both
-startup guards run before any claude launch; E/F/G supply a stub `claude` so claudezero
-writes `zero.sh` and loops out at once). A missing hook makes them exit with the wrong
-message and their assertions fail.
+on PATH — `flock` is the one remaining external prerequisite claudezero.sh's own startup guard
+checks. A and C need real `claude` on PATH. B, E, F and G do **not** invoke claude but still
+need it present on PATH: `run_doctor` tests `command -v claude` before any startup guard runs,
+so a missing `claude` fails them at the wrong step (E/F/G additionally supply a stub `claude`
+so claudezero writes `zero.sh` and loops out at once; B needs none beyond the PATH check since
+every case there refuses before a launch).
 
 Inform about progress during the test; at the end return a summary report
 of passes, fails, and causes.
@@ -410,14 +415,48 @@ git -C "$TB/worktree" branch --list '*-task-*-task-*' | grep -q . && echo "B4 FA
 cd "$TB/untracked"                             # clean repo, but the todo is not in the base tree
 if out=$(timeout 20 bash "$SCRIPT" todo.md -t x 2>&1); then rc=0; else rc=$?; fi
 { [ "$rc" != 0 ] && echo "$out" | grep -qi 'not tracked'; } && echo "B5 untracked-guard PASS" || echo "B5 FAIL (rc=$rc): $out"
+
+# run_doctor coverage: no ~/.claude/settings.json is a prerequisite anymore, and --doctor is
+# the same code path a normal startup runs first. `mkbin DIR tool…` symlinks only the named
+# tools into an otherwise-empty dir, so PATH=DIR alone proves a tool's true absence — --doctor
+# exits before main() reaches any of git/sed/awk/uuidgen/etc, so `basename`, `mktemp` and
+# (conditionally) `claude`/`flock` are the whole surface it needs.
+mkbin(){ local d="$1"; shift; mkdir -p "$d"; local t p; for t in "$@"; do p=$(command -v "$t" 2>/dev/null) || continue; ln -sf "$p" "$d/$t"; done; }
+BASH_BIN="$(command -v bash)"   # PATH=bin-no* below excludes bash itself; invoke it by absolute path
+mkdir -p "$TB/emptyhome"    # HOME with no ~/.claude directory at all
+
+if out=$(HOME="$TB/emptyhome" bash "$SCRIPT" --doctor 2>&1); then rc=0; else rc=$?; fi
+{ [ "$rc" = 0 ] && echo "$out" | grep -qi 'all prerequisites OK'; } && echo "B6 doctor-no-settings PASS" || echo "B6 FAIL (rc=$rc): $out"
+
+cd "$TB/dirty"                                 # same dirty tree as B1, now under the empty HOME
+if out=$(HOME="$TB/emptyhome" timeout 20 bash "$SCRIPT" todo.md -t x 2>&1); then rc=0; else rc=$?; fi
+{ [ "$rc" != 0 ] && echo "$out" | grep -qi dirty; } && echo "B7 startup-no-settings PASS" || echo "B7 FAIL (rc=$rc): $out"
+
+mkbin "$TB/bin-noclaude" basename mktemp flock
+if out=$(HOME="$TB/emptyhome" PATH="$TB/bin-noclaude" "$BASH_BIN" "$SCRIPT" --doctor 2>&1); then rc=0; else rc=$?; fi
+{ [ "$rc" != 0 ] && echo "$out" | grep -qi 'claude CLI not found'; } && echo "B8 doctor-no-claude PASS" || echo "B8 FAIL (rc=$rc): $out"
+
+mkbin "$TB/bin-noflock" basename mktemp claude
+if out=$(HOME="$TB/emptyhome" PATH="$TB/bin-noflock" "$BASH_BIN" "$SCRIPT" --doctor 2>&1); then rc=0; else rc=$?; fi
+{ [ "$rc" != 0 ] && echo "$out" | grep -qi 'flock not found'; } && echo "B9 doctor-no-flock PASS" || echo "B9 FAIL (rc=$rc): $out"
+
+mkbin "$TB/bin-badflock" basename mktemp claude
+printf '#!/usr/bin/env bash\nexit 1\n' > "$TB/bin-badflock/flock"; chmod +x "$TB/bin-badflock/flock"
+if out=$(HOME="$TB/emptyhome" PATH="$TB/bin-badflock" "$BASH_BIN" "$SCRIPT" --doctor 2>&1); then rc=0; else rc=$?; fi
+{ [ "$rc" != 0 ] && echo "$out" | grep -qi 'flock present but not runnable'; } && echo "B10 doctor-flock-broken PASS" || echo "B10 FAIL (rc=$rc): $out"
 ```
-- **B PASS** — B1, B2, B3, B4, and B5 all report PASS (non-zero exit + the expected message,
-  before any claude launch), and no `*-task-*-task-*` branch exists. B3 proves the
-  worktree-path assumption is enforced: a subdir launch refuses rather than misfiring
-  `../ts-*` paths. B4 proves the same for a launch *inside* a leftover claim worktree, where
-  the base branch would otherwise be poisoned to a peer's claim and both instances would take
-  the same todo (BUG-014). B5 proves a todo the base branch does not track refuses up front
-  instead of letting every merge be refused for checking zero boxes (BUG-026).
+- **B PASS** — B1 through B10 all report PASS (non-zero exit + the expected message, before
+  any claude launch — B6/B7 exit 0/nonzero respectively), and no `*-task-*-task-*` branch
+  exists. B3 proves the worktree-path assumption is enforced: a subdir launch refuses rather
+  than misfiring `../ts-*` paths. B4 proves the same for a launch *inside* a leftover claim
+  worktree, where the base branch would otherwise be poisoned to a peer's claim and both
+  instances would take the same todo (BUG-014). B5 proves a todo the base branch does not
+  track refuses up front instead of letting every merge be refused for checking zero boxes
+  (BUG-026). B6 proves `--doctor` no longer needs `~/.claude/settings.json`; B7 proves a
+  normal startup from the same `HOME` gets past that same prerequisite check and refuses on
+  the dirty-tree guard instead, so both paths run the same `run_doctor` code. B8, B9 and B10
+  prove `--doctor` still refuses, with its existing message, when `claude` is absent, when
+  `flock` is absent, and when `flock` is present but not runnable.
 
 ---
 
@@ -1233,7 +1272,7 @@ The claimable probe moved out of claude and into the shell: nothing left → the
 everything unchecked held by a *live* peer → wait, launching no claude at all; anything free
 (including a crashed peer's branch, which only claude can rescue) → launch. The Stop hook is
 the other half — in zero mode it ends the session at every turn end, so one session zeroes one
-task; in `-l` loop mode only the context-bucket file still ends it.
+task; in `-l` loop mode only the context-rot guard still ends it.
 
 ### Setup
 ```bash
@@ -1318,9 +1357,12 @@ HOOK="$TM/repo/.git/compact-exit-hook.sh"
 run_as_claude(){ CLAUDEZERO_MODE="$1" env -u CLAUDE_PID "$TM/owner/claude" -c 'printf "%s" "$2" | bash "$1" >/dev/null 2>&1; sleep 3' _ "$HOOK" "$2"; echo $?; }
 echo "M4 zero mode     : $(run_as_claude zero '{}')  (want 143 — ordinary turn end SIGTERMs the owning claude)"
 echo "M4 loop mode     : $(run_as_claude loop '{}')  (want 0 — -l has no task boundary, so it is left running)"
-B="${TMPDIR:-/tmp}"; B="${B%/}/claude-context-bucket-czM4"; : > "$B"
-echo "M4 bucket branch : $(run_as_claude loop '{"session_id":"czM4"}')  (want 143 — the context-rot guard is unchanged and still first)"
-rm -f "$B"
+# a transcript whose newest usage record is at/over claude-opus-5's 200000 threshold
+# (9000 + 250000 + 1000 = 260000) — the context-rot guard's own fixture, see Scenario Q.
+TP="$TM/ctx-over.jsonl"
+printf '%s\n' '{"type":"assistant","requestId":"r1","message":{"model":"claude-opus-5","usage":{"input_tokens":9000,"cache_read_input_tokens":250000,"cache_creation_input_tokens":1000,"output_tokens":500}}}' > "$TP"
+echo "M4 bucket branch : $(run_as_claude loop "$(printf '{"transcript_path":"%s"}' "$TP")")  (want 143 — the context-rot guard is unchanged and still first)"
+rm -f "$TP"
 ```
 - **M4 PASS** — `zero mode = 143`, `loop mode = 0`, `bucket branch = 143`.
 
@@ -1667,6 +1709,196 @@ echo "P6 names the var    : $(printf '%s' "$H" | grep -c 'CLAUDEZERO_DEPENDENCY_
   as an independent trigger (P2), the `0` off-switch (P3), the ceiling forcing a relaunch when
   nothing changes (P4), the marker being consumed either way (P1/P4), the absence case costing no
   new sleep or poll (P5), and `--help` documenting the variable (P6).
+
+---
+
+## Scenario Q — the context-rot guard   `[$TESTROOT/Q]`   (no claude)
+
+The Stop hook computes its own restart signal from `CONTEXT_THRESHOLDS` against a session
+transcript — no third-party hook, no state file. Every case here drives the hook directly with
+a static JSONL fixture, in `loop` mode, so the guard is the only branch that can fire (zero mode
+ends every turn regardless — that is M4's subject, not this one's).
+
+### Setup
+```bash
+TQ="$TESTROOT/Q"; mkdir -p "$TQ/repo"
+mkdir -p "$TQ/owner"; cp "$(command -v bash)" "$TQ/owner/claude"   # decoy ancestor, Section 0's `guard` technique
+cd "$TQ/repo"
+git init -q -b main; git config user.email t@t.t; git config user.name test
+printf -- '- [ ] Q1 x\n' > todo.md; git add -A; git commit -qm init
+CLAUDEZERO_TEST_EMIT=1 bash "$SCRIPT" todo.md -t x > /dev/null 2>&1   # writes the real emitted hook, no claude needed
+HOOK="$TQ/repo/.git/compact-exit-hook.sh"
+
+# fires the emitted hook with $2 as its stdin payload, against the given hook file, in loop mode.
+# Same shape as M4's own driver — read that comment first. `-c` body is two statements ending in
+# `sleep 3`: the real work (printf | bash, where term_owner runs) is never in tail position, so
+# this process's own comm can't get execve()-replaced out from under it before the kill lands.
+run_hook(){ local hook="$1" payload="$2"
+  CLAUDEZERO_MODE=loop env -u CLAUDE_PID "$TQ/owner/claude" \
+    -c 'printf "%s" "$2" | bash "$1" >/dev/null 2>&1; sleep 3' _ "$hook" "$payload"
+  echo $?
+}
+run_as_claude(){ run_hook "$HOOK" "$1"; }
+# same driver, stderr redirected to $3 instead of discarded — the empty-stderr assertion (Q10)
+# needs to observe it, which run_hook's own >/dev/null 2>&1 cannot.
+run_hook_stderr(){ local hook="$1" payload="$2" errfile="$3"
+  CLAUDEZERO_MODE=loop env -u CLAUDE_PID "$TQ/owner/claude" \
+    -c 'printf "%s" "$2" | bash "$1" >/dev/null 2>"$3"; sleep 3' _ "$hook" "$payload" "$errfile"
+  echo $?
+}
+path(){ printf '{"transcript_path":"%s"}' "$1"; }   # the Stop hook payload shape
+
+# one transcript line: requestId model input cache_read cache_creation output
+rec(){ printf '{"type":"assistant","requestId":"%s","message":{"model":"%s","usage":{"input_tokens":%s,"cache_read_input_tokens":%s,"cache_creation_input_tokens":%s,"output_tokens":%s}}}' "$1" "$2" "$3" "$4" "$5" "$6"; }
+```
+
+### Q1 — over/under the resolved threshold, `>=` not `>`
+```bash
+TP="$TQ/over.jsonl";  rec r1 claude-opus-5 9000 250000 1000 500 > "$TP"      # 260000
+echo "Q1 over    : $(run_as_claude "$(path "$TP")")  (want 143 — 260000 >= claude-opus-5's 200000)"
+TP="$TQ/under.jsonl"; rec r1 claude-opus-5 9000 100000 1000 500 > "$TP"      # 110000
+echo "Q1 under   : $(run_as_claude "$(path "$TP")")  (want 0 — 110000 < 200000)"
+TP="$TQ/exact.jsonl"; rec r1 claude-opus-5 9000 190000 1000 500 > "$TP"      # exactly 200000
+echo "Q1 exact   : $(run_as_claude "$(path "$TP")")  (want 143 — total == threshold restarts too)"
+```
+- **Q1 PASS** — `over = 143`, `under = 0`, `exact = 143`.
+
+### Q2 — latest record wins (both orders), `usage.iterations[]` is not double-counted
+```bash
+TP="$TQ/two-a.jsonl"; { rec r1 claude-opus-5 9000 250000 1000 500; echo; rec r2 claude-opus-5 9000 100000 1000 500; } > "$TP"
+echo "Q2 over-then-under : $(run_as_claude "$(path "$TP")")  (want 0 — the LAST record, 110000, wins)"
+TP="$TQ/two-b.jsonl"; { rec r1 claude-opus-5 9000 100000 1000 500; echo; rec r2 claude-opus-5 9000 250000 1000 500; } > "$TP"
+echo "Q2 under-then-over : $(run_as_claude "$(path "$TP")")  (want 143 — the LAST record, 260000, wins)"
+# parent total 110000 (want 0); nested iterations carry 900000s that would flip this to 143 if
+# num()'s first-match-per-line stopped matching the parent field instead.
+TP="$TQ/iter.jsonl"
+printf '{"type":"assistant","requestId":"r1","message":{"model":"claude-opus-5","usage":{"input_tokens":9000,"cache_read_input_tokens":100000,"cache_creation_input_tokens":1000,"output_tokens":500,"iterations":[{"input_tokens":900000,"cache_read_input_tokens":900000,"cache_creation_input_tokens":900000,"output_tokens":900000}]}}}\n' > "$TP"
+echo "Q2 iterations      : $(run_as_claude "$(path "$TP")")  (want 0 — parent total only, nested iterations ignored)"
+```
+- **Q2 PASS** — `over-then-under = 0`, `under-then-over = 143`, `iterations = 0`.
+
+### Q3 — each matching rule
+```bash
+# [1m] resolves 200000 through the table's FIRST row, whatever the family (here: none of the 4).
+TP="$TQ/marker.jsonl"; rec r1 "claude-opus-4-8[1m]" 9000 250000 1000 500 > "$TP"
+echo "Q3 marker           : $(run_as_claude "$(path "$TP")")  (want 143)"
+
+# bare family ids -> 200000
+for fam in claude-opus-5 claude-sonnet-5 claude-fable-5 claude-mythos-5; do
+  TP="$TQ/fam-$fam.jsonl"; rec r1 "$fam" 9000 250000 1000 500 > "$TP"
+  echo "Q3 bare $fam : $(run_as_claude "$(path "$TP")")  (want 143)"
+done
+
+# version/date suffix keeps the family row, prefixed too (unanchored pattern)
+for id in claude-fable-5-20260115-v1:0 us.anthropic.claude-fable-5-20260115-v1:0; do
+  TP="$TQ/ver-$(printf '%s' "$id" | tr -c 'A-Za-z0-9' -).jsonl"; rec r1 "$id" 9000 250000 1000 500 > "$TP"
+  echo "Q3 versioned $id : $(run_as_claude "$(path "$TP")")  (want 143)"
+done
+
+# a WORD suffix ("-mini") is a different tier, not the family row: falls to the 160000 default.
+# Pinned at a total BETWEEN 160000 and 200000 — a broken ENVIRON hand-off (-v instead) would
+# corrupt \[1m\] into the character class [1m], matching the bare "m" in "mini" and wrongly
+# resolving this to the marker's 200000, flipping this from 143 to 0.
+TP="$TQ/mini.jsonl"; rec r1 claude-fable-5-mini 9000 170000 1000 500 > "$TP"   # 180000
+echo "Q3 fable-5-mini     : $(run_as_claude "$(path "$TP")")  (want 143 — default 160000, not the marker's 200000)"
+TP="$TQ/haiku.jsonl"; rec r1 claude-haiku-4-5 9000 250000 1000 500 > "$TP"     # 260000
+echo "Q3 haiku-4-5        : $(run_as_claude "$(path "$TP")")  (want 143 — default, unlisted family)"
+
+# no Opus 4.x / Sonnet 4.x row: bare vs [1m]-marked differ, both at the SAME between-value total
+# so the two thresholds (160000 default vs 200000 marker) are distinguishable.
+TP="$TQ/opus48-bare.jsonl";   rec r1 claude-opus-4-8        9000 170000 1000 500 > "$TP"   # 180000
+echo "Q3 opus-4-8 bare    : $(run_as_claude "$(path "$TP")")  (want 143 — default 160000, no Opus 4.x row)"
+TP="$TQ/opus48-marked.jsonl"; rec r1 "claude-opus-4-8[1m]"   9000 170000 1000 500 > "$TP"   # 180000
+echo "Q3 opus-4-8 marked  : $(run_as_claude "$(path "$TP")")  (want 0 — 180000 < the marker's 200000)"
+```
+- **Q3 PASS** — every line above reports its `want` value.
+
+### Q4 — the table ships exactly five rows
+```bash
+N=$(sed -n "/^CONTEXT_THRESHOLDS='\$/,/^'\$/p" "$SCRIPT" | sed '1d;$d' | grep -c .)
+echo "Q4 row count : $N  (want 5 — marker + fable-5 + mythos-5 + opus-5 + sonnet-5)"
+```
+- **Q4 PASS** — `row count = 5`.
+
+### Q5 — row order decides between two rows that both match
+```bash
+# a genuinely overlapping second row: `claude-fable-5-2026` matches the versioned id used in
+# Q3, so ABOVE the family row it wins (160000), BELOW it the family row (200000) still wins
+# first — edited on a COPY of the emitted hook, never on claudezero.sh or via a runtime override.
+sed '/claude-fable-5(/i\
+  claude-fable-5-2026                                   160000' "$HOOK" > "$TQ/hook-above.sh"
+sed '/claude-fable-5(/a\
+  claude-fable-5-2026                                   160000' "$HOOK" > "$TQ/hook-below.sh"
+TP="$TQ/order.jsonl"; rec r1 claude-fable-5-20260115-v1:0 9000 170000 1000 500 > "$TP"   # 180000
+echo "Q5 row above    : $(run_hook "$TQ/hook-above.sh" "$(path "$TP")")  (want 143 — the inserted 160000 row wins)"
+echo "Q5 row below    : $(run_hook "$TQ/hook-below.sh" "$(path "$TP")")  (want 0 — the family row, 200000, is still first)"
+```
+- **Q5 PASS** — `row above = 143`, `row below = 0`.
+
+### Q6 — the marker row resolves THROUGH the table, not a hardcoded branch
+```bash
+# only the marker row's line (the one literal `\[1m\]`) has its 200000 rewritten to 300000 —
+# every other row also reads "200000" so the sed address must anchor on the marker text itself.
+sed '/\\\[1m\\\]/s/200000/300000/' "$HOOK" > "$TQ/hook-marker-edit.sh"
+TP="$TQ/marker-edit.jsonl"; rec r1 "claude-opus-4-8[1m]" 9000 250000 1000 500 > "$TP"   # 260000
+echo "Q6 unedited table : $(run_as_claude "$(path "$TP")")  (want 143 — unedited marker row is 200000)"
+echo "Q6 edited marker  : $(run_hook "$TQ/hook-marker-edit.sh" "$(path "$TP")")  (want 0 — edited marker row is 300000)"
+```
+- **Q6 PASS** — `unedited table = 143`, `edited marker = 0`.
+
+### Q7 — the 256 KiB cap: a record just under it resolves `model`, padded past it (by more than
+### `model`'s own offset) it does not, and the total is unaffected either way
+```bash
+mkpad(){ yes x | tr -d '\n' | head -c "$1"; }   # bash's ${var//pat/rep} is O(n^2) at this size
+rec_pad(){ printf '{"type":"assistant","requestId":"r1","message":{"model":"claude-opus-5","content":"%s","usage":{"input_tokens":9000,"cache_read_input_tokens":170000,"cache_creation_input_tokens":1000,"output_tokens":500}}}' "$1"; }   # 180000 total, between the two thresholds
+
+under_line="$(rec_pad "$(mkpad 100)")"
+model_offset=$(awk 'match($0,/"model":/){print RSTART-1; exit}' <<< "$under_line")
+TP="$TQ/cap-under.jsonl"; printf '%s' "$under_line" > "$TP"
+echo "Q7 under cap : $(run_as_claude "$(path "$TP")")  (want 0 — whole record read, resolves claude-opus-5's family row (200000), 180000 < 200000)"
+
+over_line="$(rec_pad "$(mkpad $((262144 + model_offset + 1000)))")"
+TP="$TQ/cap-over.jsonl"; printf '%s' "$over_line" > "$TP"
+echo "Q7 over cap  : $(run_as_claude "$(path "$TP")")  (want 143 — model cropped away by the tail -c cut, default 160000 applies, 180000 >= 160000)"
+```
+- **Q7 PASS** — `under cap = 0`, `over cap = 143`. The token report is unaffected by this cap —
+  `read_tokens_total`'s own body carries no `tail -c`:
+  ```bash
+  echo "Q7 token report uncapped : $(awk '/^read_tokens_total\(\)/{f=1} f{print} f&&/^}/{exit}' "$SCRIPT" | grep -c 'tail -c')  (want 0 — the cap belongs to the guard alone)"
+  ```
+
+### Q8 — degrade, never lie: every bad input leaves the session running
+```bash
+echo "Q8 missing file  : $(run_as_claude "$(path "$TQ/does-not-exist.jsonl")")  (want 0)"
+TP="$TQ/no-usage.jsonl"; printf '{"type":"assistant","requestId":"r1","message":{"model":"claude-opus-5"}}\n' > "$TP"
+echo "Q8 no usage      : $(run_as_claude "$(path "$TP")")  (want 0)"
+TP="$TQ/zero-usage.jsonl"; rec r1 claude-opus-5 0 0 0 0 > "$TP"
+echo "Q8 zero usage    : $(run_as_claude "$(path "$TP")")  (want 0)"
+echo "Q8 no path key   : $(run_as_claude '{}')  (want 0)"
+if [ "$(id -u)" != 0 ]; then      # chmod 000 does not deny root, so this leg is meaningless there
+  TP="$TQ/unreadable.jsonl"; rec r1 claude-opus-5 9000 250000 1000 500 > "$TP"; chmod 000 "$TP"
+  ERR="$TQ/unreadable.err"
+  echo "Q8 unreadable exit   : $(run_hook_stderr "$HOOK" "$(path "$TP")" "$ERR")  (want 0)"
+  echo "Q8 unreadable stderr : $(wc -c < "$ERR" | tr -d ' ')  (want 0 — tail's OWN 2>/dev/null swallows Permission denied)"
+  chmod 644 "$TP"
+else
+  echo "Q8 unreadable        : SKIPPED (running as root)"
+fi
+```
+- **Q8 PASS** — every `want 0` line reports it; `unreadable stderr = 0` (or the case is skipped as root).
+
+### Q9 — the emitted hook is byte-identical across two instances of the same `claudezero.sh`
+```bash
+cd "$TQ/repo"
+CLAUDEZERO_TEST_EMIT=1 bash "$SCRIPT" todo.md -t x > /dev/null 2>&1; cp "$HOOK" "$TQ/hook-1.sh"
+CLAUDEZERO_TEST_EMIT=1 bash "$SCRIPT" todo.md -t x > /dev/null 2>&1; cp "$HOOK" "$TQ/hook-2.sh"
+echo "Q9 byte-identical : $(cmp -s "$TQ/hook-1.sh" "$TQ/hook-2.sh" && echo yes || echo NO)  (want yes)"
+```
+- **Q9 PASS** — `byte-identical = yes`.
+
+- **Q PASS** — Q1 through Q9 all report PASS. Together with M4's `zero mode`/`loop mode` cases
+  (this scenario runs everything in loop mode, where the guard is the only kill path) they prove
+  the guard sits above `claudezero.sh`'s zero-mode turn-end branch and is reachable in loop mode.
 
 ---
 

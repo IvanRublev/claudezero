@@ -21,4 +21,4 @@
 - [x] ISSUE-032 Kill a hung claude with a `CLAUDEZERO_WATCHDOG` timer (default 15m) and name the watchdog on its own console line
 - [x] ISSUE-033 Symlink gitignored spec directories into every task worktree with `CLAUDEZERO_LINK` so a session reads the acceptance criteria its todo line points at
 - [x] ISSUE-034 Stop relaunching claude once every unchecked task is dependency-blocked, and resume the moment that changes
-- [ ] ISSUE-035 Compute the context-full restart signal in ClaudeZero's own Stop hook so no third-party hook is a prerequisite
+- [x] ISSUE-035 Compute the context-full restart signal in ClaudeZero's own Stop hook so no third-party hook is a prerequisite

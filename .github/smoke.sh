@@ -117,4 +117,63 @@ ln -s "$tmp/nowhere" "$tmp/dangling"            || fail "ln -s to a missing targ
 if [ -e "$tmp/dangling" ]; then fail "-e followed a dangling link (guard would misfire)"; fi
 ok "ln -s / -L / -e guard"
 
+# 10. context-rot guard's field extraction / threshold resolution (claudezero.sh's Stop hook).
+# `grep -noE` feeds short per-field `LINE:"key":value` lines into the table-matcher awk — never
+# the raw record — so this exercises: ENVIRON[] escapes surviving intact (a `-v` hand-off would
+# expand `\[1m\]` into the character class `[1m]`, matching bare "1"/"m"); dynamic regex matching
+# a version-suffixed family id while a word-suffix tier ("-mini") falls through to the default
+# (split(s,a," ") whitespace-run parsing, blank table lines dropped, exercised via CZ_TABLE's own
+# leading/trailing blank lines below); and match-based field extraction surviving a `tail -c` cut
+# that lands mid-JSON, dropping `model` while the `usage` object (which trails it) survives.
+CZT='
+  \[1m\]                                                200000
+  claude-fable-5(-[0-9]|[^A-Za-z0-9-])                  200000
+'
+guard_verdict() {   # $1 = raw bytes: a JSONL record, or a `tail -c`-cropped fragment of one
+  printf '%s' "$1" \
+    | grep -noE '"model":"[^"]*"|"input_tokens":[0-9]+|"cache_read_input_tokens":[0-9]+|"cache_creation_input_tokens":[0-9]+|"output_tokens":[0-9]+' \
+    | CZ_TABLE="$CZT" CZ_DEFAULT=160000 awk '
+      BEGIN {
+        def = ENVIRON["CZ_DEFAULT"] + 0
+        n = split(ENVIRON["CZ_TABLE"], tln, "\n")
+        for (i = 1; i <= n; i++) {
+          if (split(tln[i], f, " ") < 2) continue
+          tn++; pat[tn] = f[1]; thr[tn] = f[2] + 0
+        }
+      }
+      {
+        if (!match($0, /^[0-9]+:/)) next
+        L = substr($0, 1, RLENGTH - 1); rest = substr($0, RLENGTH + 1)
+        if (!match(rest, /^"[a-zA-Z_]+":/)) next
+        key = substr(rest, 2, RLENGTH - 3); val = substr(rest, RLENGTH + 1)
+        if ((L, key) in seen) next
+        seen[L, key] = 1
+        if (key == "model") { sub(/^"/, "", val); sub(/"$/, "", val); mdl[L] = val; next }
+        if (key == "output_tokens") { saw_out[L] = 1; next }
+        tot[L] += val + 0
+      }
+      END {
+        best = ""
+        for (L in saw_out) { if ((tot[L]+0) > 0 && (best == "" || (L+0) > (best+0))) best = L }
+        if (best == "") { print 0; exit }
+        id = mdl[best] " "
+        th = def
+        for (i = 1; i <= tn; i++) { if (id ~ pat[i]) { th = thr[i]; break } }
+        print (((tot[best]+0) >= th) ? 1 : 0)
+      }'
+}
+
+REC_MINI='{"model":"claude-fable-5-mini","input_tokens":9000,"cache_read_input_tokens":170000,"cache_creation_input_tokens":1000,"output_tokens":500}'
+[ "$(guard_verdict "$REC_MINI")" = 1 ] || fail "claude-fable-5-mini at 180000: default (160000) should fire; a -v hand-off would corrupt \\[1m\\] into a class matching mini's 'm' and wrongly give 0"
+
+REC_VER='{"model":"claude-fable-5-20260115-v1:0","input_tokens":9000,"cache_read_input_tokens":170000,"cache_creation_input_tokens":1000,"output_tokens":500}'
+[ "$(guard_verdict "$REC_VER")" = 0 ] || fail "claude-fable-5-20260115-v1:0 at 180000 should keep the family row (200000), not the default"
+
+REC_FULL='{"model":"claude-fable-5","content":"PADDING","input_tokens":9000,"cache_read_input_tokens":170000,"cache_creation_input_tokens":1000,"output_tokens":500}'
+[ "$(guard_verdict "$REC_FULL")" = 0 ] || fail "uncropped record should resolve its family row"
+cropped="$(printf '%s' "$REC_FULL" | tail -c 110)"
+[ "$(guard_verdict "$cropped")" = 1 ] || fail "a tail -c cut mid-JSON that drops 'model' should degrade to the default, not stay unmatched"
+
+ok "context-rot guard: grep -n -o extraction, ENVIRON[] escapes, dynamic regex, tail -c mid-JSON cut"
+
 echo "SMOKE PASS ($(uname -s), bash $BASH_VERSION)"
