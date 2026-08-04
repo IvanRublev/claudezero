@@ -558,7 +558,7 @@ WT=$(cat "$H/wt.path")
 ### Run — real claude only for the merge + self-heal
 ```bash
 cd "$H/repo"
-PROMPT="Run \`.git/zero.sh merge T1 \"$WT\"\`. If it refuses (nonzero exit, output starting \`checkbox-merge: refused\`), it lists the offending checked lines as file:line — uncheck every line that is not T1's directly in $WT/todo.md, run \`git -C \"$WT\" commit --amend --no-edit\`, then retry \`.git/zero.sh merge T1 \"$WT\"\` exactly once more. In your final reply, state the exit code of your LAST merge attempt and paste the merge command's own output verbatim."
+PROMPT="Run \`.git/zero.sh merge T1 \"$WT\"\`. If it refuses (nonzero exit, output starting \`checkbox-merge: refused\`), it lists the offending checked lines as file:line — uncheck every line that is not T1's directly in $WT/todo.md, run \`git -C \"$WT\" commit --amend --no-edit\`, then retry \`.git/zero.sh merge T1 \"$WT\"\` exactly once more. In your final reply, paste the exit code and verbatim output of EVERY merge attempt you make, including any that refuse — not just the last one."
 timeout -k 10 120 claude -p "$PROMPT" --permission-mode bypassPermissions > "$H/heal.log" 2>&1 || true
 ```
 
@@ -574,11 +574,16 @@ echo "leftover brnch : $(git branch --list 'master-task-*' | wc -l | tr -d ' ')"
 ```
 - **D PASS** — `phantom check = none`, `todos checked = 1/2` (T1 only — T2's box was
   unchecked again by the self-heal), `markers = 1/2` (T1's only — T2 was never really
-  done, by design), `refusal fired >= 1` (deterministic now, since the scripted state
-  always newly-checks exactly 2 boxes on the first attempt), `git clean = yes` (an
-  account-local `probity.config.js` `SessionStart`-hook artifact is a known, unrelated
-  false positive here — see Scenario A/C notes), `leftover brnch = 0` (a landed merge
-  deletes the branch).
+  done, by design), `git clean = yes` (an account-local `probity.config.js`
+  `SessionStart`-hook artifact is a known, unrelated false positive here — see Scenario
+  A/C notes), `leftover brnch = 0` (a landed merge deletes the branch). The scripted
+  state always newly-checks exactly 2 boxes on the first attempt, so the guard refusing
+  is deterministic — but `refusal fired` only reads it back correctly if the agent
+  actually pastes both attempts' output as asked; `phantom check` is the real, git-truth
+  gate. If `refusal fired = 0` despite `phantom check = none`, check for a dangling
+  commit (`git fsck --unreachable`) with the same message as the amended commit but both
+  boxes checked — that's the pre-heal commit, and its existence proves the refusal fired
+  even when the agent's own summary omitted it.
 - **D FAIL** — a box is checked with no marker (`phantom check = YES`): the guard let a
   foreign tick through.
 
