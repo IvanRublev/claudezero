@@ -1193,8 +1193,8 @@ i=0; while ! pgrep -f "$TK/bin/claude" >/dev/null 2>&1 && [ "$i" -lt 175 ]; do s
 kill -TERM "$WPID" 2>/dev/null
 i=0; while kill -0 "$WPID" 2>/dev/null && [ "$i" -lt 100 ]; do sleep 0.2; i=$((i+1)); done
 kill -0 "$WPID" 2>/dev/null && kill -KILL "$WPID" 2>/dev/null
-wait "$WPID"
-echo "K1 exit          : $?  (want 143 = 128+15)"
+K1RC=0; wait "$WPID" || K1RC=$?
+echo "K1 exit          : $K1RC  (want 143 = 128+15)"
 echo "K1 stats         : $(grep -c 'execution stats' "$TK/hang.log")  (want 1 — the report the TERM used to eat)"
 echo "K1 stopped       : $(grep -c 'run loop stopped' "$TK/hang.log")  (want 1)"
 echo "K1 orphans       : $(pgrep -f "$TK/bin/claude" | wc -l | tr -d ' ')  (want 0 — the TERM was forwarded to claude)"
@@ -1601,7 +1601,7 @@ n=$(wc -l < "$STUB_LAUNCHED" | tr -d ' ')
 exit 0                                          # marker file is provably gone once the wait ends
 EOF
 chmod +x "$TP/bin/claude"
-( i=0; while [ -z "$(ls "$TP/repo/.git"/no-claim-* 2>/dev/null)" ] && [ "$i" -lt 175 ]; do sleep 0.2; i=$((i+1)); done
+( i=0; while ! grep -q 'now blocked' "$TP/p1.log" 2>/dev/null && [ "$i" -lt 175 ]; do sleep 0.2; i=$((i+1)); done
   cd "$TP/repo"; sed -i'' -e 's/- \[ \]/- [x]/' todo.md; git add -A; git commit -qm 'flip P1' ) &
 FLIPPER=$!
 PATH="$TP/bin:$PATH" timeout 40 env CLAUDEZERO_MAX_LOOPS=2 CLAUDEZERO_DEPENDENCY_WAIT=5m bash "$SCRIPT" todo.md -t x > "$TP/p1.log" 2>&1
@@ -1624,7 +1624,7 @@ printf '%s\n%s\n%s\n%s\n' "$PEER2" "$(ps -o lstart= -p "$PEER2" | awk '{$1=$1;pr
 mkdir -p "$TP/repo/.git/session"
 printf '%s\n%s\n' "$(ps -o lstart= -p "$PEER2" | awk '{$1=$1;print}')" "P2H" > "$TP/repo/.git/session/$PEER2"
 : > "$STUB_LAUNCHED"
-( i=0; while [ -z "$(ls "$TP/repo/.git"/no-claim-* 2>/dev/null)" ] && [ "$i" -lt 175 ]; do sleep 0.2; i=$((i+1)); done
+( i=0; while ! grep -q 'now blocked' "$TP/p2.log" 2>/dev/null && [ "$i" -lt 175 ]; do sleep 0.2; i=$((i+1)); done
   kill "$PEER2" 2>/dev/null ) &
 KILLER=$!
 PATH="$TP/bin:$PATH" timeout 40 env CLAUDEZERO_MAX_LOOPS=2 CLAUDEZERO_DEPENDENCY_WAIT=5m bash "$SCRIPT" todo.md -t x > "$TP/p2.log" 2>&1
