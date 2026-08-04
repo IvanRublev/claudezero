@@ -4,7 +4,20 @@ All notable changes to ClaudeZero are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); this project uses
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.0.17] - 2026-08-04
+
+### Added
+
+- `CLAUDEZERO_DEPENDENCY_WAIT` — ceiling on the wait after a zero-mode session walks the whole
+  todo list and claims nothing because every unchecked task is dependency-blocked. Without it, a
+  fully dependency-blocked list looked identical to a genuinely stuck one: a fresh claude session
+  launched, found the same block, and ended its turn — one session burned per cycle for zero
+  possible progress. The session now marks the block on its way out, and the shell waits,
+  comparing a deterministic signature of the todo blob and the ids peers currently hold, instead
+  of relaunching blindly — stopping the instant a peer merges the blocking task or its holder
+  dies, or after this ceiling, whichever comes first. Default `10m`; same grammar as
+  `CLAUDEZERO_WATCHDOG`; `0` relaunches immediately every cycle, same as before this existed
+  (ISSUE-034).
 
 ### Changed
 
