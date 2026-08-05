@@ -45,7 +45,8 @@ Runs [`claude`](https://claude.com/product/claude-code) on a predefined prompt i
 ## Quickstart
 
 ```
-brew install IvanRublev/tap/claudezero
+sudo curl -fsSL https://raw.githubusercontent.com/IvanRublev/claudezero/refs/heads/master/claudezero.sh -o /usr/local/bin/claudezero
+sudo chmod +x /usr/local/bin/claudezero
 ```
 
 Change to your repo root with a todo-list file, and make sure the working tree is in a clean state (commit or stash any changes) and the todo file itself is committed on that branch. 
@@ -101,15 +102,15 @@ Supported on **macOS and Linux** (the script is bash-3.2-safe, so stock macOS `b
 
 ### Get the script
 
-#### macOS (Homebrew)
-  ```sh
-  brew install IvanRublev/tap/claudezero
-  ```
-
-#### Linux (curl)
+#### Linux / macOS (curl)
   ```sh
   sudo curl -fsSL https://raw.githubusercontent.com/IvanRublev/claudezero/refs/heads/master/claudezero.sh -o /usr/local/bin/claudezero
   sudo chmod +x /usr/local/bin/claudezero
+  ```
+
+#### macOS (Homebrew)
+  ```sh
+  brew install IvanRublev/tap/claudezero
   ```
 
 ### Prerequisites
